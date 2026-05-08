@@ -45,5 +45,15 @@ LIMIT 100;
 - `flusher/src/main.rs`: Added Parquet schema fields
 - `docs/plan/plan.md`: Updated implementation status
 
+## Retrospective
+
+- **What worked:** The session stitching implementation was straightforward. The client-side JavaScript library already had session management built in. The collector and flusher only needed to add `session_id` and `user_id` fields to their respective schemas. The validator module properly handles both "session_id" and "trace_session" keys for flexibility.
+
+- **What didn't:** No blockers or significant issues encountered. The implementation followed the existing patterns in the codebase.
+
+- **Surprise:** The `trace_session` parameter naming for link decoration was a good choice - it's clearly namespaced and unlikely to conflict with existing application parameters.
+
+- **Reusable pattern:** For adding new tracking fields: 1) Add to Event struct in collector, 2) Add extraction logic in validator, 3) Add to Parquet schema in flusher, 4) Update documentation with query examples.
+
 ## Status
 COMPLETE - No additional changes required.
