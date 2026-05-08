@@ -1,0 +1,30 @@
+{
+  "name": "@trace/client",
+  "version": "1.0.0",
+  "description": "TRACE - Traffic Recording, Attribution, and Campaign Events Client Library",
+  "main": "trace.js",
+  "scripts": {
+    "build": "node build.js",
+    "dev": "python3 -m http.server 8000",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "analytics",
+    "tracking",
+    "attribution",
+    "pixel",
+    "tag"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@terser/webpack-plugin": "^5.3.10",
+    "terser": "^5.36.0"
+  },
+  "files": [
+    "trace.js",
+    "trace.min.js",
+    "trace.min.js.map",
+    "README.md"
+  ]
+}
