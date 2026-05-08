@@ -135,6 +135,27 @@ pub fn list_reports() -> Vec<Report> {
             sql_template: include_str!("../queries/hourly_traffic_pattern.sql").to_string(),
             default_params: HashMap::new(),
         },
+        Report {
+            name: "attribution_first_touch".to_string(),
+            description: "First-touch attribution: credits initial acquisition source for conversions".to_string(),
+            category: ReportCategory::Journey,
+            sql_template: include_str!("../queries/attribution_first_touch.sql").to_string(),
+            default_params: HashMap::new(),
+        },
+        Report {
+            name: "attribution_last_touch".to_string(),
+            description: "Last-touch attribution: credits final touchpoint before conversion".to_string(),
+            category: ReportCategory::Journey,
+            sql_template: include_str!("../queries/attribution_last_touch.sql").to_string(),
+            default_params: HashMap::new(),
+        },
+        Report {
+            name: "attribution_linear".to_string(),
+            description: "Linear attribution: distributes credit equally across all touchpoints".to_string(),
+            category: ReportCategory::Journey,
+            sql_template: include_str!("../queries/attribution_linear.sql").to_string(),
+            default_params: HashMap::new(),
+        },
     ]
 }
 
