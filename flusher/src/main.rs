@@ -323,8 +323,9 @@ fn parse_hour_key(filename: &str) -> Option<(String, String)> {
 /// This matches the Iceberg schema defined in analytics/schemas/ad_events_iceberg.sql
 fn jsonl_to_parquet(events: Vec<CollectorEvent>) -> Result<Vec<u8>> {
     use arrow::array::{
-        BooleanArray, Float64Array, Int64Array, StringArray, TimestampMillisecondArray,
+        BooleanArray, Float64Array, Int64Array, MapArray, StringArray, TimestampMillisecondArray,
     };
+    use arrow::buffer::OffsetBuffer;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
@@ -427,6 +428,54 @@ fn jsonl_to_parquet(events: Vec<CollectorEvent>) -> Result<Vec<u8>> {
         .map(|e| e.enrichment_version.clone())
         .collect();
 
+    // Build params as a MapArray for Iceberg compatibility
+    // Maps are represented as struct arrays with key/value fields
+    let mut all_params_keys = Vec::new();
+    let mut all_params_values = Vec::new();
+    let mut params_offsets = vec![0i32];
+    let mut current_offset = 0i32;
+
+    for event in &events {
+        for (key, value) in &event.params {
+            all_params_keys.push(key.clone());
+            all_params_values.push(value.clone());
+            current_offset += 1;
+        }
+        params_offsets.push(current_offset);
+    }
+
+    // Create the map field (struct with key and value)
+    let map_fields = vec![
+        Field::new("key", DataType::Utf8, false),
+        Field::new("value", DataType::Utf8, false),
+    ];
+    let map_data_type = DataType::Map(
+        Arc::new(Field::new("entries", DataType::Struct(map_fields), false)),
+        false,
+    );
+
+    let params_array = MapArray::new(
+        Arc::new(Field::new("entries", DataType::Struct(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, false),
+        ]), false)),
+        OffsetBuffer::new(params_offsets.into()),
+        Arc::new(arrow::array::StructArray::new(
+            DataType::Struct(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Utf8, false),
+            ])
+            .into(),
+            vec![
+                Arc::new(StringArray::from(all_params_keys)),
+                Arc::new(StringArray::from(all_params_values)),
+            ],
+            None,
+        )),
+        None,
+        false,
+    );
+
     let schema = Schema::new(vec![
         Field::new(
             "ts",
@@ -474,6 +523,7 @@ fn jsonl_to_parquet(events: Vec<CollectorEvent>) -> Result<Vec<u8>> {
             true,
         ),
         Field::new("enrichment_version", DataType::Utf8, true),
+        Field::new("params", map_data_type, true),
     ]);
 
     let batch = RecordBatch::try_new(
@@ -517,6 +567,7 @@ fn jsonl_to_parquet(events: Vec<CollectorEvent>) -> Result<Vec<u8>> {
             Arc::new(StringArray::from(validation_reasons)),
             Arc::new(TimestampMillisecondArray::from(enriched_ats)),
             Arc::new(StringArray::from(enrichment_versions)),
+            Arc::new(params_array),
         ],
     )?;
 
@@ -645,13 +696,14 @@ async fn flush_batch(state: &FlusherState, reason: &str) -> Result<()> {
     }
 
     // Move failed uploads to DLQ
+    let error_count = upload_errors.len();
     for (entry, error) in upload_errors {
         move_to_dlq(state, &entry.source_file, &error.to_string()).await;
     }
 
     info!(
         "Batch flush complete: {} entries uploaded",
-        entries.values().map(|v| v.len()).sum::<usize>() - upload_errors.len()
+        entries.values().map(|v| v.len()).sum::<usize>() - error_count
     );
 
     Ok(())
@@ -899,7 +951,7 @@ async fn main() -> Result<()> {
         _ = tokio::signal::ctrl_c() => {
             info!("Received shutdown signal");
         }
-        _ = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())? => {
+        _ = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?.recv() => {
             info!("Received TERM signal");
         }
     }
@@ -1166,5 +1218,51 @@ mod tests {
         assert_eq!(entries.len(), 2); // 2 partition keys
         assert_eq!(entries.get("events/dt=2026-05-08/hour=14").unwrap().len(), 2);
         assert_eq!(entries.get("events/dt=2026-05-08/hour=15").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_jsonl_to_parquet_with_params() {
+        let mut params = HashMap::new();
+        params.insert("utm_source".to_string(), "taboola".to_string());
+        params.insert("tb_image".to_string(), "img123".to_string());
+        params.insert("tb_headline".to_string(), "Click Here".to_string());
+
+        let events = vec![CollectorEvent {
+            ts: DateTime::parse_from_rfc3339("2026-05-08T14:30:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            ip: Some("1.2.3.4".to_string()),
+            ua: Some("Mozilla/5.0".to_string()),
+            url: "https://example.com".to_string(),
+            params,
+            event_type: "click".to_string(),
+            session_id: Some("sess-123".to_string()),
+            user_id: Some("user-456".to_string()),
+        }];
+
+        let result = jsonl_to_parquet(events);
+        assert!(result.is_ok(), "Parquet conversion with params failed: {:?}", result.err());
+
+        let parquet_data = result.unwrap();
+        assert!(!parquet_data.is_empty(), "Parquet data with params should not be empty");
+    }
+
+    #[test]
+    fn test_jsonl_to_parquet_empty_params() {
+        let events = vec![CollectorEvent {
+            ts: DateTime::parse_from_rfc3339("2026-05-08T14:30:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            ip: Some("1.2.3.4".to_string()),
+            ua: Some("Mozilla/5.0".to_string()),
+            url: "https://example.com".to_string(),
+            params: HashMap::new(),
+            event_type: "pageview".to_string(),
+            session_id: None,
+            user_id: None,
+        }];
+
+        let result = jsonl_to_parquet(events);
+        assert!(result.is_ok(), "Parquet conversion with empty params failed");
     }
 }
