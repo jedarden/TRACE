@@ -1,0 +1,28 @@
+[package]
+name = "trace-flusher"
+version = "0.1.0"
+edition = "2021"
+description = "Flusher service for TRACE - converts JSONL to Parquet and uploads to S3"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+parquet = { version = "54", features = ["arrow"] }
+arrow = { version = "54", features = ["chrono-tz"] }
+aws-config = { version = "1.5", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1.65"
+aws-smithy-types = "1.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+flate2 = "1.0"
+anyhow = "1.0"
+notify = "8"
+async-trait = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

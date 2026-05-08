@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trace-collector
+  namespace: trace
+  labels:
+    app: trace-collector
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: trace-collector
+  template:
+    metadata:
+      labels:
+        app: trace-collector
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/health"
+    spec:
+      containers:
+        - name: collector
+          image: ghcr.io/jedarden/trace-collector:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: TRACE_LOG_DIR
+              value: /data/logs
+            - name: RUST_LOG
+              value: info
+          volumeMounts:
+            - name: logs
+              mountPath: /data/logs
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: logs
+          persistentVolumeClaim:
+            claimName: trace-logs

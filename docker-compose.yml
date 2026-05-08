@@ -1,0 +1,14 @@
+services:
+  collector:
+    build: ./collector
+    ports:
+      - "8080:8080"
+    volumes:
+      - trace-logs:/data/logs
+    environment:
+      TRACE_LOG_DIR: /data/logs
+      RUST_LOG: info
+    restart: unless-stopped
+
+volumes:
+  trace-logs:

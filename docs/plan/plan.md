@@ -1,0 +1,362 @@
+# TRACE Implementation Plan
+
+**Traffic Recording, Attribution, and Campaign Events**
+
+---
+
+## Overview
+
+TRACE is a lightweight, self-hosted event tracking system for affiliate marketing and direct response advertising. It captures raw traffic signals and attributes performance back to campaigns, creatives, and assets.
+
+## Design Philosophy
+
+1. **Log first, parse later** — Collector is an access log. Raw requests stored as-is. All enrichment happens downstream.
+2. **Dynamic schema** — Query parameters stored as MAP. No schema migrations when adding new UTM/custom params.
+3. **Observation only** — Nothing needs pre-registration. Assets, parameters, campaigns discovered from data.
+4. **Reprocessable** — Raw event logs are source of truth. Replay from beginning if ETL improves.
+5. **Minimal infrastructure** — Single container with DuckDB at typical affiliate volumes (~15-20k events/day).
+
+---
+
+## Architecture
+
+```
+┌──────────────────────┐
+│  Browser             │
+│  + JS Tag / Pixel    │
+└──────────┬───────────┘
+           │ POST/GET /collect
+           │ JSON body or query params
+           ▼
+┌──────────────────────┐
+│  Collector (Rust)    │
+│  /collect endpoint   │
+│  Write JSONL by hour │
+└──────────┬───────────┘
+           │ events-YYYYMMDD-HH.jsonl
+           │ (compressed to .gz on rotation)
+           ▼
+┌──────────────────────┐
+│  Flusher (Rust)      │
+│  File watcher        │
+│  Parse → Parquet     │
+│  Upload to S3        │
+└──────────┬───────────┘
+           │ s3://bucket/events/dt=YYYY-MM-DD/hour=HH/
+           │ Hive partitioned Parquet files
+           ▼
+┌──────────────────────┐
+│  Iceberg Tables      │
+│  + Compaction jobs   │
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│  DuckDB / Trino      │
+│  Queries & Reports   │
+└──────────────────────┘
+```
+
+---
+
+## Data Model
+
+### Collector Event (JSONL)
+
+```json
+{
+  "ts": "2026-05-08T14:30:00Z",
+  "ip": "1.2.3.4",
+  "ua": "Mozilla/5.0...",
+  "url": "https://example.com/page?utm_source=taboola&utm_campaign=c123&item=i456",
+  "params": {
+    "utm_source": "taboola",
+    "utm_campaign": "c123",
+    "item": "i456",
+    "tb_image": "img-abc-123",
+    "tb_headline": "Lose Weight Fast"
+  },
+  "type": "pageview"
+}
+```
+
+### Parquet Schema (Hive Partitioned)
+
+```
+ts: TIMESTAMP(MILLIS, UTC) NOT NULL
+ip: UTF8 (OPTIONAL)
+ua: UTF8 (OPTIONAL)
+url: UTF8 NOT NULL
+params: UTF8 NOT NULL  -- JSON string of query params
+type: UTF8 NOT NULL
+
+Partitioned by:
+  dt: STRING (YYYY-MM-DD)
+  hour: STRING (HH)
+```
+
+---
+
+## Implementation Status
+
+### Phase 1: Core Collection Infrastructure ✅ COMPLETE
+
+**Status**: Implemented and working
+
+#### Collector Service (`collector/`)
+
+- **HTTP Endpoint**: `/collect` accepts both GET (query params) and POST (JSON body)
+- **Event Types**: pageview, click, scroll, dwell (extensible via `type` field)
+- **Headers Captured**: X-Forwarded-For (IP), User-Agent
+- **Log Rotation**: Hourly files with automatic compression to gzip
+- **Graceful Shutdown**: Flushes buffers on SIGTERM/SIGINT
+- **Health Check**: `/health` endpoint
+- **Dockerfile**: Multi-stage Alpine build, healthcheck included
+
+**Tech Stack**: Rust, Axum, Tokio, Chrono, flate2
+
+#### Flusher Service (`flusher/`)
+
+- **File Watching**: Uses `notify` crate for new .jsonl.gz files
+- **Parquet Conversion**: Arrow-based in-memory conversion
+- **S3 Upload**: Partitioned by `dt=YYYY-MM-DD/hour=HH`
+- **DLQ Pattern**: Failed files moved to `/data/dlq` with error metadata
+- **Retry Logic**: 3 retries with 5s backoff
+- **Dockerfile**: Multi-stage Alpine build
+
+**Tech Stack**: Rust, AWS SDK, Parquet/Arrow, notify
+
+#### Docker Compose (`docker-compose.yml`)
+
+- Collector service exposed on port 8080
+- Shared volume `trace-logs` for log files
+
+---
+
+### Phase 2: CI/CD & Deployment ✅ COMPLETE
+
+**Status**: CI workflows complete, ready for deployment
+
+#### Argo Workflows
+
+**Collector CI** (`.argo/trace-collector-ci-workflowtemplate.yaml`) ✅
+- Checkout from GitHub
+- `cargo fmt --check` and `cargo clippy`
+- `cargo build --release`
+- Kaniko Docker build to GHCR
+- Tag handling: vX.Y.Z → pushes X.Y, X, latest
+
+**Flusher CI** (`.argo/trace-flusher-ci-workflowtemplate.yaml`) ✅
+- Checkout from GitHub
+- `cargo fmt --check` and `cargo clippy`
+- Kaniko Docker build to GHCR
+- Tag handling: vX.Y.Z → pushes X.Y, X, latest
+
+**Deployment**
+- Target: ardenone-manager cluster
+- Services: Collector + Flusher deployments
+- Persistent volume for shared logs
+- S3 bucket configuration
+
+---
+
+### Phase 3: Client Integration 📋 PLANNED
+
+#### JavaScript Tag
+
+**Features**:
+- Autocapture pageviews on load
+- Link decoration for session stitching
+- Heartbeat pings for dwell time
+- Click tracking on outbound links
+- Scroll depth tracking
+- Privacy: Local storage only, no third-party cookies
+
+**API**:
+```javascript
+// Basic pageview (autocaptured)
+TRACE.collect();
+
+// Custom event
+TRACE.collect('click', { element: 'buy-button' });
+
+// Set user ID (first-party cookie)
+TRACE.identify('user-123');
+```
+
+**Delivery Options**:
+1. **Pixel tag** (backward compatible):
+```html
+<img src="https://trace.example.com/collect?url=PAGE_URL&type=pageview" width="1" height="1">
+```
+
+2. **JS tag** (recommended):
+```html
+<script src="https://trace.example.com/trace.js" data-collector="https://trace.example.com/collect"></script>
+```
+
+---
+
+### Phase 4: Attribution & Campaign Sync 📋 PLANNED
+
+#### Ad Network Integration
+
+**Goal**: Map campaign IDs back to actual creatives (headlines, images) used.
+
+**Supported Networks**:
+- Taboola (`tb_item`, `tb_image`, `tb_headline`)
+- Outbrain (`ob_item`, `ob_creative`)
+- MGID (`mg_id`, `mg_title`, `mg_image`)
+- RevContent (`rc_id`, `rc_title`, `rc_thumb`)
+
+**Implementation**:
+1. **API Sync Jobs**: Periodic fetch from ad network APIs
+2. **Creative Registry**: Store creative metadata (image URLs, headlines, landing pages)
+3. **Asset Tagging**: Tag images/headlines with semantic categories
+4. **Performance Attribution**: Join events with creative registry
+
+**Schema**:
+```sql
+CREATE TABLE creatives (
+  network STRING NOT NULL,
+  campaign_id STRING NOT NULL,
+  creative_id STRING NOT NULL,
+  headline STRING,
+  image_url STRING,
+  landing_page STRING,
+  first_seen TIMESTAMP,
+  last_seen TIMESTAMP,
+  PRIMARY KEY (network, creative_id)
+);
+```
+
+---
+
+### Phase 5: Analytics & Reporting 📋 PLANNED
+
+#### DuckDB Queries
+
+**Common Metrics**:
+```sql
+-- CTR by campaign
+SELECT
+  params:utm_campaign AS campaign,
+  COUNT(*) FILTER (WHERE type = 'pageview') AS views,
+  COUNT(*) FILTER (WHERE type = 'click') AS clicks,
+  clicks::FLOAT / NULLIF(views, 0) AS ctr
+FROM read_parquet('s3://bucket/events/**/*.parquet')
+GROUP BY 1;
+
+-- Asset performance (by headline)
+SELECT
+  params:tb_headline AS headline,
+  COUNT(*) FILTER (WHERE type = 'click') AS clicks,
+  COUNT(DISTINCT params:utm_campaign) AS campaigns
+FROM read_parquet('s3://bucket/events/**/*.parquet')
+WHERE params:tb_headline IS NOT NULL
+GROUP BY 1
+ORDER BY 2 DESC;
+```
+
+#### Compaction Strategy
+
+**Problem**: Many small Parquet files from hourly uploads
+
+**Solution**:
+1. **Daily compaction job**: Merge hourly files into daily partitions
+2. **Retention**: Raw JSONL deleted after successful Parquet upload
+3. **Iceberg integration**: For large-scale queries (optional)
+
+---
+
+### Phase 6: Advanced Features 📋 PLANNED
+
+#### Session Stitching
+
+- First-party cookie for user identification
+- Link decoration (utm_session) for cross-site tracking
+- Session timeout (30 min inactivity)
+
+#### Fraud Detection
+
+- Bot filtering via User-Agent analysis
+- IP-based rate limiting
+- Suspicious pattern detection (rapid clicks, same IP multiple campaigns)
+
+#### Real-time Dashboard
+
+- Live event stream (WebSocket)
+- Campaign performance in last hour
+- Alerting on anomalies
+
+---
+
+## Deployment Plan
+
+### Infrastructure Requirements
+
+**Minimal** (~15k events/day):
+- 1 container (collector + flusher combined)
+- 2 CPU, 4GB RAM
+- 10GB volume for logs
+- S3 bucket (any region)
+
+**Recommended** (~100k+ events/day):
+- Separate collector and flusher containers
+- Collector: 1 CPU, 2GB RAM
+- Flusher: 2 CPU, 4GB RAM
+- 50GB volume for logs
+- Iceberg tables + Trino for analytics
+
+### Environment Variables
+
+**Collector**:
+```
+TRACE_LOG_DIR=/data/logs
+RUST_LOG=info
+PORT=8080
+```
+
+**Flusher**:
+```
+TRACE_LOG_DIR=/data/logs
+TRACE_DLQ_DIR=/data/dlq
+TRACE_S3_BUCKET=my-trace-bucket
+TRACE_S3_REGION=us-east-1
+TRACE_S3_PREFIX=trace-events
+AWS_ACCESS_KEY_ID=***
+AWS_SECRET_ACCESS_KEY=***
+AWS_SESSION_TOKEN=***  # if using temporary creds
+```
+
+---
+
+## Roadmap
+
+| Phase | Status | Target |
+|-------|--------|--------|
+| 1. Core Collection | ✅ Complete | DONE |
+| 2. CI/CD & Deploy | 🚧 In Progress | 2026-05-15 |
+| 3. Client JS Tag | 📋 Planned | 2026-05-30 |
+| 4. Attribution Sync | 📋 Planned | 2026-06-15 |
+| 5. Analytics Layer | 📋 Planned | 2026-06-30 |
+| 6. Advanced Features | 📋 Planned | Future |
+
+---
+
+## Open Questions
+
+1. **S3 vs MinIO**: Use cloud S3 or self-hosted MinIO for full on-prem?
+2. **Compaction cadence**: Daily vs weekly for Parquet merges?
+3. **Session storage**: Cookie vs localStorage for session IDs?
+4. **PII handling**: Should we hash IPs for GDPR compliance?
+
+---
+
+## Next Steps
+
+1. ✅ Create this plan document
+2. ⏳ Add flusher CI workflow template
+3. ⏳ Create ArgoCD manifests for deployment
+4. ⏳ Implement JS client tag
+5. ⏳ Set up S3 bucket and IAM policies
