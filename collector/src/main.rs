@@ -59,6 +59,12 @@ struct Event {
     /// Normalized campaign data (cross-network)
     #[serde(skip_serializing_if = "Option::is_none")]
     normalized: Option<normalizer::NormalizedCampaign>,
+    /// Session ID for cross-page tracking
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    /// User ID for cross-session tracking
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<String>,
 }
 
 /// Shared state for the collector
@@ -187,6 +193,7 @@ async fn collect_json(
 
     let url = payload
         .url
+        .clone()
         .or_else(|| {
             payload.extra.get("url").and_then(|v| {
                 if let serde_json::Value::String(s) = v {
@@ -207,6 +214,13 @@ async fn collect_json(
         None
     };
 
+    // Extract session_id and user_id from payload
+    let session_id = extract_string_field(&payload, "session_id");
+    let user_id = extract_string_field(&payload, "user_id");
+
+    // Also check for trace_session in URL params (link decoration)
+    let link_session = params.get("trace_session").map(|s| s.to_string());
+
     let event = Event {
         ts: Utc::now(),
         ip,
@@ -215,11 +229,24 @@ async fn collect_json(
         params,
         r#type: payload.r#type,
         normalized,
+        session_id: session_id.or(link_session),
+        user_id,
     };
 
     write_event(&state, &event).await?;
 
     Ok(())
+}
+
+/// Extract a string field from payload extra data
+fn extract_string_field(payload: &EventPayload, key: &str) -> Option<String> {
+    payload.extra.get(key).and_then(|v| {
+        if let serde_json::Value::String(s) = v {
+            Some(s.clone())
+        } else {
+            None
+        }
+    })
 }
 
 /// GET /collect - Query string endpoint
@@ -259,6 +286,14 @@ async fn collect_query(
         None
     };
 
+    // Extract session_id and user_id from query params
+    // Check both direct params and trace_session (link decoration)
+    let session_id = params
+        .get("session_id")
+        .or_else(|| params.get("trace_session"))
+        .map(|s| s.to_string());
+    let user_id = params.get("user_id").map(|s| s.to_string());
+
     let event = Event {
         ts: Utc::now(),
         ip,
@@ -267,6 +302,8 @@ async fn collect_query(
         params,
         r#type: event_type,
         normalized,
+        session_id,
+        user_id,
     };
 
     write_event(&state, &event).await?;

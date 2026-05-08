@@ -30,6 +30,10 @@ struct CollectorEvent {
     params: HashMap<String, String>,
     #[serde(rename = "type")]
     event_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<String>,
 }
 
 /// S3 configuration
@@ -140,6 +144,8 @@ fn jsonl_to_parquet(events: Vec<CollectorEvent>) -> Result<Vec<u8>> {
         .map(|e| serde_json::to_string(&e.params).unwrap_or_default())
         .collect();
     let types: Vec<String> = events.iter().map(|e| e.event_type.clone()).collect();
+    let session_ids: Vec<Option<String>> = events.iter().map(|e| e.session_id.clone()).collect();
+    let user_ids: Vec<Option<String>> = events.iter().map(|e| e.user_id.clone()).collect();
 
     let schema = Schema::new(vec![
         Field::new(
@@ -152,6 +158,8 @@ fn jsonl_to_parquet(events: Vec<CollectorEvent>) -> Result<Vec<u8>> {
         Field::new("url", DataType::Utf8, false),
         Field::new("params", DataType::Utf8, false),
         Field::new("type", DataType::Utf8, false),
+        Field::new("session_id", DataType::Utf8, true),
+        Field::new("user_id", DataType::Utf8, true),
     ]);
 
     let batch = RecordBatch::try_new(
@@ -163,6 +171,8 @@ fn jsonl_to_parquet(events: Vec<CollectorEvent>) -> Result<Vec<u8>> {
             Arc::new(StringArray::from(urls)),
             Arc::new(StringArray::from(params_json)),
             Arc::new(StringArray::from(types)),
+            Arc::new(StringArray::from(session_ids)),
+            Arc::new(StringArray::from(user_ids)),
         ],
     )?;
 
@@ -455,6 +465,8 @@ mod tests {
                     .into_iter()
                     .collect(),
                 event_type: "pageview".to_string(),
+                session_id: Some("sess-abc-123".to_string()),
+                user_id: Some("user-xyz-789".to_string()),
             },
             CollectorEvent {
                 ts: DateTime::parse_from_rfc3339("2026-05-08T14:31:00Z")
@@ -465,6 +477,8 @@ mod tests {
                 url: "https://example.com/page2".to_string(),
                 params: HashMap::new(),
                 event_type: "click".to_string(),
+                session_id: None,
+                user_id: None,
             },
         ];
 

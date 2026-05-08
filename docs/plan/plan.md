@@ -411,11 +411,55 @@ ORDER BY 2 DESC;
 
 ### Phase 6: Advanced Features 📋 PLANNED
 
-#### Session Stitching
+#### Session Stitching ✅ COMPLETE
 
-- First-party cookie for user identification
-- Link decoration (utm_session) for cross-site tracking
-- Session timeout (30 min inactivity)
+**Status**: Session stitching implemented in collector and flusher
+
+**Implementation**:
+1. **Client-side** (`client/trace.js`):
+   - Session ID generation and storage in localStorage
+   - Session timeout handling (30 minutes)
+   - Link decoration with `trace_session` parameter for cross-site tracking
+   - Session stitching when `trace_session` is present in URL
+
+2. **Collector** (`collector/src/main.rs`):
+   - `session_id` and `user_id` fields added to Event struct
+   - Extraction from both GET query params and POST JSON body
+   - Support for `trace_session` URL parameter (link decoration)
+   - Stored in JSONL event logs
+
+3. **Flusher** (`flusher/src/main.rs`):
+   - `session_id` and `user_id` fields added to Parquet schema
+   - Fields are optional (nullable) in Parquet
+   - Available for session-based queries in DuckDB
+
+**Usage**:
+```sql
+-- Session-based funnel analysis
+SELECT
+    session_id,
+    COUNT(*) FILTER (WHERE type = 'pageview') AS pageviews,
+    COUNT(*) FILTER (WHERE type = 'click') AS clicks,
+    MIN(ts) AS session_start,
+    MAX(ts) AS session_end
+FROM read_parquet('s3://bucket/events/**/*.parquet')
+WHERE session_id IS NOT NULL
+GROUP BY session_id
+ORDER BY session_start DESC
+LIMIT 100;
+
+-- User journey across multiple sessions
+SELECT
+    user_id,
+    COUNT(DISTINCT session_id) AS num_sessions,
+    COUNT(*) FILTER (WHERE type = 'pageview') AS total_pageviews,
+    COUNT(*) FILTER (WHERE type = 'click') AS total_clicks
+FROM read_parquet('s3://bucket/events/**/*.parquet')
+WHERE user_id IS NOT NULL
+GROUP BY user_id
+ORDER BY num_sessions DESC
+LIMIT 100;
+```
 
 #### Fraud Detection
 
@@ -492,6 +536,7 @@ AWS_SESSION_TOKEN=***  # if using temporary creds
 | 4. Cross-Network Normalization | ✅ Complete | 2026-05-08 |
 | 5. Analytics Layer | ✅ Complete | 2026-05-08 |
 | 6. Ad Network API Sync | ✅ Complete | 2026-05-08 |
+| 7. Session Stitching | ✅ Complete | 2026-05-08 |
 
 ---
 
@@ -511,7 +556,9 @@ AWS_SESSION_TOKEN=***  # if using temporary creds
 4. ✅ Add syncer CI workflow template
 5. ✅ Implement JS client tag
 6. ✅ Implement ad network API sync
-7. ⏳ Create ArgoCD manifests for deployment
-8. ⏳ Set up S3 bucket and IAM policies
-9. ⏳ Add semantic tagging for headlines/images (future enhancement)
-10. ⏳ Implement real-time dashboard (future enhancement)
+7. ✅ Implement session stitching
+8. ⏳ Create ArgoCD manifests for deployment
+9. ⏳ Set up S3 bucket and IAM policies
+10. ⏳ Add semantic tagging for headlines/images (future enhancement)
+11. ⏳ Implement real-time dashboard (future enhancement)
+12. ⏳ Implement fraud detection (future enhancement)
