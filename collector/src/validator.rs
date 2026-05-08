@@ -13,7 +13,7 @@ const MAX_PAYLOAD_SIZE: usize = 1024 * 1024;
 const MAX_STRING_LENGTH: usize = 4096;
 
 /// Valid event types
-const VALID_EVENT_TYPES: &[&str] = &["pageview", "click", "scroll", "dwell"];
+const VALID_EVENT_TYPES: &[&str] = &["pageview", "click", "impression", "scroll", "dwell"];
 
 /// Validation error with detailed context
 #[derive(Debug, Clone, Serialize, Deserialize)]

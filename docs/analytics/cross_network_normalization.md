@@ -12,12 +12,13 @@ Different ad networks use different parameter names for the same campaign concep
 | **Outbrain** | `utm_source=outbrain` | `ob_creative` | *(not passed)* | `ob_creative` |
 | **MGID** | `utm_source=mgid` | `mg_image` | `mg_title` | `mg_id` |
 | **RevContent** | `utm_source=revcontent` | `rc_thumb` | `rc_title` | `rc_id` |
+| **Google Ads** | `utm_source=google` or `gclid` | `imageid` | `keyword`/`placement` | `adgroupid` |
 
 ## Normalized Schema
 
 The normalized view provides these common fields:
 
-- **`network`** - Detected ad network (taboola, outbrain, mgid, revcontent, unknown)
+- **`network`** - Detected ad network (taboola, outbrain, mgid, revcontent, googleads, unknown)
 - **`campaign_id`** - Campaign identifier from `utm_campaign`
 - **`creative_id`** - Unique creative identifier (normalized from network-specific field)
 - **`headline`** - Creative headline/title text (normalized from network-specific field)
@@ -110,6 +111,14 @@ Events now include normalized campaign data:
 }
 ```
 
+### Supported Event Types
+
+- **pageview** - Initial page load or navigation
+- **click** - User clicked on a link or element
+- **impression** - Ad was displayed (used for ad network tracking)
+- **scroll** - User scrolled the page
+- **dwell** - User spent time on page (heartbeat ping)
+
 ## Analytics Use Cases
 
 ### 1. Cross-Network Performance Comparison
@@ -179,7 +188,9 @@ LIMIT 20;
 ### Network Detection Logic
 
 1. **Primary**: Check `utm_source` parameter for known network names
-2. **Fallback**: Check for network-specific parameter prefixes (`tb_`, `ob_`, `mg_`, `rc_`)
+2. **Fallback**: Check for network-specific parameter presence:
+   - `gclid`/`gclsrc` for Google Ads
+   - Network-specific prefixes (`tb_`, `ob_`, `mg_`, `rc_`)
 3. **Default**: Return "unknown" if no network detected
 
 ### Parameter Mapping
@@ -205,6 +216,14 @@ Each network's parameters are mapped to the normalized schema:
 - `rc_id` → `creative_id`, `item_id`
 - `rc_title` → `headline`
 - `rc_thumb` → `image_id`
+
+**Google Ads:**
+- `adgroupid` / `adgroup_id` → `creative_id`, `item_id`
+- `feeditemid` / `feed_item_id` → `creative_id` (shopping ads)
+- `campaignid` / `campaign_id` / `utm_campaign` → `campaign_id`
+- `keyword` / `placement` / `target` / `utm_term` → `headline`
+- `imageid` / `image_id` → `image_id`
+- `utm_content` → `creative_id` (custom tracking)
 
 ### Generic Fallback
 
