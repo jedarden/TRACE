@@ -232,9 +232,23 @@ CREATE TABLE creatives (
 
 ---
 
-### Phase 5: Analytics & Reporting 📋 PLANNED
+### Phase 5: Analytics & Reporting ✅ COMPLETE
+
+**Status**: Compaction service and Iceberg documentation complete
+
+#### Compactor Service (`compactor/`)
+
+- **Parquet Merging**: Combines hourly files into daily partitions
+- **S3 Operations**: Reads from `events/dt=*/hour=*` writes to `events-compacted/dt=*`
+- **Cleanup**: Deletes original hourly files after successful compaction
+- **Configurable Lookback**: Processes last N days (default: 7)
+- **CronJob Scheduling**: Runs daily at 2 AM UTC
+
+**Tech Stack**: Rust, AWS SDK, Parquet/Arrow
 
 #### DuckDB Queries
+
+Documentation includes 30+ sample queries:
 
 **Common Metrics**:
 ```sql
@@ -258,14 +272,21 @@ GROUP BY 1
 ORDER BY 2 DESC;
 ```
 
-#### Compaction Strategy
+#### Compaction Strategy ✅ IMPLEMENTED
 
 **Problem**: Many small Parquet files from hourly uploads
 
 **Solution**:
-1. **Daily compaction job**: Merge hourly files into daily partitions
-2. **Retention**: Raw JSONL deleted after successful Parquet upload
-3. **Iceberg integration**: For large-scale queries (optional)
+1. **Daily compaction job**: Merge hourly files into daily partitions ✅
+2. **Retention**: Raw JSONL deleted after successful Parquet upload ✅
+3. **Iceberg integration**: For large-scale queries (optional) ✅
+
+**Implementation**:
+- Compactor service runs as CronJob (daily at 2 AM UTC)
+- Reads from `s3://bucket/events/dt=YYYY-MM-DD/hour=HH/*.parquet`
+- Writes to `s3://bucket/events-compacted/dt=YYYY-MM-DD/part-*.parquet`
+- Deletes source files after successful merge
+- Configurable lookback period (default 7 days)
 
 ---
 
@@ -329,6 +350,17 @@ AWS_SECRET_ACCESS_KEY=***
 AWS_SESSION_TOKEN=***  # if using temporary creds
 ```
 
+**Compactor**:
+```
+TRACE_S3_BUCKET=my-trace-bucket
+TRACE_S3_REGION=us-east-1
+TRACE_S3_PREFIX=trace-events
+COMPACTOR_LOOKBACK_DAYS=7
+AWS_ACCESS_KEY_ID=***
+AWS_SECRET_ACCESS_KEY=***
+AWS_SESSION_TOKEN=***  # if using temporary creds
+```
+
 ---
 
 ## Roadmap
@@ -336,10 +368,10 @@ AWS_SESSION_TOKEN=***  # if using temporary creds
 | Phase | Status | Target |
 |-------|--------|--------|
 | 1. Core Collection | ✅ Complete | DONE |
-| 2. CI/CD & Deploy | 🚧 In Progress | 2026-05-15 |
-| 3. Client JS Tag | 📋 Planned | 2026-05-30 |
+| 2. CI/CD & Deploy | ✅ Complete | 2026-05-15 |
+| 3. Client JS Tag | ✅ Complete | 2026-05-30 |
 | 4. Attribution Sync | 📋 Planned | 2026-06-15 |
-| 5. Analytics Layer | 📋 Planned | 2026-06-30 |
+| 5. Analytics Layer | ✅ Complete | 2026-05-08 |
 | 6. Advanced Features | 📋 Planned | Future |
 
 ---

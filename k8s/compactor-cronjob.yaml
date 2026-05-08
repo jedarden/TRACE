@@ -1,0 +1,56 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: trace-compactor
+  namespace: trace
+  labels:
+    app: trace-compactor
+spec:
+  schedule: "0 2 * * *"  # Run daily at 2 AM UTC
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  concurrencyPolicy: Forbid  # Don't run if previous job is still running
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: compactor
+              image: ghcr.io/jedarden/trace-compactor:latest
+              imagePullPolicy: Always
+              env:
+                - name: TRACE_S3_BUCKET
+                  valueFrom:
+                    secretKeyRef:
+                      name: trace-s3-credentials
+                      key: bucket
+                - name: TRACE_S3_REGION
+                  valueFrom:
+                    secretKeyRef:
+                      name: trace-s3-credentials
+                      key: region
+                - name: TRACE_S3_PREFIX
+                  value: trace-events
+                - name: COMPACTOR_LOOKBACK_DAYS
+                  value: "7"
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: trace-s3-credentials
+                      key: access-key-id
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: trace-s3-credentials
+                      key: secret-access-key
+                - name: RUST_LOG
+                  value: info
+              resources:
+                requests:
+                  cpu: 1000m
+                  memory: 1Gi
+                limits:
+                  cpu: 2000m
+                  memory: 2Gi
