@@ -569,6 +569,11 @@ async fn main() -> Result<()> {
         .await?;
 
     // Final flush on shutdown
+    info!("Flushing queue before shutdown...");
+    if let Err(e) = flush_state.queue.flush().await {
+        error!("Failed to flush queue on shutdown: {}", e);
+    }
+
     if let Some(log_file) = flush_state.current.lock().await.take() {
         info!("Flushing final log file...");
         if let Err(e) = log_file.flush() {

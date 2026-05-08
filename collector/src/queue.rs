@@ -15,6 +15,7 @@
 //! - TRACE_REDIS_QUEUE_KEY: Queue key name (default: trace:events)
 
 use anyhow::Result;
+use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
