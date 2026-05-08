@@ -1,0 +1,4 @@
+# Requirements for Iceberg Migration Runner
+# Install with: pip install -r requirements.txt
+
+trino>=0.329  # Trino Python client for Iceberg operations
