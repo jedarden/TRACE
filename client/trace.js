@@ -5,7 +5,7 @@
  * Features:
  * - Autocapture pageviews on load
  * - Link decoration for session stitching
- * - Cross-domain tracking support
+ * - Cross-domain tracking support (iframe PostMessage, storage bridge)
  * - Heartbeat pings for dwell time
  * - Click tracking on outbound links
  * - Scroll depth tracking
@@ -53,7 +53,9 @@
     scrollEventSent: new Set(),
     pageLoadTime: Date.now(),
     url: window.location.href,
-    referrer: document.referrer || ''
+    referrer: document.referrer || '',
+    iframeOrigins: new Set(), // Origins of iframes we've sent IDs to
+    parentOrigin: null // Origin of parent window (if in iframe)
   };
 
   /**
@@ -197,6 +199,211 @@
         domainStr = '; domain=' + domain;
       }
       document.cookie = name + '=; expires=Thu, 01 Jan 1970 00:00:00 UTC' + domainStr + '; path=/';
+    }
+  };
+
+  /**
+   * PostMessage API for cross-domain iframe communication
+   */
+  var PostMessageUtils = {
+    /**
+     * Send session and user IDs to a child iframe
+     * @param {HTMLIFrameElement} iframe - The iframe element
+     */
+    sendToIframe: function(iframe) {
+      try {
+        if (!iframe.contentWindow) {
+          return;
+        }
+
+        var iframeOrigin = this.getIframeOrigin(iframe);
+        if (!iframeOrigin) {
+          return;
+        }
+
+        var message = {
+          type: 'trace_sync',
+          sessionId: CONFIG.sessionId,
+          userId: CONFIG.userId,
+          version: TRACE.version
+        };
+
+        iframe.contentWindow.postMessage(message, iframeOrigin);
+        state.iframeOrigins.add(iframeOrigin);
+        debug('Sent TRACE IDs to iframe', { origin: iframeOrigin });
+      } catch (e) {
+        debug('Failed to send to iframe', e);
+      }
+    },
+
+    /**
+     * Get the origin of an iframe
+     * @param {HTMLIFrameElement} iframe - The iframe element
+     * @returns {string|null} The origin or null
+     */
+    getIframeOrigin: function(iframe) {
+      try {
+        if (iframe.src) {
+          var url = new URL(iframe.src);
+          return url.origin;
+        }
+      } catch (e) {
+        // Invalid URL
+      }
+      return '*';
+    },
+
+    /**
+     * Handle incoming PostMessage
+     * @param {MessageEvent} event - The message event
+     */
+    handleMessage: function(event) {
+      // Validate message type
+      if (!event.data || event.data.type !== 'trace_sync') {
+        return;
+      }
+
+      // Validate version (basic check)
+      if (!event.data.version) {
+        return;
+      }
+
+      var sourceOrigin = event.origin;
+      debug('Received TRACE sync message', { origin: sourceOrigin });
+
+      // Stitch session if provided and different
+      if (event.data.sessionId && event.data.sessionId !== CONFIG.sessionId) {
+        debug('Session stitched from PostMessage', {
+          from: CONFIG.sessionId,
+          to: event.data.sessionId,
+          origin: sourceOrigin
+        });
+
+        if (currentStorage === 'cookie') {
+          CookieUtils.set(STORAGE_KEYS.SESSION_ID, event.data.sessionId, null, CONFIG.cookieDomain, CONFIG.cookieSecure, CONFIG.cookieSameSite);
+        } else {
+          localStorage.setItem(STORAGE_KEYS.SESSION_ID, event.data.sessionId);
+        }
+
+        CONFIG.sessionId = event.data.sessionId;
+      }
+
+      // Stitch user if provided and different
+      if (event.data.userId && event.data.userId !== CONFIG.userId) {
+        debug('User stitched from PostMessage', {
+          from: CONFIG.userId,
+          to: event.data.userId,
+          origin: sourceOrigin
+        });
+
+        if (currentStorage === 'cookie') {
+          CookieUtils.set(STORAGE_KEYS.USER_ID, event.data.userId, 365, CONFIG.cookieDomain, CONFIG.cookieSecure, CONFIG.cookieSameSite);
+        } else {
+          localStorage.setItem(STORAGE_KEYS.USER_ID, event.data.userId);
+        }
+
+        CONFIG.userId = event.data.userId;
+      }
+
+      // Record the parent origin for future messages
+      state.parentOrigin = sourceOrigin;
+    },
+
+    /**
+     * Send IDs to parent window (if we're in an iframe)
+     */
+    sendToParent: function() {
+      if (window.self === window.top) {
+        // Not in an iframe
+        return;
+      }
+
+      try {
+        var message = {
+          type: 'trace_sync',
+          sessionId: CONFIG.sessionId,
+          userId: CONFIG.userId,
+          version: TRACE.version
+        };
+
+        // Send to parent origin (or * if unknown)
+        var targetOrigin = document.referrer ? new URL(document.referrer).origin : '*';
+        window.parent.postMessage(message, targetOrigin);
+        debug('Sent TRACE IDs to parent', { origin: targetOrigin });
+      } catch (e) {
+        debug('Failed to send to parent', e);
+      }
+    }
+  };
+
+  /**
+   * Storage Bridge for cross-domain cookie sharing
+   * Allows setting cookies on a shared domain via redirect
+   */
+  var StorageBridge = {
+    /**
+     * Generate a bridge URL for cross-domain cookie sharing
+     * @param {string} bridgeDomain - The domain hosting the bridge endpoint
+     * @param {string} targetUrl - The URL to redirect to after setting cookies
+     * @returns {string|null} The bridge URL or null
+     */
+    getBridgeUrl: function(bridgeDomain, targetUrl) {
+      if (!bridgeDomain || !targetUrl) {
+        debug('Bridge URL requires bridgeDomain and targetUrl');
+        return null;
+      }
+
+      try {
+        var bridgeUrl = new URL('/trace/bridge', 'https://' + bridgeDomain);
+        bridgeUrl.searchParams.set('trace_session', CONFIG.sessionId);
+        bridgeUrl.searchParams.set('trace_user', CONFIG.userId);
+        bridgeUrl.searchParams.set('redirect', targetUrl);
+        return bridgeUrl.toString();
+      } catch (e) {
+        debug('Failed to generate bridge URL', e);
+        return null;
+      }
+    },
+
+    /**
+     * Create a bridge link for cross-domain navigation
+     * @param {string} href - The target URL
+     * @param {string} bridgeDomain - The bridge domain (optional, uses CONFIG.crossDomains if not provided)
+     * @returns {string} The bridge URL or original href
+     */
+    decorateLink: function(href, bridgeDomain) {
+      if (!bridgeDomain && CONFIG.crossDomains && CONFIG.crossDomains.length > 0) {
+        bridgeDomain = CONFIG.crossDomains[0];
+      }
+
+      if (!bridgeDomain) {
+        return href;
+      }
+
+      try {
+        var targetUrl = new URL(href, window.location.href);
+        var targetDomain = targetUrl.hostname;
+
+        // Check if target is a cross-domain
+        var isCrossDomain = false;
+        if (CONFIG.crossDomains) {
+          for (var i = 0; i < CONFIG.crossDomains.length; i++) {
+            var crossDomain = CONFIG.crossDomains[i];
+            if (targetDomain === crossDomain || targetDomain.endsWith('.' + crossDomain)) {
+              isCrossDomain = true;
+              break;
+            }
+          }
+        }
+
+        if (isCrossDomain && targetDomain !== window.location.hostname) {
+          return this.getBridgeUrl(bridgeDomain, href);
+        }
+      } catch (e) {
+        debug('Failed to decorate link with bridge', e);
+      }
+
+      return href;
     }
   };
 
@@ -503,6 +710,11 @@
       var link = links[i];
       var href = link.getAttribute('href');
 
+      // Skip if already decorated or has special attributes
+      if (!href || href.indexOf('trace_session=') > -1 || link.getAttribute('data-trace-skip') !== null) {
+        continue;
+      }
+
       // Decorate links to same domain, subdomains, or configured cross-domains
       try {
         var linkUrl = new URL(href, window.location.href);
@@ -518,6 +730,17 @@
     debug('Links decorated with session ID and user ID', {
       crossDomains: CONFIG.crossDomains
     });
+  }
+
+  /**
+   * Send TRACE IDs to all child iframes
+   */
+  function syncToIframes() {
+    var iframes = document.querySelectorAll('iframe');
+    for (var i = 0; i < iframes.length; i++) {
+      PostMessageUtils.sendToIframe(iframes[i]);
+    }
+    debug('Synced TRACE IDs to iframes', { count: iframes.length });
   }
 
   /**
@@ -562,6 +785,11 @@
   function init() {
     debug('Initializing TRACE');
 
+    // Set up PostMessage listener for iframe communication
+    window.addEventListener('message', function(event) {
+      PostMessageUtils.handleMessage(event);
+    });
+
     // Get or create session and user IDs
     getOrCreateSessionId();
     getOrCreateUserId();
@@ -597,6 +825,9 @@
       CONFIG.userId = linkUserId;
     }
 
+    // Send IDs to parent window if we're in an iframe
+    PostMessageUtils.sendToParent();
+
     // Capture initial pageview
     capturePageview();
 
@@ -605,6 +836,30 @@
     trackScrollDepth();
     trackClicks();
     decorateLinks();
+    syncToIframes();
+
+    // Watch for dynamically added iframes
+    var observer = new MutationObserver(function(mutations) {
+      mutations.forEach(function(mutation) {
+        if (mutation.type === 'childList') {
+          mutation.addedNodes.forEach(function(node) {
+            if (node.nodeName === 'IFRAME') {
+              PostMessageUtils.sendToIframe(node);
+            } else if (node.querySelectorAll) {
+              var iframes = node.querySelectorAll('iframe');
+              for (var i = 0; i < iframes.length; i++) {
+                PostMessageUtils.sendToIframe(iframes[i]);
+              }
+            }
+          });
+        }
+      });
+    });
+
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
 
     // Event listeners
     document.addEventListener('visibilitychange', handleVisibilityChange);
@@ -631,13 +886,14 @@
     debug('TRACE initialized', {
       sessionId: CONFIG.sessionId,
       userId: CONFIG.userId,
-      collectorUrl: CONFIG.collectorUrl
+      collectorUrl: CONFIG.collectorUrl,
+      inIframe: window.self !== window.top
     });
   }
 
   // Public API
   var TRACE = {
-    version: '1.1.0',
+    version: '1.2.0',
 
     /**
      * Send a custom event
@@ -714,6 +970,60 @@
       }
       getOrCreateSessionId();
       debug('Session reset', { storage: currentStorage });
+    },
+
+    /**
+     * Get a bridge URL for cross-domain cookie sharing
+     * @param {string} bridgeDomain - The domain hosting the bridge endpoint
+     * @param {string} targetUrl - The URL to redirect to after setting cookies
+     * @returns {string|null} The bridge URL or null
+     */
+    getBridgeUrl: function(bridgeDomain, targetUrl) {
+      return StorageBridge.getBridgeUrl(bridgeDomain, targetUrl);
+    },
+
+    /**
+     * Decorate a link with session ID and user ID
+     * @param {string} href - The link URL
+     * @returns {string} The decorated URL
+     */
+    decorateLink: function(href) {
+      if (!href) {
+        return href;
+      }
+      var sessionParam = 'trace_session=' + CONFIG.sessionId;
+      var userParam = 'trace_user=' + CONFIG.userId;
+      var separator = href.indexOf('?') > -1 ? '&' : '?';
+      return href + separator + sessionParam + '&' + userParam;
+    },
+
+    /**
+     * Send TRACE IDs to a specific iframe
+     * @param {HTMLIFrameElement} iframe - The iframe element
+     */
+    syncToIframe: function(iframe) {
+      PostMessageUtils.sendToIframe(iframe);
+    },
+
+    /**
+     * Send TRACE IDs to parent window (if in iframe)
+     */
+    syncToParent: function() {
+      PostMessageUtils.sendToParent();
+    },
+
+    /**
+     * Get current configuration
+     * @returns {object} Current configuration
+     */
+    getConfig: function() {
+      return {
+        collectorUrl: CONFIG.collectorUrl,
+        storage: currentStorage,
+        cookieDomain: CONFIG.cookieDomain,
+        crossDomains: CONFIG.crossDomains,
+        debug: CONFIG.debug
+      };
     }
   };
 

@@ -37,7 +37,7 @@ For basic pageview tracking only:
 - **Scroll Depth** - Tracks scroll thresholds at 25%, 50%, 75%, 90%
 - **Click Tracking** - Captures all link clicks with coordinates
 - **Session Stitching** - Decorates links with session ID for cross-site tracking
-- **Cross-Domain Tracking** - Track users across multiple domains and subdomains
+- **Cross-Domain Tracking** - Track users across multiple domains via link decoration, iframe PostMessage, and storage bridge
 - **First-Party Cookies** - Cookie-based identity and persistence with localStorage fallback
 - **Privacy-First** - First-party cookies or localStorage only, no third-party cookies
 - **SPA Support** - Works with React, Vue, Angular, and other SPAs
@@ -214,6 +214,49 @@ Create a new session:
 TRACE.reset();
 ```
 
+### `TRACE.getBridgeUrl(bridgeDomain, targetUrl)`
+
+Get a bridge URL for cross-domain cookie sharing:
+
+```javascript
+var bridgeUrl = TRACE.getBridgeUrl('shared-domain.com', 'https://target-domain.com/page');
+window.location.href = bridgeUrl;
+```
+
+### `TRACE.decorateLink(href)`
+
+Manually decorate a link with session and user IDs:
+
+```javascript
+var decoratedUrl = TRACE.decorateLink('https://shop.example.com/checkout');
+// Returns: https://shop.example.com/checkout?trace_session=xxx&trace_user=yyy
+```
+
+### `TRACE.syncToIframe(iframe)`
+
+Manually sync TRACE IDs to a specific iframe:
+
+```javascript
+TRACE.syncToIframe(document.getElementById('my-iframe'));
+```
+
+### `TRACE.syncToParent()`
+
+Manually sync TRACE IDs to parent window (if inside an iframe):
+
+```javascript
+TRACE.syncToParent();
+```
+
+### `TRACE.getConfig()`
+
+Get current TRACE configuration:
+
+```javascript
+var config = TRACE.getConfig();
+// Returns: { collectorUrl, storage, cookieDomain, crossDomains, debug }
+```
+
 ---
 
 ## Event Types
@@ -277,7 +320,11 @@ When a user clicks a decorated link, the destination page inherits the session I
 
 #### Cross-Domain Tracking
 
-To track users across multiple domains, configure the `data-cross-domains` attribute:
+TRACE supports multiple methods for tracking users across domains:
+
+##### Method 1: Link Decoration (Default)
+
+Configure the `data-cross-domains` attribute to automatically decorate links:
 
 ```html
 <script src="trace.js"
@@ -286,7 +333,7 @@ To track users across multiple domains, configure the `data-cross-domains` attri
 ```
 
 This will:
-1. Decorate links to the configured domains with the session ID
+1. Decorate links to the configured domains with session and user IDs
 2. Allow the session to persist across domain boundaries
 3. Enable user journey tracking across multiple properties
 
@@ -295,7 +342,74 @@ This will:
 - Follow users across related microsites
 - Measure cross-domain conversions and funnels
 
-**Note:** For cross-domain tracking to work, the TRACE JavaScript tag must be installed on all domains with the same `data-cross-domains` configuration.
+##### Method 2: PostMessage API (Iframe Communication)
+
+TRACE automatically shares session and user IDs between parent pages and iframes using the PostMessage API. This works automatically when:
+
+1. A page with TRACE contains iframes from other domains that also have TRACE installed
+2. TRACE is loaded inside an iframe on another domain
+
+**Parent page example:**
+```html
+<!-- On https://www.example.com -->
+<script src="trace.js" data-collector="https://trace.example.com/collect"></script>
+
+<iframe src="https://shop.example.com/product"></iframe>
+```
+
+**Iframe page example:**
+```html
+<!-- On https://shop.example.com -->
+<script src="trace.js" data-collector="https://trace.example.com/collect"></script>
+```
+
+The session and user IDs will be synchronized automatically between the domains.
+
+##### Method 3: Storage Bridge (For Non-Link Navigation)
+
+For navigation that doesn't use direct links (e.g., form posts, JavaScript redirects), use the storage bridge:
+
+```javascript
+// Generate a bridge URL
+var bridgeUrl = TRACE.getBridgeUrl('shared-domain.com', 'https://target-domain.com/page');
+
+// Use the bridge URL for navigation
+window.location.href = bridgeUrl;
+```
+
+The bridge will set the session and user cookies on the shared domain before redirecting to the target URL.
+
+##### Manual Cross-Domain Link Decoration
+
+For manual control over link decoration:
+
+```javascript
+// Get a decorated link URL
+var decoratedUrl = TRACE.decorateLink('https://shop.example.com/checkout');
+// Result: https://shop.example.com/checkout?trace_session=xxx&trace_user=yyy
+```
+
+##### Skip Link Decoration
+
+To prevent a specific link from being decorated:
+
+```html
+<a href="https://external.com" data-trace-skip>Skip tracking</a>
+```
+
+##### Manual Iframe Sync
+
+To manually sync IDs to an iframe or parent:
+
+```javascript
+// Sync to a specific iframe
+TRACE.syncToIframe(document.getElementById('my-iframe'));
+
+// Sync to parent (if inside an iframe)
+TRACE.syncToParent();
+```
+
+**Note:** For cross-domain tracking to work, the TRACE JavaScript tag must be installed on all domains with compatible configuration.
 
 ---
 
