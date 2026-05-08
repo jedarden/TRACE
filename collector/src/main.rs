@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
@@ -75,7 +75,7 @@ struct LogFile {
 
 impl LogFile {
     /// Open a new log file for the given hour
-    fn open(log_dir: &PathBuf, hour_key: &str) -> Result<Self> {
+    fn open(log_dir: &Path, hour_key: &str) -> Result<Self> {
         let path = log_dir.join(format!("events-{}.jsonl", hour_key));
         let file = OpenOptions::new()
             .create(true)

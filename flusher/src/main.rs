@@ -1,27 +1,22 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
-use aws_sdk_s3::{
-    types::{BucketLocationConstraint, CreateBucketConfiguration},
-    Client,
-};
+use aws_sdk_s3::{config::Region, Client};
 use aws_smithy_types::byte_stream::ByteStream;
 use chrono::{DateTime, Utc};
 use flate2::read::GzDecoder;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
-use parquet::{
-    arrow::arrow_writer::ArrowWriter,
-    file::properties::WriterProperties,
-};
+use parquet::{arrow::arrow_writer::ArrowWriter, file::properties::WriterProperties};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
+use tracing_subscriber::prelude::*;
 
 /// Event from the collector (matches collector schema)
 #[derive(Debug, Deserialize, Serialize)]
@@ -59,11 +54,10 @@ struct S3Client {
 
 impl S3Client {
     async fn new(config: S3Config) -> Result<Self> {
-        let aws_config = aws_config::load_defaults(BehaviorVersion::latest())
-            .await
-            .into_builder()
-            .region(config.region.clone())
-            .build()
+        let region = Region::new(config.region.clone());
+        let aws_config = aws_config::defaults(BehaviorVersion::latest())
+            .region(region)
+            .load()
             .await;
 
         let client = Client::new(&aws_config);
@@ -137,10 +131,7 @@ fn jsonl_to_parquet(events: Vec<CollectorEvent>) -> Result<Vec<u8>> {
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
-    let timestamps: Vec<i64> = events
-        .iter()
-        .map(|e| e.ts.timestamp_millis())
-        .collect();
+    let timestamps: Vec<i64> = events.iter().map(|e| e.ts.timestamp_millis()).collect();
     let ips: Vec<Option<String>> = events.iter().map(|e| e.ip.clone()).collect();
     let uas: Vec<Option<String>> = events.iter().map(|e| e.ua.clone()).collect();
     let urls: Vec<String> = events.iter().map(|e| e.url.clone()).collect();
@@ -148,13 +139,14 @@ fn jsonl_to_parquet(events: Vec<CollectorEvent>) -> Result<Vec<u8>> {
         .iter()
         .map(|e| serde_json::to_string(&e.params).unwrap_or_default())
         .collect();
-    let types: Vec<String> = events
-        .iter()
-        .map(|e| e.event_type.clone())
-        .collect();
+    let types: Vec<String> = events.iter().map(|e| e.event_type.clone()).collect();
 
     let schema = Schema::new(vec![
-        Field::new("ts", DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None), false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+            false,
+        ),
         Field::new("ip", DataType::Utf8, true),
         Field::new("ua", DataType::Utf8, true),
         Field::new("url", DataType::Utf8, false),
@@ -243,7 +235,10 @@ async fn move_to_dlq(state: &FlusherState, path: &PathBuf, error: &str) {
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
 
-    let dlq_path = state.dlq_dir.join(filename).with_extension("jsonl.gz.failed");
+    let dlq_path = state
+        .dlq_dir
+        .join(filename)
+        .with_extension("jsonl.gz.failed");
 
     if let Err(e) = tokio::fs::rename(path, &dlq_path).await {
         error!("Failed to move to DLQ: {}", e);
@@ -295,10 +290,7 @@ async fn handle_file(state: Arc<FlusherState>, path: PathBuf) {
             Err(e) => {
                 retries -= 1;
                 if retries > 0 {
-                    warn!(
-                        "Failed to process {}, retrying... ({})",
-                        filename, e
-                    );
+                    warn!("Failed to process {}, retrying... ({})", filename, e);
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 } else {
                     error!("Failed to process {} after retries: {}", filename, e);
@@ -361,12 +353,10 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let log_dir = PathBuf::from(
-        std::env::var("TRACE_LOG_DIR").unwrap_or_else(|_| "/data/logs".to_string()),
-    );
-    let dlq_dir = PathBuf::from(
-        std::env::var("TRACE_DLQ_DIR").unwrap_or_else(|_| "/data/dlq".to_string()),
-    );
+    let log_dir =
+        PathBuf::from(std::env::var("TRACE_LOG_DIR").unwrap_or_else(|_| "/data/logs".to_string()));
+    let dlq_dir =
+        PathBuf::from(std::env::var("TRACE_DLQ_DIR").unwrap_or_else(|_| "/data/dlq".to_string()));
     let s3_bucket = std::env::var("TRACE_S3_BUCKET").expect("TRACE_S3_BUCKET must be set");
     let s3_region = std::env::var("TRACE_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
     let s3_prefix = std::env::var("TRACE_S3_PREFIX").unwrap_or_else(|_| "trace-events".to_string());
