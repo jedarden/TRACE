@@ -232,6 +232,56 @@ impl NetworkNormalizer {
             .with_item_id(item_id)
     }
 
+    /// Normalize Meta Ads (Facebook/Instagram) parameters
+    ///
+    /// Meta Ads uses: fbclid, campaign_id, adset_id, ad_id
+    /// Also supports standard UTM parameters: utm_campaign, utm_content, utm_term
+    fn normalize_meta(params: &HashMap<String, String>) -> NormalizedCampaign {
+        // Meta Ads uses standard UTM parameters for campaign tracking
+        let campaign_id = params.get("utm_campaign")
+            .or_else(|| params.get("campaignid"))
+            .or_else(|| params.get("campaign_id"))
+            .map(|s| s.to_string());
+
+        // For Meta Ads, creative_id can be derived from multiple sources
+        // - ad_id for ad level tracking
+        // - adset_id for ad set level tracking
+        // - UTM content for custom tracking
+        let creative_id = params.get("ad_id")
+            .or_else(|| params.get("adid"))
+            .or_else(|| params.get("adset_id"))
+            .or_else(|| params.get("adsetid"))
+            .or_else(|| params.get("utm_content"))
+            .map(|s| s.to_string());
+
+        // Headline/text from various Meta Ads parameters
+        let headline = params.get("headline")
+            .or_else(|| params.get("ad_name"))
+            .or_else(|| params.get("adname"))
+            .or_else(|| params.get("utm_term"))
+            .map(|s| s.to_string());
+
+        // Image ID for display ads
+        let image_id = params.get("imageid")
+            .or_else(|| params.get("image_id"))
+            .or_else(|| params.get("creative"))
+            .map(|s| s.to_string());
+
+        // Item ID can be ad ID or adset ID
+        let item_id = params.get("ad_id")
+            .or_else(|| params.get("adid"))
+            .or_else(|| params.get("adset_id"))
+            .or_else(|| params.get("adsetid"))
+            .map(|s| s.to_string());
+
+        NormalizedCampaign::new("meta")
+            .with_campaign_id(campaign_id)
+            .with_creative_id(creative_id)
+            .with_headline(headline)
+            .with_image_id(image_id)
+            .with_item_id(item_id)
+    }
+
     /// Normalize generic/unknown network parameters
     ///
     /// Falls back to utm_campaign and tries to find any headline/title/image params
@@ -594,6 +644,162 @@ mod tests {
 
         params.clear();
         params.insert("campaignid".to_string(), "camp123".to_string());
+        assert!(NetworkNormalizer::has_campaign_data(&params));
+    }
+
+    #[test]
+    fn test_detect_network_meta_facebook_utm_source() {
+        let mut params = HashMap::new();
+        params.insert("utm_source".to_string(), "facebook".to_string());
+        assert_eq!(NetworkNormalizer::detect_network(&params), "meta");
+
+        params.clear();
+        params.insert("utm_source".to_string(), "instagram".to_string());
+        assert_eq!(NetworkNormalizer::detect_network(&params), "meta");
+
+        params.clear();
+        params.insert("utm_source".to_string(), "meta".to_string());
+        assert_eq!(NetworkNormalizer::detect_network(&params), "meta");
+    }
+
+    #[test]
+    fn test_detect_network_meta_fbclid() {
+        let mut params = HashMap::new();
+        params.insert("fbclid".to_string(), "Cj0KCQjw-5FhBRD_ARIsAP".to_string());
+        assert_eq!(NetworkNormalizer::detect_network(&params), "meta");
+    }
+
+    #[test]
+    fn test_detect_network_meta_igshid() {
+        let mut params = HashMap::new();
+        params.insert("igshid".to_string(), "XYZ123abc".to_string());
+        assert_eq!(NetworkNormalizer::detect_network(&params), "meta");
+    }
+
+    #[test]
+    fn test_normalize_meta_with_utm_params() {
+        let mut params = HashMap::new();
+        params.insert("utm_source".to_string(), "facebook".to_string());
+        params.insert("utm_campaign".to_string(), "summer_sale_2024".to_string());
+        params.insert("utm_content".to_string(), "ad_variant_b".to_string());
+        params.insert("utm_term".to_string(), "running shoes".to_string());
+
+        let normalized = NetworkNormalizer::normalize(&params);
+
+        assert_eq!(normalized.network, "meta");
+        assert_eq!(normalized.campaign_id, Some("summer_sale_2024".to_string()));
+        assert_eq!(normalized.creative_id, Some("ad_variant_b".to_string()));
+        assert_eq!(normalized.headline, Some("running shoes".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_meta_with_ad_id() {
+        let mut params = HashMap::new();
+        params.insert("utm_source".to_string(), "instagram".to_string());
+        params.insert("campaign_id".to_string(), "123456789".to_string());
+        params.insert("ad_id".to_string(), "987654321".to_string());
+
+        let normalized = NetworkNormalizer::normalize(&params);
+
+        assert_eq!(normalized.network, "meta");
+        assert_eq!(normalized.campaign_id, Some("123456789".to_string()));
+        assert_eq!(normalized.creative_id, Some("987654321".to_string()));
+        assert_eq!(normalized.item_id, Some("987654321".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_meta_with_adset_id() {
+        let mut params = HashMap::new();
+        params.insert("utm_source".to_string(), "meta".to_string());
+        params.insert("adset_id".to_string(), "adset_12345".to_string());
+
+        let normalized = NetworkNormalizer::normalize(&params);
+
+        assert_eq!(normalized.network, "meta");
+        assert_eq!(normalized.creative_id, Some("adset_12345".to_string()));
+        assert_eq!(normalized.item_id, Some("adset_12345".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_meta_with_ad_name() {
+        let mut params = HashMap::new();
+        params.insert("utm_source".to_string(), "facebook".to_string());
+        params.insert("ad_name".to_string(), "Best Product Ad".to_string());
+
+        let normalized = NetworkNormalizer::normalize(&params);
+
+        assert_eq!(normalized.network, "meta");
+        assert_eq!(normalized.headline, Some("Best Product Ad".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_meta_with_image() {
+        let mut params = HashMap::new();
+        params.insert("utm_source".to_string(), "instagram".to_string());
+        params.insert("imageid".to_string(), "img_banner_123".to_string());
+        params.insert("headline".to_string(), "Limited Time Offer".to_string());
+
+        let normalized = NetworkNormalizer::normalize(&params);
+
+        assert_eq!(normalized.network, "meta");
+        assert_eq!(normalized.image_id, Some("img_banner_123".to_string()));
+        assert_eq!(normalized.headline, Some("Limited Time Offer".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_meta_fbclid_only() {
+        let mut params = HashMap::new();
+        params.insert("fbclid".to_string(), "Cj0KCQjw-5FhBRD_ARIsAP".to_string());
+
+        let normalized = NetworkNormalizer::normalize(&params);
+
+        assert_eq!(normalized.network, "meta");
+        // With only fbclid, most fields should be None
+        assert!(normalized.campaign_id.is_none());
+        assert!(normalized.creative_id.is_none());
+    }
+
+    #[test]
+    fn test_normalize_meta_complete() {
+        let mut params = HashMap::new();
+        params.insert("utm_source".to_string(), "facebook".to_string());
+        params.insert("utm_campaign".to_string(), "q4_promo".to_string());
+        params.insert("ad_id".to_string(), "ad_238512345".to_string());
+        params.insert("adset_id".to_string(), "adset_238598765".to_string());
+        params.insert("ad_name".to_string(), "Holiday Sale - 50% Off".to_string());
+        params.insert("imageid".to_string(), "img_holiday_456".to_string());
+
+        let normalized = NetworkNormalizer::normalize(&params);
+
+        assert_eq!(normalized.network, "meta");
+        assert_eq!(normalized.campaign_id, Some("q4_promo".to_string()));
+        assert_eq!(normalized.creative_id, Some("ad_238512345".to_string()));
+        assert_eq!(normalized.headline, Some("Holiday Sale - 50% Off".to_string()));
+        assert_eq!(normalized.image_id, Some("img_holiday_456".to_string()));
+        assert_eq!(normalized.item_id, Some("ad_238512345".to_string()));
+    }
+
+    #[test]
+    fn test_creative_fingerprint_meta() {
+        let mut params = HashMap::new();
+        params.insert("utm_source".to_string(), "instagram".to_string());
+        params.insert("ad_id".to_string(), "ad_12345".to_string());
+        params.insert("ad_name".to_string(), "Test Ad Name".to_string());
+
+        let normalized = NetworkNormalizer::normalize(&params);
+        let fingerprint = NetworkNormalizer::creative_fingerprint(&normalized);
+
+        assert_eq!(fingerprint, Some("meta:ad_12345:Test Ad Name".to_string()));
+    }
+
+    #[test]
+    fn test_has_campaign_data_meta() {
+        let mut params = HashMap::new();
+        params.insert("fbclid".to_string(), "test_fbclid".to_string());
+        assert!(NetworkNormalizer::has_campaign_data(&params));
+
+        params.clear();
+        params.insert("ad_id".to_string(), "ad_123".to_string());
         assert!(NetworkNormalizer::has_campaign_data(&params));
     }
 }
