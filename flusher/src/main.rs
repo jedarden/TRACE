@@ -171,7 +171,13 @@ impl BatchAccumulator {
             self.oldest_entry_at = Some(now);
         }
 
-        let key = format!("{}/part-{:05}.parquet", partition_key, self.entries.len());
+        // Get the current count for this partition to generate a unique part number
+        let part_number = self
+            .entries
+            .get(&partition_key)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let key = format!("{}/part-{:05}.parquet", partition_key, part_number);
         let entry = BatchEntry {
             data,
             key,
@@ -589,6 +595,25 @@ async fn main() -> Result<()> {
     let s3_prefix = std::env::var("TRACE_S3_PREFIX").unwrap_or_else(|_| "trace-events".to_string());
     let s3_endpoint = std::env::var("TRACE_S3_ENDPOINT").ok();
 
+    // Batch configuration from environment
+    let max_batch_size_bytes = std::env::var("TRACE_BATCH_MAX_SIZE_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10 * 1024 * 1024);
+    let max_batch_age_secs = std::env::var("TRACE_BATCH_MAX_AGE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300);
+
+    let batch_config = BatchConfig {
+        max_batch_size_bytes,
+        max_batch_age_secs,
+    };
+    info!(
+        "Batch config: max_size_bytes={}, max_age_secs={}",
+        batch_config.max_batch_size_bytes, batch_config.max_batch_age_secs
+    );
+
     // Create directories
     tokio::fs::create_dir_all(&log_dir).await?;
     tokio::fs::create_dir_all(&dlq_dir).await?;
@@ -607,12 +632,6 @@ async fn main() -> Result<()> {
 
     let s3_client = S3Client::new(s3_config.clone()).await?;
     let s3: Arc<dyn S3Upload> = Arc::new(s3_client);
-
-    let batch_config = BatchConfig::default();
-    info!(
-        "Batch config: max_size_bytes={}, max_age_secs={}",
-        batch_config.max_batch_size_bytes, batch_config.max_batch_age_secs
-    );
 
     let state = Arc::new(FlusherState {
         log_dir,
@@ -820,5 +839,114 @@ mod tests {
         assert_eq!(uploads.len(), 1);
         assert_eq!(uploads[0].0, "test-key");
         assert_eq!(uploads[0].1, b"test data");
+    }
+
+    #[test]
+    fn test_batch_accumulator_size_trigger() {
+        let config = BatchConfig {
+            max_batch_size_bytes: 100,
+            max_batch_age_secs: 300,
+        };
+        let mut accumulator = BatchAccumulator::new(config);
+
+        // Add first entry (50 bytes)
+        let result = accumulator.add(
+            "events/dt=2026-05-08/hour=14".to_string(),
+            vec![0u8; 50],
+            PathBuf::from("/tmp/test1.jsonl.gz"),
+        );
+        assert!(matches!(result, AddedToBatch::Continue));
+
+        // Add second entry (50 bytes, total 100 bytes)
+        let result = accumulator.add(
+            "events/dt=2026-05-08/hour=14".to_string(),
+            vec![0u8; 50],
+            PathBuf::from("/tmp/test2.jsonl.gz"),
+        );
+        assert!(matches!(result, AddedToBatch::ShouldFlushSize(100)));
+    }
+
+    #[test]
+    fn test_batch_accumulator_time_trigger() {
+        let config = BatchConfig {
+            max_batch_size_bytes: 10 * 1024 * 1024,
+            max_batch_age_secs: 1,
+        };
+        let mut accumulator = BatchAccumulator::new(config);
+
+        // Add entry
+        let result = accumulator.add(
+            "events/dt=2026-05-08/hour=14".to_string(),
+            vec![0u8; 100],
+            PathBuf::from("/tmp/test1.jsonl.gz"),
+        );
+        assert!(matches!(result, AddedToBatch::Continue));
+
+        // Wait for age trigger
+        std::thread::sleep(Duration::from_secs(2));
+
+        // Check should_flush
+        let result = accumulator.should_flush();
+        assert!(matches!(result, AddedToBatch::ShouldFlushTime(_)));
+    }
+
+    #[test]
+    fn test_batch_accumulator_drain() {
+        let config = BatchConfig::default();
+        let mut accumulator = BatchAccumulator::new(config);
+
+        // Add entries
+        accumulator.add(
+            "events/dt=2026-05-08/hour=14".to_string(),
+            vec![0u8; 100],
+            PathBuf::from("/tmp/test1.jsonl.gz"),
+        );
+        accumulator.add(
+            "events/dt=2026-05-08/hour=15".to_string(),
+            vec![0u8; 100],
+            PathBuf::from("/tmp/test2.jsonl.gz"),
+        );
+
+        assert_eq!(accumulator.entry_count(), 2);
+        assert_eq!(accumulator.size_bytes(), 200);
+
+        // Drain
+        let entries = accumulator.drain();
+
+        assert_eq!(entries.len(), 2); // 2 partition keys
+        assert_eq!(accumulator.entry_count(), 0);
+        assert_eq!(accumulator.size_bytes(), 0);
+        assert!(accumulator.oldest_entry_at.is_none());
+    }
+
+    #[test]
+    fn test_batch_accumulator_multiple_partitions() {
+        let config = BatchConfig::default();
+        let mut accumulator = BatchAccumulator::new(config);
+
+        // Add entries to different partitions
+        accumulator.add(
+            "events/dt=2026-05-08/hour=14".to_string(),
+            vec![0u8; 100],
+            PathBuf::from("/tmp/test1.jsonl.gz"),
+        );
+        accumulator.add(
+            "events/dt=2026-05-08/hour=14".to_string(),
+            vec![0u8; 100],
+            PathBuf::from("/tmp/test2.jsonl.gz"),
+        );
+        accumulator.add(
+            "events/dt=2026-05-08/hour=15".to_string(),
+            vec![0u8; 100],
+            PathBuf::from("/tmp/test3.jsonl.gz"),
+        );
+
+        assert_eq!(accumulator.entry_count(), 3);
+        assert_eq!(accumulator.size_bytes(), 300);
+
+        let entries = accumulator.drain();
+        assert_eq!(entries.len(), 2); // 2 partition keys
+        assert_eq!(entries.get("events/dt=2026-05-08/hour=14").unwrap().len(), 2);
+        assert_eq!(entries.get("events/dt=2026-05-08/hour=15").unwrap().len(), 1);
     }
 }
