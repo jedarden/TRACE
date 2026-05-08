@@ -1,4 +1,6 @@
 mod normalizer;
+mod queue;
+mod validator;
 
 use anyhow::Result;
 use axum::{
@@ -74,6 +76,8 @@ struct CollectorState {
     log_dir: PathBuf,
     /// Current log file buffer
     current: Arc<tokio::sync::Mutex<Option<LogFile>>>,
+    /// Queue producer for event buffering
+    queue: Arc<dyn queue::QueueProducer>,
 }
 
 /// Handle to the current log file with rotation tracking
@@ -207,30 +211,58 @@ async fn collect_json(
 
     let params = extract_params(&url);
 
+    // Validate and normalize the event payload
+    let validated = match validator::EventValidator::validate(
+        &payload.r#type,
+        Some(&url),
+        &params,
+        &payload.extra,
+    ) {
+        Ok(v) => v,
+        Err(errors) => {
+            // Log validation errors but still process with defaults
+            for e in &errors {
+                warn!("Validation error on field '{}': {}", e.field, e.message);
+            }
+            // Return early for critical errors (invalid event type or URL)
+            if errors.iter().any(|e| e.field == "type" || e.field == "url") {
+                return Err(CollectError::Validation);
+            }
+            // For non-critical errors, continue with sanitized data
+            validator::EventValidator::validate(
+                &payload.r#type,
+                Some(&url),
+                &params,
+                &payload.extra,
+            )
+            .unwrap_or_else(|_| validator::ValidatedEvent {
+                event_type: "pageview".to_string(),
+                url: "unknown".to_string(),
+                params: validator::EventValidator::sanitize_params(&params),
+                session_id: None,
+                user_id: None,
+                extra: payload.extra.clone(),
+            })
+        }
+    };
+
     // Normalize campaign data if present
-    let normalized = if normalizer::NetworkNormalizer::has_campaign_data(&params) {
-        Some(normalizer::NetworkNormalizer::normalize(&params))
+    let normalized = if normalizer::NetworkNormalizer::has_campaign_data(&validated.params) {
+        Some(normalizer::NetworkNormalizer::normalize(&validated.params))
     } else {
         None
     };
-
-    // Extract session_id and user_id from payload
-    let session_id = extract_string_field(&payload, "session_id");
-    let user_id = extract_string_field(&payload, "user_id");
-
-    // Also check for trace_session in URL params (link decoration)
-    let link_session = params.get("trace_session").map(|s| s.to_string());
 
     let event = Event {
         ts: Utc::now(),
         ip,
         ua,
-        url,
-        params,
-        r#type: payload.r#type,
+        url: validated.url,
+        params: validated.params,
+        r#type: validated.event_type,
         normalized,
-        session_id: session_id.or(link_session),
-        user_id,
+        session_id: validated.session_id,
+        user_id: validated.user_id,
     };
 
     write_event(&state, &event).await?;
@@ -279,31 +311,65 @@ async fn collect_query(
 
     let event_type = params.get("type").cloned().unwrap_or_else(|| "pageview".to_string());
 
+    // Convert query params to extra format for validation
+    let extra: HashMap<String, serde_json::Value> = params
+        .iter()
+        .filter(|(k, _)| *k != "url" && *k != "type")
+        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+        .collect();
+
+    // Validate and normalize the event payload
+    let validated = match validator::EventValidator::validate(
+        &event_type,
+        Some(&url),
+        &params,
+        &extra,
+    ) {
+        Ok(v) => v,
+        Err(errors) => {
+            // Log validation errors but still process with defaults
+            for e in &errors {
+                warn!("Validation error on field '{}': {}", e.field, e.message);
+            }
+            // Return early for critical errors (invalid event type or URL)
+            if errors.iter().any(|e| e.field == "type" || e.field == "url") {
+                return Err(CollectError::Validation);
+            }
+            // For non-critical errors, continue with sanitized data
+            validator::EventValidator::validate(
+                &event_type,
+                Some(&url),
+                &params,
+                &extra,
+            )
+            .unwrap_or_else(|_| validator::ValidatedEvent {
+                event_type: "pageview".to_string(),
+                url: "unknown".to_string(),
+                params: validator::EventValidator::sanitize_params(&params),
+                session_id: None,
+                user_id: None,
+                extra,
+            })
+        }
+    };
+
     // Normalize campaign data if present
-    let normalized = if normalizer::NetworkNormalizer::has_campaign_data(&params) {
-        Some(normalizer::NetworkNormalizer::normalize(&params))
+    let normalized = if normalizer::NetworkNormalizer::has_campaign_data(&validated.params) {
+        Some(normalizer::NetworkNormalizer::normalize(&validated.params))
     } else {
         None
     };
-
-    // Extract session_id and user_id from query params
-    // Check both direct params and trace_session (link decoration)
-    let session_id = params
-        .get("session_id")
-        .or_else(|| params.get("trace_session"))
-        .map(|s| s.to_string());
-    let user_id = params.get("user_id").map(|s| s.to_string());
 
     let event = Event {
         ts: Utc::now(),
         ip,
         ua,
-        url: url.clone(),
-        params,
-        r#type: event_type,
+        url: validated.url,
+        params: validated.params,
+        r#type: validated.event_type,
         normalized,
-        session_id,
-        user_id,
+        session_id: validated.session_id,
+        user_id: validated.user_id,
     };
 
     write_event(&state, &event).await?;
@@ -325,6 +391,9 @@ fn extract_params(url: &str) -> HashMap<String, String> {
 }
 
 /// Write event to the current log file with rotation
+///
+/// First attempts to send the event to the configured queue backend.
+/// If queue send fails, falls back to writing directly to log files.
 async fn write_event(state: &CollectorState, event: &Event) -> Result<(), CollectError> {
     let current_key = current_hour_key();
     let line = serde_json::to_string(event).map_err(|e| {
@@ -332,6 +401,15 @@ async fn write_event(state: &CollectorState, event: &Event) -> Result<(), Collec
         CollectError::Json
     })?;
 
+    // Try to send to queue first
+    if let Err(e) = state.queue.send(&line).await {
+        warn!("Queue send failed ({}), falling back to file write: {}", state.queue.name(), e);
+    } else {
+        // Queue send succeeded, skip file write
+        return Ok(());
+    }
+
+    // Fallback: write directly to log file
     let mut current = state.current.lock().await;
 
     // Check if we need to rotate
@@ -386,6 +464,7 @@ async fn write_event(state: &CollectorState, event: &Event) -> Result<(), Collec
 enum CollectError {
     Json,
     Io,
+    Validation,
 }
 
 impl IntoResponse for CollectError {
@@ -439,9 +518,15 @@ async fn main() -> Result<()> {
     // Create log directory if it doesn't exist
     tokio::fs::create_dir_all(&log_dir).await?;
 
+    // Initialize queue producer from environment configuration
+    let queue_backend = queue::QueueBackend::from_env();
+    let queue = queue::create_producer(queue_backend)?;
+    info!("Queue backend initialized: {}", queue.name());
+
     let state = CollectorState {
         log_dir,
         current: Arc::new(tokio::sync::Mutex::new(None)),
+        queue,
     };
 
     // Initialize the first log file
