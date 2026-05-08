@@ -16,3 +16,10 @@
 # OS
 .DS_Store
 Thumbs.db
+
+# Beads (local task tracking)
+.beads/
+.needle-predispatch-sha
+
+# Build artifacts in subdirectories
+**/target/

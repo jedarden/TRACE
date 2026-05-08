@@ -248,15 +248,106 @@ SELECT * FROM cross_network_creatives
 WHERE num_networks >= 2;
 ```
 
-#### Ad Network API Sync (Planned)
+#### Ad Network API Sync ✅ COMPLETE
 
-**Goal**: Fetch creative metadata from ad network APIs for enrichment.
+**Status**: Syncer service implemented with support for all major ad networks
 
 **Implementation**:
-1. **API Sync Jobs**: Periodic fetch from ad network APIs
-2. **Creative Registry**: Store creative metadata (image URLs, headlines, landing pages)
-3. **Asset Tagging**: Tag images/headlines with semantic categories
-4. **Performance Attribution**: Join events with creative registry
+1. **API Sync Jobs**: Periodic fetch from ad network APIs ✅
+2. **Creative Registry**: Store creative metadata (image URLs, headlines, landing pages) ✅
+3. **Asset Tagging**: Tag images/headlines with semantic categories (future enhancement)
+4. **Performance Attribution**: Join events with creative registry (via S3 Parquet files) ✅
+
+#### Syncer Service (`syncer/`)
+
+The syncer service fetches creative metadata from ad network APIs and stores it in S3 as Parquet files for enrichment.
+
+**Supported Networks**:
+- Taboola (Backstage API)
+- Outbrain (Amplify API)
+- MGID API
+- RevContent API
+- Demo client (for testing without API keys)
+
+**Features**:
+- Configurable sync interval (default: 1 hour)
+- One-shot mode (`--once`) for CI/CD
+- Network filtering (`--networks taboola,outbrain`)
+- In-memory registry with S3 persistence
+- Parquet storage for efficient querying
+
+**Tech Stack**: Rust, AWS SDK, Parquet/Arrow, reqwest
+
+**API Client Structure**:
+```rust
+pub trait ApiClient {
+    async fn fetch_creatives(&mut self) -> Result<ApiSyncResult>;
+    fn network_name(&self) -> &str;
+}
+```
+
+**Creative Metadata Schema**:
+```rust
+pub struct CreativeMetadata {
+    pub network: String,
+    pub campaign_id: Option<String>,
+    pub campaign_name: Option<String>,
+    pub creative_id: Option<String>,
+    pub headline: Option<String>,
+    pub image_url: Option<String>,
+    pub landing_page_url: Option<String>,
+    pub item_id: Option<String>,
+    pub synced_at: DateTime<Utc>,
+}
+```
+
+**Usage**:
+```bash
+# Run once and exit
+trace-syncer --once
+
+# Continuous sync mode (default interval: 1 hour)
+trace-syncer --interval 3600
+
+# Sync specific networks only
+trace-syncer --networks taboola,outbrain
+```
+
+**Environment Variables**:
+```
+TRACE_S3_BUCKET=my-trace-bucket
+TRACE_S3_REGION=us-east-1
+TRACE_S3_PREFIX=trace-events
+TABOOLA_API_KEY=xxx          # Optional
+OUTBRAIN_API_KEY=xxx         # Optional
+MGID_API_KEY=xxx             # Optional
+REVCONTENT_API_KEY=xxx       # Optional
+```
+
+**S3 Storage**:
+- Registry stored as `s3://bucket/creative-registry.parquet`
+- Can be loaded directly in DuckDB for joining with event data
+
+**DuckDB Integration**:
+```sql
+-- Load creative registry
+CREATE TABLE creatives AS
+SELECT * FROM read_parquet('s3://bucket/trace-events/creative-registry.parquet');
+
+-- Join with events for enriched attribution
+SELECT
+    e.network,
+    c.headline,
+    c.image_url,
+    c.landing_page_url,
+    COUNT(*) FILTER (WHERE e.type = 'click') AS clicks
+FROM events e
+LEFT JOIN creatives c
+    ON e.network = c.network
+    AND e.params:utm_campaign = c.campaign_id
+    AND e.params:tb_image = c.creative_id
+GROUP BY ALL;
+```
 
 ---
 
@@ -400,23 +491,27 @@ AWS_SESSION_TOKEN=***  # if using temporary creds
 | 3. Client JS Tag | ✅ Complete | 2026-05-30 |
 | 4. Cross-Network Normalization | ✅ Complete | 2026-05-08 |
 | 5. Analytics Layer | ✅ Complete | 2026-05-08 |
-| 6. Advanced Features | 📋 Planned | Future |
+| 6. Ad Network API Sync | ✅ Complete | 2026-05-08 |
 
 ---
 
 ## Open Questions
 
-1. **S3 vs MinIO**: Use cloud S3 or self-hosted MinIO for full on-prem?
-2. **Compaction cadence**: Daily vs weekly for Parquet merges?
-3. **Session storage**: Cookie vs localStorage for session IDs?
-4. **PII handling**: Should we hash IPs for GDPR compliance?
+1. **Session storage**: Cookie vs localStorage for session IDs? (Advanced feature)
+2. **PII handling**: Should we hash IPs for GDPR compliance? (Advanced feature)
+3. **Real-time streaming**: WebSocket support for live dashboards? (Advanced feature)
 
 ---
 
 ## Next Steps
 
 1. ✅ Create this plan document
-2. ⏳ Add flusher CI workflow template
-3. ⏳ Create ArgoCD manifests for deployment
-4. ⏳ Implement JS client tag
-5. ⏳ Set up S3 bucket and IAM policies
+2. ✅ Add flusher CI workflow template
+3. ✅ Add compactor CI workflow template
+4. ✅ Add syncer CI workflow template
+5. ✅ Implement JS client tag
+6. ✅ Implement ad network API sync
+7. ⏳ Create ArgoCD manifests for deployment
+8. ⏳ Set up S3 bucket and IAM policies
+9. ⏳ Add semantic tagging for headlines/images (future enhancement)
+10. ⏳ Implement real-time dashboard (future enhancement)
