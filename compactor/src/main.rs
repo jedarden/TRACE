@@ -1,3 +1,5 @@
+pub mod iceberg;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
@@ -25,29 +27,32 @@ fn parse_date_from_partition(path: &str) -> Option<NaiveDate> {
 
 /// S3 configuration
 #[derive(Clone)]
-struct S3Config {
-    bucket: String,
-    region: String,
-    key_prefix: String,
+pub struct S3Config {
+    pub bucket: String,
+    pub region: String,
+    pub key_prefix: String,
 }
 
 /// S3 operations trait for testability
 #[async_trait]
-trait S3Ops: Send + Sync {
+pub trait S3Ops: Send + Sync {
     async fn list_objects(&self, prefix: &str) -> Result<Vec<String>>;
     async fn get_object(&self, key: &str) -> Result<Vec<u8>>;
     async fn put_object(&self, key: &str, data: Vec<u8>) -> Result<()>;
     async fn delete_objects(&self, keys: Vec<String>) -> Result<()>;
+
+    /// Allow downcasting for accessing S3Client-specific methods
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// Real S3 implementation
-struct S3Client {
-    client: Client,
-    config: S3Config,
+pub struct S3Client {
+    pub client: Client,
+    pub config: S3Config,
 }
 
 impl S3Client {
-    async fn new(config: S3Config) -> Result<Self> {
+    pub async fn new(config: S3Config) -> Result<Self> {
         let region = Region::new(config.region.clone());
         let aws_config = aws_config::defaults(BehaviorVersion::latest())
             .region(region)
@@ -59,13 +64,16 @@ impl S3Client {
         Ok(Self { client, config })
     }
 
-    fn full_key(&self, key: &str) -> String {
+    pub fn full_key(&self, key: &str) -> String {
         format!("{}/{}", self.config.key_prefix, key)
     }
 }
 
 #[async_trait]
 impl S3Ops for S3Client {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     async fn list_objects(&self, prefix: &str) -> Result<Vec<String>> {
         let full_prefix = self.full_key(prefix);
 
@@ -206,7 +214,7 @@ impl Default for CompactorConfig {
 }
 
 /// Merge multiple Parquet files into one
-async fn merge_parquet_files(
+pub async fn merge_parquet_files(
     s3: Arc<dyn S3Ops>,
     keys: Vec<String>,
     target_row_group_size: usize,
@@ -486,6 +494,14 @@ async fn main() -> Result<()> {
     let s3_prefix =
         std::env::var("TRACE_S3_PREFIX").unwrap_or_else(|_| "trace-events".to_string());
 
+    // Check if we should run Iceberg compaction
+    // Set ICEBERG_COMPACTION=true to enable Iceberg table compaction
+    // instead of regular event compaction
+    let iceberg_mode = std::env::var("ICEBERG_COMPACTION")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(false);
+
     let lookback_days = std::env::var("COMPACTOR_LOOKBACK_DAYS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -500,32 +516,48 @@ async fn main() -> Result<()> {
     let s3_client = S3Client::new(s3_config.clone()).await?;
     let s3: Arc<dyn S3Ops> = Arc::new(s3_client);
 
-    let config = CompactorConfig {
-        lookback_days,
-        ..Default::default()
-    };
+    if iceberg_mode {
+        // Run Iceberg compaction
+        let iceberg_config = iceberg::IcebergCompactorConfig {
+            lookback_days,
+            ..Default::default()
+        };
 
-    let state = Arc::new(CompactorState {
-        s3,
-        config,
-        last_run: Arc::new(Mutex::new(None)),
-    });
-
-    // Run once on startup
-    info!("Running initial compaction");
-    if let Err(e) = scheduled_compaction(state.clone()).await {
-        error!("Initial compaction failed: {}", e);
-    }
-
-    // Enter scheduling mode - wait for SIGTERM
-    info!("TRACE compactor running (waiting for scheduled runs or shutdown)");
-
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!("Shutting down...");
+        info!("Starting Iceberg compaction mode");
+        if let Err(e) = iceberg::run_iceberg_compaction(s3, iceberg_config).await {
+            error!("Iceberg compaction failed: {}", e);
+            return Err(e);
         }
-        _ = shutdown_signal() => {
-            info!("Shutting down...");
+        info!("Iceberg compaction completed successfully");
+    } else {
+        // Run regular event compaction
+        let config = CompactorConfig {
+            lookback_days,
+            ..Default::default()
+        };
+
+        let state = Arc::new(CompactorState {
+            s3,
+            config,
+            last_run: Arc::new(Mutex::new(None)),
+        });
+
+        // Run once on startup
+        info!("Running initial compaction");
+        if let Err(e) = scheduled_compaction(state.clone()).await {
+            error!("Initial compaction failed: {}", e);
+        }
+
+        // Enter scheduling mode - wait for SIGTERM
+        info!("TRACE compactor running (waiting for scheduled runs or shutdown)");
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("Shutting down...");
+            }
+            _ = shutdown_signal() => {
+                info!("Shutting down...");
+            }
         }
     }
 
@@ -587,6 +619,9 @@ mod tests {
 
     #[async_trait]
     impl S3Ops for MockS3 {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
         async fn list_objects(&self, prefix: &str) -> Result<Vec<String>> {
             let store = self.data.lock().await;
             let keys: Vec<String> = store

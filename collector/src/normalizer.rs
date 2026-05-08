@@ -9,7 +9,7 @@ use std::collections::HashMap;
 /// Normalized campaign data across all ad networks
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedCampaign {
-    /// Detected ad network (taboola, outbrain, mgid, revcontent, unknown)
+    /// Detected ad network (taboola, outbrain, mgid, revcontent, googleads, meta, unknown)
     pub network: String,
     /// Network's campaign identifier
     pub campaign_id: Option<String>,
@@ -85,6 +85,8 @@ impl NetworkNormalizer {
                 "outbrain" | "ob" => "outbrain",
                 "mgid" => "mgid",
                 "revcontent" | "rc" => "revcontent",
+                "google" | "googleads" | "google-ads" => "googleads",
+                "facebook" | "instagram" | "meta" => "meta",
                 "adventory" => "adventory",
                 "contentad" => "contentad",
                 _ => Self::detect_from_params(params),
@@ -99,7 +101,12 @@ impl NetworkNormalizer {
         let keys: Vec<_> = params.keys().map(|k| k.to_lowercase()).collect();
 
         // Check for network-specific prefixes
-        if keys.iter().any(|k| k.starts_with("tb_")) {
+        // Meta Ads: check for fbclid (Facebook Click Identifier) first
+        if keys.iter().any(|k| k == "fbclid" || k == "igshid") {
+            "meta"
+        } else if keys.iter().any(|k| k == "gclid" || k == "gclsrc") {
+            "googleads"
+        } else if keys.iter().any(|k| k.starts_with("tb_")) {
             "taboola"
         } else if keys.iter().any(|k| k.starts_with("ob_")) {
             "outbrain"
@@ -121,6 +128,8 @@ impl NetworkNormalizer {
             "outbrain" => Self::normalize_outbrain(params),
             "mgid" => Self::normalize_mgid(params),
             "revcontent" => Self::normalize_revcontent(params),
+            "googleads" => Self::normalize_googleads(params),
+            "meta" => Self::normalize_meta(params),
             _ => Self::normalize_generic(params),
         }
     }
@@ -170,6 +179,57 @@ impl NetworkNormalizer {
             .with_creative_id(params.get("rc_id").map(|s| s.to_string()))
             .with_headline(params.get("rc_title").map(|s| s.to_string()))
             .with_image_id(params.get("rc_thumb").map(|s| s.to_string()))
+    }
+
+    /// Normalize Google Ads parameters
+    ///
+    /// Google Ads uses: gclid, campaignid, adgroupid, target, keyword, placement, feeditemid
+    /// Also supports standard UTM parameters: utm_campaign, utm_content, utm_term
+    fn normalize_googleads(params: &HashMap<String, String>) -> NormalizedCampaign {
+        // Google Ads uses standard UTM parameters for campaign tracking
+        let campaign_id = params.get("utm_campaign")
+            .or_else(|| params.get("campaignid"))
+            .or_else(|| params.get("campaign_id"))
+            .map(|s| s.to_string());
+
+        // For Google Ads, creative_id can be derived from multiple sources
+        // - adgroupid for ad group level tracking
+        // - feeditemid for shopping ads
+        // - UTM content for custom tracking
+        let creative_id = params.get("adgroupid")
+            .or_else(|| params.get("adgroup_id"))
+            .or_else(|| params.get("feeditemid"))
+            .or_else(|| params.get("feed_item_id"))
+            .or_else(|| params.get("utm_content"))
+            .map(|s| s.to_string());
+
+        // Headline/text from various Google Ads parameters
+        let headline = params.get("headline")
+            .or_else(|| params.get("keyword"))
+            .or_else(|| params.get("placement"))
+            .or_else(|| params.get("utm_term"))
+            .or_else(|| params.get("target"))
+            .map(|s| s.to_string());
+
+        // Image ID for display ads
+        let image_id = params.get("imageid")
+            .or_else(|| params.get("image_id"))
+            .or_else(|| params.get("creative"))
+            .map(|s| s.to_string());
+
+        // Item ID can be feed item ID or ad group ID
+        let item_id = params.get("feeditemid")
+            .or_else(|| params.get("feed_item_id"))
+            .or_else(|| params.get("adgroupid"))
+            .or_else(|| params.get("adgroup_id"))
+            .map(|s| s.to_string());
+
+        NormalizedCampaign::new("googleads")
+            .with_campaign_id(campaign_id)
+            .with_creative_id(creative_id)
+            .with_headline(headline)
+            .with_image_id(image_id)
+            .with_item_id(item_id)
     }
 
     /// Normalize generic/unknown network parameters
@@ -369,6 +429,171 @@ mod tests {
 
         params.clear();
         params.insert("tb_image".to_string(), "img123".to_string());
+        assert!(NetworkNormalizer::has_campaign_data(&params));
+    }
+
+    #[test]
+    fn test_detect_network_googleads_utm_source() {
+        let mut params = HashMap::new();
+        params.insert("utm_source".to_string(), "google".to_string());
+        assert_eq!(NetworkNormalizer::detect_network(&params), "googleads");
+
+        params.clear();
+        params.insert("utm_source".to_string(), "googleads".to_string());
+        assert_eq!(NetworkNormalizer::detect_network(&params), "googleads");
+
+        params.clear();
+        params.insert("utm_source".to_string(), "google-ads".to_string());
+        assert_eq!(NetworkNormalizer::detect_network(&params), "googleads");
+    }
+
+    #[test]
+    fn test_detect_network_googleads_gclid() {
+        let mut params = HashMap::new();
+        params.insert("gclid".to_string(), "Cj0KCQjw-5FhBRD_ARIsAP".to_string());
+        assert_eq!(NetworkNormalizer::detect_network(&params), "googleads");
+    }
+
+    #[test]
+    fn test_detect_network_googleads_gclsrc() {
+        let mut params = HashMap::new();
+        params.insert("gclsrc".to_string(), "aw".to_string());
+        assert_eq!(NetworkNormalizer::detect_network(&params), "googleads");
+    }
+
+    #[test]
+    fn test_normalize_googleads_with_utm_params() {
+        let mut params = HashMap::new();
+        params.insert("utm_source".to_string(), "google".to_string());
+        params.insert("utm_campaign".to_string(), "summer_sale_2024".to_string());
+        params.insert("utm_content".to_string(), "ad_variant_b".to_string());
+        params.insert("utm_term".to_string(), "running shoes".to_string());
+
+        let normalized = NetworkNormalizer::normalize(&params);
+
+        assert_eq!(normalized.network, "googleads");
+        assert_eq!(normalized.campaign_id, Some("summer_sale_2024".to_string()));
+        assert_eq!(normalized.creative_id, Some("ad_variant_b".to_string()));
+        assert_eq!(normalized.headline, Some("running shoes".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_googleads_with_adgroupid() {
+        let mut params = HashMap::new();
+        params.insert("utm_source".to_string(), "googleads".to_string());
+        params.insert("campaignid".to_string(), "123456789".to_string());
+        params.insert("adgroupid".to_string(), "987654321".to_string());
+
+        let normalized = NetworkNormalizer::normalize(&params);
+
+        assert_eq!(normalized.network, "googleads");
+        assert_eq!(normalized.campaign_id, Some("123456789".to_string()));
+        assert_eq!(normalized.creative_id, Some("987654321".to_string()));
+        assert_eq!(normalized.item_id, Some("987654321".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_googleads_with_keyword() {
+        let mut params = HashMap::new();
+        params.insert("utm_source".to_string(), "google".to_string());
+        params.insert("keyword".to_string(), "best running shoes".to_string());
+        params.insert("campaignid".to_string(), "111222333".to_string());
+
+        let normalized = NetworkNormalizer::normalize(&params);
+
+        assert_eq!(normalized.network, "googleads");
+        assert_eq!(normalized.headline, Some("best running shoes".to_string()));
+        assert_eq!(normalized.campaign_id, Some("111222333".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_googleads_with_placement() {
+        let mut params = HashMap::new();
+        params.insert("utm_source".to_string(), "googleads".to_string());
+        params.insert("placement".to_string(), "example.com".to_string());
+
+        let normalized = NetworkNormalizer::normalize(&params);
+
+        assert_eq!(normalized.network, "googleads");
+        assert_eq!(normalized.headline, Some("example.com".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_googleads_shopping_feed() {
+        let mut params = HashMap::new();
+        params.insert("utm_source".to_string(), "google".to_string());
+        params.insert("feeditemid".to_string(), "feed_12345".to_string());
+        params.insert("campaignid".to_string(), "shop_camp_789".to_string());
+
+        let normalized = NetworkNormalizer::normalize(&params);
+
+        assert_eq!(normalized.network, "googleads");
+        assert_eq!(normalized.creative_id, Some("feed_12345".to_string()));
+        assert_eq!(normalized.item_id, Some("feed_12345".to_string()));
+        assert_eq!(normalized.campaign_id, Some("shop_camp_789".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_googleads_with_image() {
+        let mut params = HashMap::new();
+        params.insert("utm_source".to_string(), "googleads".to_string());
+        params.insert("imageid".to_string(), "img_banner_123".to_string());
+        params.insert("headline".to_string(), "Limited Time Offer".to_string());
+
+        let normalized = NetworkNormalizer::normalize(&params);
+
+        assert_eq!(normalized.network, "googleads");
+        assert_eq!(normalized.image_id, Some("img_banner_123".to_string()));
+        assert_eq!(normalized.headline, Some("Limited Time Offer".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_googleads_with_target() {
+        let mut params = HashMap::new();
+        params.insert("utm_source".to_string(), "google".to_string());
+        params.insert("target".to_string(), "audience_interest_fitness".to_string());
+
+        let normalized = NetworkNormalizer::normalize(&params);
+
+        assert_eq!(normalized.network, "googleads");
+        assert_eq!(normalized.headline, Some("audience_interest_fitness".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_googleads_gclid_only() {
+        let mut params = HashMap::new();
+        params.insert("gclid".to_string(), "Cj0KCQjw-5FhBRD_ARIsAP".to_string());
+
+        let normalized = NetworkNormalizer::normalize(&params);
+
+        assert_eq!(normalized.network, "googleads");
+        // With only gclid, most fields should be None
+        assert!(normalized.campaign_id.is_none());
+        assert!(normalized.creative_id.is_none());
+    }
+
+    #[test]
+    fn test_creative_fingerprint_googleads() {
+        let mut params = HashMap::new();
+        params.insert("utm_source".to_string(), "google".to_string());
+        params.insert("campaignid".to_string(), "camp123".to_string());
+        params.insert("adgroupid".to_string(), "adgroup456".to_string());
+        params.insert("keyword".to_string(), "test keyword".to_string());
+
+        let normalized = NetworkNormalizer::normalize(&params);
+        let fingerprint = NetworkNormalizer::creative_fingerprint(&normalized);
+
+        assert_eq!(fingerprint, Some("googleads:adgroup456:test keyword".to_string()));
+    }
+
+    #[test]
+    fn test_has_campaign_data_googleads() {
+        let mut params = HashMap::new();
+        params.insert("gclid".to_string(), "test_gclid".to_string());
+        assert!(NetworkNormalizer::has_campaign_data(&params));
+
+        params.clear();
+        params.insert("campaignid".to_string(), "camp123".to_string());
         assert!(NetworkNormalizer::has_campaign_data(&params));
     }
 }

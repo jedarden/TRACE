@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
+// Import from crate root (declared in main.rs)
 use crate::{merge_parquet_files, S3Ops, S3Client};
 
 /// Iceberg-specific compaction configuration

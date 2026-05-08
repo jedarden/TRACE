@@ -20,6 +20,7 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::prelude::*;
 
 /// Event from the collector (matches collector schema)
+/// All fields are optional to support gradual schema evolution
 #[derive(Debug, Deserialize, Serialize)]
 struct CollectorEvent {
     ts: DateTime<Utc>,
@@ -28,13 +29,77 @@ struct CollectorEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     ua: Option<String>,
     url: String,
-    params: HashMap<String, String>,
     #[serde(rename = "type")]
     event_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cookie_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    campaign_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    campaign_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    creative_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    headline: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    item_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    referrer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    referrer_network: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attribution_campaign_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attribution_creative_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attribution_touches: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attribution_days_to_convert: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_os: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_browser: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scroll_depth_pct: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scroll_time_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dwell_time_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dwell_visible_pct: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    viewport_width: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    viewport_height: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quality_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bot_probability: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fraud_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_valid: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_verified: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validation_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enriched_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enrichment_version: Option<String>,
+    /// Raw params map (kept for flexibility and backward compatibility)
+    #[serde(default)]
+    params: HashMap<String, String>,
 }
 
 /// S3 configuration
@@ -254,24 +319,113 @@ fn parse_hour_key(filename: &str) -> Option<(String, String)> {
     None
 }
 
-/// Convert JSONL to Parquet in memory
+/// Convert JSONL to Parquet in memory with full columnar schema
+/// This matches the Iceberg schema defined in analytics/schemas/ad_events_iceberg.sql
 fn jsonl_to_parquet(events: Vec<CollectorEvent>) -> Result<Vec<u8>> {
-    use arrow::array::{StringArray, TimestampMillisecondArray};
+    use arrow::array::{
+        BooleanArray, Float64Array, Int64Array, StringArray, TimestampMillisecondArray,
+    };
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
+    let n = events.len();
+
+    // Build column arrays for each field
     let timestamps: Vec<i64> = events.iter().map(|e| e.ts.timestamp_millis()).collect();
     let ips: Vec<Option<String>> = events.iter().map(|e| e.ip.clone()).collect();
     let uas: Vec<Option<String>> = events.iter().map(|e| e.ua.clone()).collect();
     let urls: Vec<String> = events.iter().map(|e| e.url.clone()).collect();
-    let params_json: Vec<String> = events
-        .iter()
-        .map(|e| serde_json::to_string(&e.params).unwrap_or_default())
-        .collect();
     let types: Vec<String> = events.iter().map(|e| e.event_type.clone()).collect();
     let session_ids: Vec<Option<String>> = events.iter().map(|e| e.session_id.clone()).collect();
     let user_ids: Vec<Option<String>> = events.iter().map(|e| e.user_id.clone()).collect();
+    let cookie_ids: Vec<Option<String>> = events.iter().map(|e| e.cookie_id.clone()).collect();
+    let networks: Vec<Option<String>> = events.iter().map(|e| e.network.clone()).collect();
+    let campaign_ids: Vec<Option<String>> =
+        events.iter().map(|e| e.campaign_id.clone()).collect();
+    let campaign_names: Vec<Option<String>> =
+        events.iter().map(|e| e.campaign_name.clone()).collect();
+    let creative_ids: Vec<Option<String>> =
+        events.iter().map(|e| e.creative_id.clone()).collect();
+    let headlines: Vec<Option<String>> = events.iter().map(|e| e.headline.clone()).collect();
+    let image_ids: Vec<Option<String>> = events.iter().map(|e| e.image_id.clone()).collect();
+    let item_ids: Vec<Option<String>> = events.iter().map(|e| e.item_id.clone()).collect();
+    let referrers: Vec<Option<String>> = events.iter().map(|e| e.referrer.clone()).collect();
+    let referrer_networks: Vec<Option<String>> =
+        events.iter().map(|e| e.referrer_network.clone()).collect();
+    let attribution_campaign_ids: Vec<Option<String>> = events
+        .iter()
+        .map(|e| e.attribution_campaign_id.clone())
+        .collect();
+    let attribution_creative_ids: Vec<Option<String>> = events
+        .iter()
+        .map(|e| e.attribution_creative_id.clone())
+        .collect();
+    let attribution_touches: Vec<Option<i64>> = events
+        .iter()
+        .map(|e| e.attribution_touches.filter(|&v| v >= 0))
+        .collect();
+    let attribution_days_to_convert: Vec<Option<i64>> = events
+        .iter()
+        .map(|e| e.attribution_days_to_convert.filter(|&v| v >= 0))
+        .collect();
+    let device_types: Vec<Option<String>> =
+        events.iter().map(|e| e.device_type.clone()).collect();
+    let device_oss: Vec<Option<String>> = events.iter().map(|e| e.device_os.clone()).collect();
+    let device_browsers: Vec<Option<String>> = events
+        .iter()
+        .map(|e| e.device_browser.clone())
+        .collect();
+    let scroll_depth_pcts: Vec<Option<i64>> = events
+        .iter()
+        .map(|e| e.scroll_depth_pct.filter(|&v| v >= 0 && v <= 100))
+        .collect();
+    let scroll_time_mss: Vec<Option<i64>> = events
+        .iter()
+        .map(|e| e.scroll_time_ms.filter(|&v| v >= 0))
+        .collect();
+    let dwell_time_mss: Vec<Option<i64>> = events
+        .iter()
+        .map(|e| e.dwell_time_ms.filter(|&v| v >= 0))
+        .collect();
+    let dwell_visible_pcts: Vec<Option<i64>> = events
+        .iter()
+        .map(|e| e.dwell_visible_pct.filter(|&v| v >= 0 && v <= 100))
+        .collect();
+    let viewport_widths: Vec<Option<i64>> = events
+        .iter()
+        .map(|e| e.viewport_width.filter(|&v| v > 0))
+        .collect();
+    let viewport_heights: Vec<Option<i64>> = events
+        .iter()
+        .map(|e| e.viewport_height.filter(|&v| v > 0))
+        .collect();
+    let quality_scores: Vec<Option<f64>> = events
+        .iter()
+        .map(|e| e.quality_score.filter(|&v| (0.0..=1.0).contains(&v)))
+        .collect();
+    let bot_probabilities: Vec<Option<f64>> = events
+        .iter()
+        .map(|e| e.bot_probability.filter(|&v| (0.0..=1.0).contains(&v)))
+        .collect();
+    let fraud_scores: Vec<Option<f64>> = events
+        .iter()
+        .map(|e| e.fraud_score.filter(|&v| (0.0..=1.0).contains(&v)))
+        .collect();
+    let is_valids: Vec<Option<bool>> = events.iter().map(|e| e.is_valid).collect();
+    let is_verifieds: Vec<Option<bool>> = events.iter().map(|e| e.is_verified).collect();
+    let validation_reasons: Vec<Option<String>> = events
+        .iter()
+        .map(|e| e.validation_reason.clone())
+        .collect();
+    let enriched_ats: Vec<Option<i64>> = events
+        .iter()
+        .map(|e| e.enriched_at.map(|dt| dt.timestamp_millis()))
+        .collect();
+    let enrichment_versions: Vec<Option<String>> = events
+        .iter()
+        .map(|e| e.enrichment_version.clone())
+        .collect();
 
     let schema = Schema::new(vec![
         Field::new(
@@ -282,10 +436,44 @@ fn jsonl_to_parquet(events: Vec<CollectorEvent>) -> Result<Vec<u8>> {
         Field::new("ip", DataType::Utf8, true),
         Field::new("ua", DataType::Utf8, true),
         Field::new("url", DataType::Utf8, false),
-        Field::new("params", DataType::Utf8, false),
         Field::new("type", DataType::Utf8, false),
         Field::new("session_id", DataType::Utf8, true),
         Field::new("user_id", DataType::Utf8, true),
+        Field::new("cookie_id", DataType::Utf8, true),
+        Field::new("network", DataType::Utf8, true),
+        Field::new("campaign_id", DataType::Utf8, true),
+        Field::new("campaign_name", DataType::Utf8, true),
+        Field::new("creative_id", DataType::Utf8, true),
+        Field::new("headline", DataType::Utf8, true),
+        Field::new("image_id", DataType::Utf8, true),
+        Field::new("item_id", DataType::Utf8, true),
+        Field::new("referrer", DataType::Utf8, true),
+        Field::new("referrer_network", DataType::Utf8, true),
+        Field::new("attribution_campaign_id", DataType::Utf8, true),
+        Field::new("attribution_creative_id", DataType::Utf8, true),
+        Field::new("attribution_touches", DataType::Int64, true),
+        Field::new("attribution_days_to_convert", DataType::Int64, true),
+        Field::new("device_type", DataType::Utf8, true),
+        Field::new("device_os", DataType::Utf8, true),
+        Field::new("device_browser", DataType::Utf8, true),
+        Field::new("scroll_depth_pct", DataType::Int64, true),
+        Field::new("scroll_time_ms", DataType::Int64, true),
+        Field::new("dwell_time_ms", DataType::Int64, true),
+        Field::new("dwell_visible_pct", DataType::Int64, true),
+        Field::new("viewport_width", DataType::Int64, true),
+        Field::new("viewport_height", DataType::Int64, true),
+        Field::new("quality_score", DataType::Float64, true),
+        Field::new("bot_probability", DataType::Float64, true),
+        Field::new("fraud_score", DataType::Float64, true),
+        Field::new("is_valid", DataType::Boolean, true),
+        Field::new("is_verified", DataType::Boolean, true),
+        Field::new("validation_reason", DataType::Utf8, true),
+        Field::new(
+            "enriched_at",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+            true,
+        ),
+        Field::new("enrichment_version", DataType::Utf8, true),
     ]);
 
     let batch = RecordBatch::try_new(
@@ -295,10 +483,40 @@ fn jsonl_to_parquet(events: Vec<CollectorEvent>) -> Result<Vec<u8>> {
             Arc::new(StringArray::from(ips)),
             Arc::new(StringArray::from(uas)),
             Arc::new(StringArray::from(urls)),
-            Arc::new(StringArray::from(params_json)),
             Arc::new(StringArray::from(types)),
             Arc::new(StringArray::from(session_ids)),
             Arc::new(StringArray::from(user_ids)),
+            Arc::new(StringArray::from(cookie_ids)),
+            Arc::new(StringArray::from(networks)),
+            Arc::new(StringArray::from(campaign_ids)),
+            Arc::new(StringArray::from(campaign_names)),
+            Arc::new(StringArray::from(creative_ids)),
+            Arc::new(StringArray::from(headlines)),
+            Arc::new(StringArray::from(image_ids)),
+            Arc::new(StringArray::from(item_ids)),
+            Arc::new(StringArray::from(referrers)),
+            Arc::new(StringArray::from(referrer_networks)),
+            Arc::new(StringArray::from(attribution_campaign_ids)),
+            Arc::new(StringArray::from(attribution_creative_ids)),
+            Arc::new(Int64Array::from(attribution_touches)),
+            Arc::new(Int64Array::from(attribution_days_to_convert)),
+            Arc::new(StringArray::from(device_types)),
+            Arc::new(StringArray::from(device_oss)),
+            Arc::new(StringArray::from(device_browsers)),
+            Arc::new(Int64Array::from(scroll_depth_pcts)),
+            Arc::new(Int64Array::from(scroll_time_mss)),
+            Arc::new(Int64Array::from(dwell_time_mss)),
+            Arc::new(Int64Array::from(dwell_visible_pcts)),
+            Arc::new(Int64Array::from(viewport_widths)),
+            Arc::new(Int64Array::from(viewport_heights)),
+            Arc::new(Float64Array::from(quality_scores)),
+            Arc::new(Float64Array::from(bot_probabilities)),
+            Arc::new(Float64Array::from(fraud_scores)),
+            Arc::new(BooleanArray::from(is_valids)),
+            Arc::new(BooleanArray::from(is_verifieds)),
+            Arc::new(StringArray::from(validation_reasons)),
+            Arc::new(TimestampMillisecondArray::from(enriched_ats)),
+            Arc::new(StringArray::from(enrichment_versions)),
         ],
     )?;
 
