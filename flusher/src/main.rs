@@ -398,3 +398,139 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_hour_key_valid() {
+        let cases = vec![
+            (
+                "events-20260508-14.jsonl.gz",
+                Some(("2026-05-08".to_string(), "14".to_string())),
+            ),
+            (
+                "events-20260101-00.jsonl.gz",
+                Some(("2026-01-01".to_string(), "00".to_string())),
+            ),
+            (
+                "events-20261231-23.jsonl.gz",
+                Some(("2026-12-31".to_string(), "23".to_string())),
+            ),
+        ];
+
+        for (filename, expected) in cases {
+            let result = parse_hour_key(filename);
+            assert_eq!(result, expected, "Failed for filename: {}", filename);
+        }
+    }
+
+    #[test]
+    fn test_parse_hour_key_invalid() {
+        let cases = vec![
+            "events-20260508-14.jsonl",
+            "events-20260508.jsonl.gz",
+            "20260508-14.jsonl.gz",
+            "events-16-14.jsonl.gz",
+        ];
+
+        for filename in cases {
+            let result = parse_hour_key(filename);
+            assert!(result.is_none(), "Should return None for: {}", filename);
+        }
+    }
+
+    #[test]
+    fn test_jsonl_to_parquet_conversion() {
+        let events = vec![
+            CollectorEvent {
+                ts: DateTime::parse_from_rfc3339("2026-05-08T14:30:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                ip: Some("1.2.3.4".to_string()),
+                ua: Some("Mozilla/5.0".to_string()),
+                url: "https://example.com?utm_source=test".to_string(),
+                params: vec![("utm_source".to_string(), "test".to_string())]
+                    .into_iter()
+                    .collect(),
+                event_type: "pageview".to_string(),
+            },
+            CollectorEvent {
+                ts: DateTime::parse_from_rfc3339("2026-05-08T14:31:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                ip: None,
+                ua: None,
+                url: "https://example.com/page2".to_string(),
+                params: HashMap::new(),
+                event_type: "click".to_string(),
+            },
+        ];
+
+        let result = jsonl_to_parquet(events);
+        assert!(
+            result.is_ok(),
+            "Parquet conversion failed: {:?}",
+            result.err()
+        );
+
+        let parquet_data = result.unwrap();
+        assert!(!parquet_data.is_empty(), "Parquet data should not be empty");
+        assert!(
+            parquet_data.len() > 100,
+            "Parquet data should have meaningful content"
+        );
+    }
+
+    #[test]
+    fn test_jsonl_to_parquet_empty() {
+        let events: Vec<CollectorEvent> = vec![];
+        let result = jsonl_to_parquet(events);
+        assert!(result.is_ok(), "Should handle empty events");
+
+        let parquet_data = result.unwrap();
+        assert!(
+            !parquet_data.is_empty(),
+            "Empty events should still produce Parquet schema"
+        );
+    }
+
+    struct MockS3Upload {
+        uploads: std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>,
+    }
+
+    impl MockS3Upload {
+        fn new() -> Self {
+            Self {
+                uploads: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn get_uploads(&self) -> Vec<(String, Vec<u8>)> {
+            self.uploads.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl S3Upload for MockS3Upload {
+        async fn upload(&self, key: &str, data: Vec<u8>) -> Result<()> {
+            self.uploads.lock().unwrap().push((key.to_string(), data));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_s3_upload_trait() {
+        let mock = Arc::new(MockS3Upload::new());
+        let s3: Arc<dyn S3Upload> = mock.clone();
+
+        let test_data = b"test data".to_vec();
+        s3.upload("test-key", test_data).await.unwrap();
+
+        let uploads = mock.get_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].0, "test-key");
+        assert_eq!(uploads[0].1, b"test data");
+    }
+}

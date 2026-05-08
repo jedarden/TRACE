@@ -21,6 +21,9 @@ anyhow = "1.0"
 notify = "8"
 async-trait = "0.1"
 
+[dev-dependencies]
+tempfile = "3"
+
 [profile.release]
 opt-level = "z"
 lto = true
