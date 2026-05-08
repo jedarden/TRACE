@@ -147,6 +147,12 @@ pub fn get_report(name: &str) -> Option<Report> {
 pub fn render_template(template: &str, params: &ReportParams) -> String {
     let mut sql = template.to_string();
 
+    if let Some(s3_path) = &params.s3_path {
+        sql = sql.replace("{{s3_path}}", s3_path);
+    } else {
+        sql = sql.replace("{{s3_path}}", "s3://my-trace-bucket/trace-events");
+    }
+
     if let Some(start) = &params.start_date {
         sql = sql.replace("{{start_date}}", start);
     } else {
@@ -164,6 +170,7 @@ pub fn render_template(template: &str, params: &ReportParams) -> String {
 
 #[derive(Debug, Clone, Default)]
 pub struct ReportParams {
+    pub s3_path: Option<String>,
     pub start_date: Option<String>,
     pub end_date: Option<String>,
 }

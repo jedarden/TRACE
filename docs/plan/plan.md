@@ -461,6 +461,99 @@ ORDER BY num_sessions DESC
 LIMIT 100;
 ```
 
+---
+
+### Phase 8: DuckDB Analytics Layer ✅ COMPLETE
+
+**Status**: Analytics service with DuckDB integration and 15+ pre-built reports
+
+#### Analytics Service (`analytics/`)
+
+The analytics service provides a command-line interface for running DuckDB queries against Parquet data stored in S3.
+
+**Features**:
+- **In-memory DuckDB**: Fast queries with HTTPFS extension for direct S3 access
+- **Pre-built reports**: 15+ analytics queries across 6 categories
+- **Template rendering**: Date range parameter substitution
+- **Output formats**: JSON or CSV
+- **Scheduled reports**: Daemon mode for recurring report execution
+- **S3 upload**: Optional report storage to S3
+
+**Supported Report Categories**:
+1. **Metrics**: Daily summaries, event counts
+2. **Campaign**: CTR, funnels, ROI
+3. **Asset**: Top headlines, images, creative combinations, fatigue detection
+4. **Network**: Cross-network comparison, same creative detection
+5. **Time**: Trending campaigns, hourly patterns
+6. **Journey**: Session flow, landing page performance
+7. **Alert**: Traffic spikes, zero traffic detection
+
+**Tech Stack**: Rust, DuckDB, AWS SDK, Parquet/Arrow
+
+**Usage**:
+```bash
+# List all available reports
+trace-analytics list
+
+# Run a specific report
+trace-analytics run daily_summary \
+  --start-date 2026-05-01 \
+  --end-date 2026-05-08 \
+  --format json \
+  --output /data/reports/daily.json
+
+# Run raw SQL query
+trace-analytics query my_query.sql \
+  --format csv \
+  --output /data/reports/results.csv
+
+# Scheduled mode (run every 24h)
+trace-analytics schedule --interval 86400
+```
+
+**Environment Variables**:
+```
+TRACE_S3_BUCKET=my-trace-bucket
+TRACE_S3_REGION=us-east-1
+TRACE_S3_PREFIX=trace-events
+AWS_ACCESS_KEY_ID=***
+AWS_SECRET_ACCESS_KEY=***
+TRACE_DATA_PATH=/data/analytics
+TRACE_REPORTS_OUTPUT_PATH=/data/reports
+```
+
+**Report Examples**:
+```sql
+-- Click-through rate by campaign
+SELECT
+    params->>'utm_campaign' AS campaign,
+    COUNT(*) FILTER (WHERE type = 'pageview') AS views,
+    COUNT(*) FILTER (WHERE type = 'click') AS clicks,
+    ROUND(100.0 * clicks / NULLIF(views, 0), 2) AS ctr_pct
+FROM read_parquet('s3://bucket/events/**/*.parquet')
+GROUP BY 1
+ORDER BY clicks DESC;
+
+-- Creative fatigue detection
+WITH creative_daily AS (
+    SELECT
+        DATE(ts) AS date,
+        params->>'tb_headline' AS headline,
+        COUNT(*) FILTER (WHERE type = 'click') AS clicks,
+        COUNT(*) FILTER (WHERE type = 'pageview') AS views
+    FROM read_parquet('s3://bucket/events/**/*.parquet')
+    WHERE ts >= CURRENT_DATE - INTERVAL '30 days'
+        AND params->>'tb_headline' IS NOT NULL
+    GROUP BY 1, 2
+)
+SELECT
+    headline,
+    AVG(ctr) FILTER (WHERE date >= CURRENT_DATE - INTERVAL '7 days') AS recent_ctr,
+    AVG(ctr) FILTER (WHERE date < CURRENT_DATE - INTERVAL '7 days') AS prior_ctr
+FROM creative_daily
+GROUP BY 1;
+```
+
 #### Fraud Detection
 
 - Bot filtering via User-Agent analysis
@@ -537,6 +630,7 @@ AWS_SESSION_TOKEN=***  # if using temporary creds
 | 5. Analytics Layer | ✅ Complete | 2026-05-08 |
 | 6. Ad Network API Sync | ✅ Complete | 2026-05-08 |
 | 7. Session Stitching | ✅ Complete | 2026-05-08 |
+| 8. DuckDB Analytics Layer | ✅ Complete | 2026-05-08 |
 
 ---
 
@@ -557,8 +651,9 @@ AWS_SESSION_TOKEN=***  # if using temporary creds
 5. ✅ Implement JS client tag
 6. ✅ Implement ad network API sync
 7. ✅ Implement session stitching
-8. ⏳ Create ArgoCD manifests for deployment
-9. ⏳ Set up S3 bucket and IAM policies
-10. ⏳ Add semantic tagging for headlines/images (future enhancement)
-11. ⏳ Implement real-time dashboard (future enhancement)
-12. ⏳ Implement fraud detection (future enhancement)
+8. ✅ Implement DuckDB analytics layer
+9. ⏳ Create ArgoCD manifests for deployment
+10. ⏳ Set up S3 bucket and IAM policies
+11. ⏳ Add semantic tagging for headlines/images (future enhancement)
+12. ⏳ Implement real-time dashboard (future enhancement)
+13. ⏳ Implement fraud detection (future enhancement)

@@ -1,0 +1,109 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: trace-analytics-ci
+  namespace: argo
+  annotations:
+    workflows.argoproj.io/description: |
+      CI pipeline for TRACE Analytics service.
+      Builds and tests the DuckDB analytics runner.
+spec:
+  entrypoint: ci
+  templates:
+    - name: ci
+      steps:
+        - - name: checkout
+            template: checkout
+        - - name: fmt-check
+            template: fmt-check
+        - - name: clippy
+            template: clippy
+        - - name: build
+            template: build
+        - - name: docker-build
+            template: docker-build
+
+    - name: checkout
+      script:
+        image: alpine/git:latest
+        command: [sh, -c]
+        source: |
+          git clone {{workflow.parameters.repo_url}} /workspace
+          cd /workspace
+          git checkout {{workflow.parameters.branch}}
+          git rev-parse HEAD
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+
+    - name: fmt-check
+      script:
+        image: rust:1.83-alpine
+        command: [sh, -c]
+        source: |
+          cd /workspace/analytics
+          cargo fmt --check
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+
+    - name: clippy
+      script:
+        image: rust:1.83-alpine
+        command: [sh, -c]
+        source: |
+          cd /workspace/analytics
+          cargo clippy --all-targets --all-features -- -D warnings
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+
+    - name: build
+      script:
+        image: rust:1.83-alpine
+        command: [sh, -c]
+        source: |
+          cd /workspace/analytics
+          cargo build --release
+          ls -lh target/release/trace-analytics
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+
+    - name: docker-build
+      script:
+        image: gcr.io/kaniko-project/executor:latest
+        command: [sh, -c]
+        source: |
+          /kaniko/executor \
+            --context=/workspace/analytics \
+            --dockerfile=/workspace/analytics/Dockerfile \
+            --destination=ghcr.io/jedarden/trace-analytics:{{workflow.parameters.tag}} \
+            --destination=ghcr.io/jedarden/trace-analytics:latest \
+            --cache=true \
+            --cache-repo=ghcr.io/jedarden/trace-analytics-cache \
+            --build-arg VERSION={{workflow.parameters.tag}}
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+          - name: docker-config
+            mountPath: /kaniko/.docker
+
+  volumes:
+    - name: workspace
+      emptyDir: {}
+    - name: docker-config
+      secret:
+        secretName: docker-config
+        items:
+          - key: config.json
+            path: config.json
+
+  arguments:
+    parameters:
+      - name: repo_url
+        value: https://github.com/jedarden/TRACE.git
+      - name: branch
+        value: master
+      - name: tag
+        value: latest

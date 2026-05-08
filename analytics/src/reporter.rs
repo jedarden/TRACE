@@ -87,7 +87,9 @@ pub async fn run_scheduled_reports(config: Config, interval_secs: u64) -> Result
 async fn run_daily_reports(config: &Config) -> Result<()> {
     let db = DuckDBClient::new(config)?;
 
+    let s3_path = format!("s3://{}/{}", config.s3_bucket, config.s3_prefix);
     let params = ReportParams {
+        s3_path: Some(s3_path),
         start_date: Some((Utc::now() - chrono::Days::new(7)).format("%Y-%m-%d").to_string()),
         end_date: Some(Utc::now().format("%Y-%m-%d").to_string()),
     };

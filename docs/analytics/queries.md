@@ -56,7 +56,7 @@ SELECT
     DATE(ts) AS date,
     type,
     COUNT(*) AS events,
-    COUNT(DISTINCT params->>'utm_session') AS unique_sessions
+    COUNT(DISTINCT session_id) AS unique_sessions
 FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
 WHERE ts >= CURRENT_DATE - INTERVAL '30 days'
 GROUP BY 1, 2
@@ -333,6 +333,198 @@ ORDER BY fatigue_change_pct ASC
 LIMIT 20;
 ```
 
+## Session Analytics
+
+### Session-Based Funnel Analysis
+
+```sql
+-- Analyze user behavior within sessions
+WITH session_metrics AS (
+    SELECT
+        session_id,
+        COUNT(*) FILTER (WHERE type = 'pageview') AS pageviews,
+        COUNT(*) FILTER (WHERE type = 'click') AS clicks,
+        COUNT(*) FILTER (WHERE type = 'scroll') AS scrolls,
+        COUNT(*) FILTER (WHERE type = 'dwell') AS dwells,
+        MIN(ts) AS session_start,
+        MAX(ts) AS session_end,
+        EXTRACT(EPOCH FROM (MAX(ts) - MIN(ts))) / 60 AS session_duration_minutes
+    FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
+    WHERE ts >= CURRENT_DATE - INTERVAL '7 days'
+        AND session_id IS NOT NULL
+    GROUP BY session_id
+)
+SELECT
+    pageviews,
+    clicks,
+    scrolls,
+    dwells,
+    ROUND(AVG(session_duration_minutes), 2) AS avg_duration_minutes,
+    COUNT(*) AS num_sessions
+FROM session_metrics
+GROUP BY pageviews, clicks, scrolls, dwells
+ORDER BY num_sessions DESC
+LIMIT 20;
+```
+
+### Session Stitching Across Pages
+
+```sql
+-- Track user journeys across multiple pages
+WITH user_journeys AS (
+    SELECT
+        session_id,
+        user_id,
+        type,
+        url,
+        ts,
+        ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY ts) AS step_number
+    FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
+    WHERE ts >= CURRENT_DATE - INTERVAL '7 days'
+        AND session_id IS NOT NULL
+)
+SELECT
+    session_id,
+    user_id,
+    STRING_AGG(url, ' -> ' ORDER BY ts) AS journey,
+    COUNT(*) AS events,
+    MIN(ts) AS session_start,
+    MAX(ts) AS session_end
+FROM user_journeys
+GROUP BY session_id, user_id
+HAVING COUNT(*) >= 2
+ORDER BY events DESC
+LIMIT 50;
+```
+
+### User-Level Analytics (Cross-Session)
+
+```sql
+-- Analyze user behavior across multiple sessions
+SELECT
+    user_id,
+    COUNT(DISTINCT session_id) AS num_sessions,
+    COUNT(*) FILTER (WHERE type = 'pageview') AS total_pageviews,
+    COUNT(*) FILTER (WHERE type = 'click') AS total_clicks,
+    MIN(ts) AS first_seen,
+    MAX(ts) AS last_seen,
+    EXTRACT(DAY FROM (MAX(ts) - MIN(ts))) + 1 AS days_active
+FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
+WHERE ts >= CURRENT_DATE - INTERVAL '30 days'
+    AND user_id IS NOT NULL
+GROUP BY user_id
+ORDER BY num_sessions DESC
+LIMIT 50;
+```
+
+### Session Source Attribution
+
+```sql
+-- Track which campaigns and sources drive sessions
+WITH session_sources AS (
+    SELECT
+        session_id,
+        params->>'utm_source' AS source,
+        params->>'utm_campaign' AS campaign,
+        params->>'utm_medium' AS medium,
+        MIN(ts) AS session_start
+    FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
+    WHERE ts >= CURRENT_DATE - INTERVAL '7 days'
+        AND session_id IS NOT NULL
+    GROUP BY session_id, source, campaign, medium
+)
+SELECT
+    source,
+    campaign,
+    medium,
+    COUNT(DISTINCT session_id) AS sessions,
+    COUNT(DISTINCT session_id) FILTER (
+        WHERE session_start >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
+    ) AS sessions_last_24h
+FROM session_sources
+GROUP BY source, campaign, medium
+ORDER BY sessions DESC
+LIMIT 20;
+```
+
+### Engagement by Session Depth
+
+```sql
+-- Categorize sessions by engagement level
+WITH session_engagement AS (
+    SELECT
+        session_id,
+        COUNT(*) FILTER (WHERE type = 'pageview') AS pageviews,
+        COUNT(*) FILTER (WHERE type = 'click') AS clicks,
+        COUNT(*) FILTER (WHERE type = 'scroll') AS scrolls,
+        EXTRACT(EPOCH FROM (MAX(ts) - MIN(ts))) / 60 AS duration_minutes
+    FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
+    WHERE ts >= CURRENT_DATE - INTERVAL '7 days'
+        AND session_id IS NOT NULL
+    GROUP BY session_id
+),
+engagement_levels AS (
+    SELECT
+        session_id,
+        pageviews,
+        clicks,
+        scrolls,
+        duration_minutes,
+        CASE
+            WHEN pageviews >= 5 AND duration_minutes >= 5 THEN 'high'
+            WHEN pageviews >= 3 OR duration_minutes >= 2 THEN 'medium'
+            WHEN pageviews >= 2 THEN 'low'
+            ELSE 'bounce'
+        END AS engagement_level
+    FROM session_engagement
+)
+SELECT
+    engagement_level,
+    COUNT(*) AS num_sessions,
+    ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2) AS pct_sessions,
+    ROUND(AVG(pageviews), 2) AS avg_pageviews,
+    ROUND(AVG(clicks), 2) AS avg_clicks,
+    ROUND(AVG(duration_minutes), 2) AS avg_duration_minutes
+FROM engagement_levels
+GROUP BY engagement_level
+ORDER BY
+    CASE engagement_level
+        WHEN 'high' THEN 1
+        WHEN 'medium' THEN 2
+        WHEN 'low' THEN 3
+        ELSE 4
+    END;
+```
+
+### Link Decoration Tracking
+
+```sql
+-- Verify session stitching is working via link decoration
+WITH decorated_sessions AS (
+    SELECT
+        session_id,
+        COUNT(DISTINCT url) AS distinct_urls,
+        COUNT(*) AS events,
+        MIN(ts) AS first_event,
+        MAX(ts) AS last_event
+    FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
+    WHERE ts >= CURRENT_DATE - INTERVAL '7 days'
+        AND session_id IS NOT NULL
+    GROUP BY session_id
+)
+SELECT
+    CASE
+        WHEN distinct_urls = 1 THEN 'single_page'
+        WHEN distinct_urls BETWEEN 2 AND 3 THEN 'multi_page_low'
+        ELSE 'multi_page_high'
+    END AS session_type,
+    COUNT(*) AS num_sessions,
+    ROUND(AVG(events), 2) AS avg_events_per_session
+FROM decorated_sessions
+GROUP BY session_type
+ORDER BY num_sessions DESC;
+```
+
 ## User Journey Analysis
 
 ### Session Flow
@@ -341,21 +533,21 @@ LIMIT 20;
 -- Common page sequences within sessions
 WITH session_events AS (
     SELECT
-        params->>'utm_session' AS session,
+        session_id,
         type,
         url,
         ts,
-        LAG(type) OVER (PARTITION BY params->>'utm_session' ORDER BY ts) AS prev_type,
-        LAG(url) OVER (PARTITION BY params->>'utm_session' ORDER BY ts) AS prev_url
+        LAG(type) OVER (PARTITION BY session_id ORDER BY ts) AS prev_type,
+        LAG(url) OVER (PARTITION BY session_id ORDER BY ts) AS prev_url
     FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
     WHERE ts >= CURRENT_DATE - INTERVAL '7 days'
-        AND params->>'utm_session' IS NOT NULL
+        AND session_id IS NOT NULL
 )
 SELECT
     prev_type,
     type,
     COUNT(*) AS flow_count,
-    COUNT(DISTINCT session) AS unique_sessions
+    COUNT(DISTINCT session_id) AS unique_sessions
 FROM session_events
 WHERE prev_type IS NOT NULL
 GROUP BY 1, 2
@@ -369,13 +561,13 @@ LIMIT 20;
 -- Top landing pages and bounce rate
 WITH sessions AS (
     SELECT
-        params->>'utm_session' AS session,
+        session_id,
         MIN(url) AS landing_url,
         COUNT(*) AS events,
         COUNT(*) FILTER (WHERE type = 'pageview') AS pageviews
     FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
     WHERE ts >= CURRENT_DATE - INTERVAL '7 days'
-        AND params->>'utm_session' IS NOT NULL
+        AND session_id IS NOT NULL
     GROUP BY 1
 )
 SELECT
@@ -441,7 +633,7 @@ WITH daily AS (
         params->>'utm_campaign' AS campaign,
         COUNT(*) FILTER (WHERE type = 'pageview') AS views,
         COUNT(*) FILTER (WHERE type = 'click') AS clicks,
-        COUNT(DISTINCT params->>'utm_session') AS sessions
+        COUNT(DISTINCT session_id) AS sessions
     FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
     GROUP BY 1, 2, 3
 )
