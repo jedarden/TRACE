@@ -37,7 +37,9 @@ For basic pageview tracking only:
 - **Scroll Depth** - Tracks scroll thresholds at 25%, 50%, 75%, 90%
 - **Click Tracking** - Captures all link clicks with coordinates
 - **Session Stitching** - Decorates links with session ID for cross-site tracking
-- **Privacy-First** - Local storage only, no third-party cookies
+- **Cross-Domain Tracking** - Track users across multiple domains and subdomains
+- **First-Party Cookies** - Cookie-based identity and persistence with localStorage fallback
+- **Privacy-First** - First-party cookies or localStorage only, no third-party cookies
 - **SPA Support** - Works with React, Vue, Angular, and other SPAs
 
 ### Pixel Tag Features
@@ -59,14 +61,93 @@ Configure the JavaScript tag using data attributes:
 |-----------|---------|-------------|
 | `data-collector` | `/collect` | Collector endpoint URL |
 | `data-debug` | `false` | Enable console logging (`"true"` to enable) |
+| `data-storage` | `'auto'` | Storage method: `'auto'`, `'cookie'`, or `'localStorage'` |
+| `data-cookie-domain` | `null` | Domain scope for cookies (e.g., `.example.com`) |
+| `data-cookie-secure` | `false` | Set Secure flag for HTTPS-only cookies |
+| `data-cookie-samesite` | `'Lax'` | SameSite attribute: `'Strict'`, `'Lax'`, or `'None'` |
+| `data-cross-domains` | `null` | Comma-separated list of domains for cross-domain tracking |
 
 Example:
 
 ```html
 <script src="trace.js"
         data-collector="https://trace.example.com/collect"
-        data-debug="true"></script>
+        data-debug="true"
+        data-cross-domains="example.com,another-domain.com"></script>
 ```
+
+---
+
+## Storage Options
+
+TRACE supports multiple storage methods for session and user identity:
+
+### Auto Detection (Recommended)
+
+Automatically detects the best available storage method:
+
+```html
+<script src="trace.js"
+        data-collector="https://trace.example.com/collect"
+        data-storage="auto"></script>
+```
+
+**Behavior:**
+1. Tries `localStorage` first
+2. Falls back to cookies if localStorage fails (Safari ITP, private browsing)
+3. Provides maximum compatibility across browsers and scenarios
+
+### Cookie Storage
+
+Explicitly use first-party cookies:
+
+```html
+<script src="trace.js"
+        data-collector="https://trace.example.com/collect"
+        data-storage="cookie"
+        data-cookie-domain=".example.com"></script>
+```
+
+**Benefits:**
+- Survives Safari's Intelligent Tracking Prevention (ITP)
+- Works in private browsing mode
+- Accessible server-side (for future features)
+- Better cross-tab reliability
+
+### Local Storage Only
+
+Force localStorage (original behavior):
+
+```html
+<script src="trace.js"
+        data-collector="https://trace.example.com/collect"
+        data-storage="localStorage"></script>
+```
+
+### Cookie Configuration
+
+For HTTPS sites, configure secure cookies:
+
+```html
+<script src="trace.js"
+        data-collector="https://trace.example.com/collect"
+        data-storage="cookie"
+        data-cookie-secure="true"
+        data-cookie-samesite="Strict"></script>
+```
+
+### Cross-Domain Cookies
+
+Share identity across subdomains:
+
+```html
+<script src="trace.js"
+        data-collector="https://trace.example.com/collect"
+        data-storage="cookie"
+        data-cookie-domain=".example.com"></script>
+```
+
+This allows `www.example.com` and `shop.example.com` to share the same user identity.
 
 ---
 
@@ -86,13 +167,20 @@ TRACE.collect('signup', { plan: 'premium' });
 TRACE.collect({ category: 'engagement', action: 'video-play' });
 ```
 
-### `TRACE.identify(userId)`
+### `TRACE.identify(userId, options)`
 
 Identify a user with your own ID:
 
 ```javascript
+// Basic usage (1 year expiration for cookies)
 TRACE.identify('user-12345');
+
+// Custom expiration (30 days)
+TRACE.identify('user-12345', { expires: 30 });
 ```
+
+**Options:**
+- `expires`: Days until cookie expiration (only for cookie storage, default: 365)
 
 ### `TRACE.pageview()`
 
@@ -155,17 +243,27 @@ All events include:
 
 ### Session ID
 
-- Stored in `localStorage` as `trace_session_id`
-- Persists across browser sessions
+- Stored in first-party cookies or localStorage (configurable)
+- Cookie name: `trace_session_id`
+- Persists for the browser session (expires when browser closes)
 - Expires after 30 minutes of inactivity
 - Automatically created on first visit
 
 ### User ID
 
-- Stored in `localStorage` as `trace_user_id`
-- Persists indefinitely
+- Stored in first-party cookies or localStorage (configurable)
+- Cookie name: `trace_user_id`
+- Persists for 1 year (cookies) or indefinitely (localStorage)
 - Random UUID until manually set via `TRACE.identify()`
 - Used for cross-session user attribution
+
+### Storage Behavior
+
+| Storage Method | Session ID | User ID | Best For |
+|----------------|------------|---------|----------|
+| `auto` | Cookie or localStorage | Cookie or localStorage | Maximum compatibility |
+| `cookie` | Session cookie | 1 year | Safari ITP, cross-domain |
+| `localStorage` | Session storage | Persistent | Legacy support |
 
 ### Session Stitching
 
@@ -176,6 +274,28 @@ Links are automatically decorated with `trace_session` parameter for cross-site 
 ```
 
 When a user clicks a decorated link, the destination page inherits the session ID.
+
+#### Cross-Domain Tracking
+
+To track users across multiple domains, configure the `data-cross-domains` attribute:
+
+```html
+<script src="trace.js"
+        data-collector="https://trace.example.com/collect"
+        data-cross-domains="example.com,shop.example.com,blog.example.com"></script>
+```
+
+This will:
+1. Decorate links to the configured domains with the session ID
+2. Allow the session to persist across domain boundaries
+3. Enable user journey tracking across multiple properties
+
+**Use cases:**
+- Track users from your main site to a checkout domain
+- Follow users across related microsites
+- Measure cross-domain conversions and funnels
+
+**Note:** For cross-domain tracking to work, the TRACE JavaScript tag must be installed on all domains with the same `data-cross-domains` configuration.
 
 ---
 

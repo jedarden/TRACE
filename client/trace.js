@@ -5,10 +5,12 @@
  * Features:
  * - Autocapture pageviews on load
  * - Link decoration for session stitching
+ * - Cross-domain tracking support
  * - Heartbeat pings for dwell time
  * - Click tracking on outbound links
  * - Scroll depth tracking
- * - Privacy: Local storage only, no third-party cookies
+ * - First-party cookie identity and persistence
+ * - Privacy: First-party cookies or localStorage only, no third-party cookies
  */
 
 (function(window, document) {
@@ -27,7 +29,12 @@
     heartbeatInterval: 30000, // 30 seconds
     scrollThresholds: [25, 50, 75, 90], // percentage thresholds
     sessionTimeout: 1800000, // 30 minutes
-    debug: script.getAttribute('data-debug') === 'true'
+    debug: script.getAttribute('data-debug') === 'true',
+    storage: script.getAttribute('data-storage') || 'auto', // 'auto', 'cookie', 'localStorage'
+    cookieDomain: script.getAttribute('data-cookie-domain') || null,
+    cookieSecure: script.getAttribute('data-cookie-secure') === 'true',
+    cookieSameSite: script.getAttribute('data-cookie-samesite') || 'Lax',
+    crossDomains: parseCrossDomains(script.getAttribute('data-cross-domains'))
   };
 
   // Storage keys
@@ -59,6 +66,64 @@
   }
 
   /**
+   * Parse cross-domains configuration
+   * @param {string} domainsStr - Comma-separated list of domains
+   * @returns {Array|null} Array of normalized domains or null
+   */
+  function parseCrossDomains(domainsStr) {
+    if (!domainsStr) {
+      return null;
+    }
+
+    var domains = [];
+    var parts = domainsStr.split(',');
+
+    for (var i = 0; i < parts.length; i++) {
+      var domain = parts[i].trim();
+      if (domain) {
+        // Normalize domain: remove protocol, path, and port
+        try {
+          var url = new URL(domain.startsWith('http') ? domain : 'https://' + domain);
+          domains.push(url.hostname);
+        } catch (e) {
+          debug('Invalid cross-domain', domain);
+        }
+      }
+    }
+
+    return domains.length > 0 ? domains : null;
+  }
+
+  /**
+   * Check if a hostname should be decorated with session ID
+   * @param {string} hostname - The link hostname to check
+   * @returns {boolean} True if the link should be decorated
+   */
+  function shouldDecorateLink(hostname) {
+    // Same domain
+    if (hostname === window.location.hostname) {
+      return true;
+    }
+
+    // Subdomain
+    if (hostname.endsWith('.' + window.location.hostname)) {
+      return true;
+    }
+
+    // Configured cross-domains
+    if (CONFIG.crossDomains) {
+      for (var i = 0; i < CONFIG.crossDomains.length; i++) {
+        var crossDomain = CONFIG.crossDomains[i];
+        if (hostname === crossDomain || hostname.endsWith('.' + crossDomain)) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  /**
    * Generate a random UUID v4
    */
   function generateUUID() {
@@ -70,28 +135,145 @@
   }
 
   /**
+   * Cookie utility functions
+   */
+  var CookieUtils = {
+    /**
+     * Set a cookie
+     * @param {string} name - Cookie name
+     * @param {string} value - Cookie value
+     * @param {number} days - Expiration in days (null for session cookie)
+     * @param {string} domain - Cookie domain (optional)
+     * @param {boolean} secure - HTTPS only
+     * @param {string} sameSite - SameSite attribute
+     */
+    set: function(name, value, days, domain, secure, sameSite) {
+      var expires = '';
+      if (days) {
+        var date = new Date();
+        date.setTime(date.getTime() + (days * 24 * 60 * 60 * 1000));
+        expires = '; expires=' + date.toUTCString();
+      }
+
+      var domainStr = '';
+      if (domain) {
+        domainStr = '; domain=' + domain;
+      }
+
+      var secureStr = secure ? '; secure' : '';
+      var sameSiteStr = sameSite ? '; samesite=' + sameSite : '';
+
+      document.cookie = name + '=' + encodeURIComponent(value) + expires + domainStr + secureStr + sameSiteStr + '; path=/';
+    },
+
+    /**
+     * Get a cookie value
+     * @param {string} name - Cookie name
+     * @returns {string|null} Cookie value or null
+     */
+    get: function(name) {
+      var nameEQ = name + '=';
+      var ca = document.cookie.split(';');
+      for (var i = 0; i < ca.length; i++) {
+        var c = ca[i];
+        while (c.charAt(0) === ' ') {
+          c = c.substring(1, c.length);
+        }
+        if (c.indexOf(nameEQ) === 0) {
+          return decodeURIComponent(c.substring(nameEQ.length, c.length));
+        }
+      }
+      return null;
+    },
+
+    /**
+     * Delete a cookie
+     * @param {string} name - Cookie name
+     * @param {string} domain - Cookie domain (optional)
+     */
+    remove: function(name, domain) {
+      var domainStr = '';
+      if (domain) {
+        domainStr = '; domain=' + domain;
+      }
+      document.cookie = name + '=; expires=Thu, 01 Jan 1970 00:00:00 UTC' + domainStr + '; path=/';
+    }
+  };
+
+  /**
+   * Detect best available storage method
+   */
+  function detectStorage() {
+    if (CONFIG.storage !== 'auto') {
+      return CONFIG.storage;
+    }
+
+    // Try localStorage first
+    try {
+      localStorage.setItem('trace_test', '1');
+      localStorage.removeItem('trace_test');
+      return 'localStorage';
+    } catch (e) {
+      // localStorage not available (e.g., Safari ITP, private browsing)
+      debug('localStorage not available, using cookies');
+      return 'cookie';
+    }
+  }
+
+  // Current storage method
+  var currentStorage = detectStorage();
+
+  /**
    * Get or create session ID
    */
   function getOrCreateSessionId() {
-    var sessionId = localStorage.getItem(STORAGE_KEYS.SESSION_ID);
-    var sessionStart = localStorage.getItem(STORAGE_KEYS.SESSION_START);
+    var sessionId, sessionStart;
 
-    // Check if session has expired
-    if (sessionId && sessionStart) {
-      var elapsed = Date.now() - parseInt(sessionStart, 10);
-      if (elapsed > CONFIG.sessionTimeout) {
-        debug('Session expired, creating new session');
-        localStorage.removeItem(STORAGE_KEYS.SESSION_ID);
-        localStorage.removeItem(STORAGE_KEYS.SESSION_START);
-        sessionId = null;
+    // Try to get from current storage method
+    if (currentStorage === 'cookie') {
+      sessionId = CookieUtils.get(STORAGE_KEYS.SESSION_ID);
+      sessionStart = CookieUtils.get(STORAGE_KEYS.SESSION_START);
+
+      // Check if session has expired
+      if (sessionId && sessionStart) {
+        var elapsed = Date.now() - parseInt(sessionStart, 10);
+        if (elapsed > CONFIG.sessionTimeout) {
+          debug('Session expired, creating new session');
+          CookieUtils.remove(STORAGE_KEYS.SESSION_ID, CONFIG.cookieDomain);
+          CookieUtils.remove(STORAGE_KEYS.SESSION_START, CONFIG.cookieDomain);
+          sessionId = null;
+        }
       }
-    }
 
-    if (!sessionId) {
-      sessionId = generateUUID();
-      localStorage.setItem(STORAGE_KEYS.SESSION_ID, sessionId);
-      localStorage.setItem(STORAGE_KEYS.SESSION_START, Date.now().toString());
-      debug('New session created', sessionId);
+      if (!sessionId) {
+        sessionId = generateUUID();
+        // Session cookie (expires when browser closes) or 30 minutes
+        CookieUtils.set(STORAGE_KEYS.SESSION_ID, sessionId, null, CONFIG.cookieDomain, CONFIG.cookieSecure, CONFIG.cookieSameSite);
+        CookieUtils.set(STORAGE_KEYS.SESSION_START, Date.now().toString(), null, CONFIG.cookieDomain, CONFIG.cookieSecure, CONFIG.cookieSameSite);
+        debug('New session created (cookie)', sessionId);
+      }
+    } else {
+      // localStorage fallback
+      sessionId = localStorage.getItem(STORAGE_KEYS.SESSION_ID);
+      sessionStart = localStorage.getItem(STORAGE_KEYS.SESSION_START);
+
+      // Check if session has expired
+      if (sessionId && sessionStart) {
+        var elapsed = Date.now() - parseInt(sessionStart, 10);
+        if (elapsed > CONFIG.sessionTimeout) {
+          debug('Session expired, creating new session');
+          localStorage.removeItem(STORAGE_KEYS.SESSION_ID);
+          localStorage.removeItem(STORAGE_KEYS.SESSION_START);
+          sessionId = null;
+        }
+      }
+
+      if (!sessionId) {
+        sessionId = generateUUID();
+        localStorage.setItem(STORAGE_KEYS.SESSION_ID, sessionId);
+        localStorage.setItem(STORAGE_KEYS.SESSION_START, Date.now().toString());
+        debug('New session created (localStorage)', sessionId);
+      }
     }
 
     CONFIG.sessionId = sessionId;
@@ -102,12 +284,26 @@
    * Get or create user ID
    */
   function getOrCreateUserId() {
-    var userId = localStorage.getItem(STORAGE_KEYS.USER_ID);
+    var userId;
 
-    if (!userId) {
-      userId = generateUUID();
-      localStorage.setItem(STORAGE_KEYS.USER_ID, userId);
-      debug('New user ID created', userId);
+    if (currentStorage === 'cookie') {
+      userId = CookieUtils.get(STORAGE_KEYS.USER_ID);
+
+      if (!userId) {
+        userId = generateUUID();
+        // User ID persists for 1 year
+        CookieUtils.set(STORAGE_KEYS.USER_ID, userId, 365, CONFIG.cookieDomain, CONFIG.cookieSecure, CONFIG.cookieSameSite);
+        debug('New user ID created (cookie)', userId);
+      }
+    } else {
+      // localStorage fallback
+      userId = localStorage.getItem(STORAGE_KEYS.USER_ID);
+
+      if (!userId) {
+        userId = generateUUID();
+        localStorage.setItem(STORAGE_KEYS.USER_ID, userId);
+        debug('New user ID created (localStorage)', userId);
+      }
     }
 
     CONFIG.userId = userId;
@@ -296,31 +492,32 @@
   }
 
   /**
-   * Decorate links with session ID for cross-site tracking
+   * Decorate links with session ID and user ID for cross-site tracking
    */
   function decorateLinks() {
     var links = document.querySelectorAll('a[href]');
     var sessionParam = 'trace_session=' + CONFIG.sessionId;
+    var userParam = 'trace_user=' + CONFIG.userId;
 
     for (var i = 0; i < links.length; i++) {
       var link = links[i];
       var href = link.getAttribute('href');
 
-      // Only decorate links to the same domain or subdomains
+      // Decorate links to same domain, subdomains, or configured cross-domains
       try {
         var linkUrl = new URL(href, window.location.href);
-        if (linkUrl.hostname === window.location.hostname ||
-            linkUrl.hostname.endsWith('.' + window.location.hostname)) {
-
+        if (shouldDecorateLink(linkUrl.hostname)) {
           var separator = href.indexOf('?') > -1 ? '&' : '?';
-          link.setAttribute('href', href + separator + sessionParam);
+          link.setAttribute('href', href + separator + sessionParam + '&' + userParam);
         }
       } catch (err) {
         // Invalid URL, skip
       }
     }
 
-    debug('Links decorated with session ID');
+    debug('Links decorated with session ID and user ID', {
+      crossDomains: CONFIG.crossDomains
+    });
   }
 
   /**
@@ -375,8 +572,29 @@
     if (linkSessionId && linkSessionId !== CONFIG.sessionId) {
       // Cross-site session stitching
       debug('Session stitched from link', { from: CONFIG.sessionId, to: linkSessionId });
-      localStorage.setItem(STORAGE_KEYS.SESSION_ID, linkSessionId);
+
+      if (currentStorage === 'cookie') {
+        CookieUtils.set(STORAGE_KEYS.SESSION_ID, linkSessionId, null, CONFIG.cookieDomain, CONFIG.cookieSecure, CONFIG.cookieSameSite);
+      } else {
+        localStorage.setItem(STORAGE_KEYS.SESSION_ID, linkSessionId);
+      }
+
       CONFIG.sessionId = linkSessionId;
+    }
+
+    // Check for user ID in URL (from decorated link)
+    var linkUserId = urlParams.get('trace_user');
+    if (linkUserId && linkUserId !== CONFIG.userId) {
+      // Cross-site user stitching
+      debug('User stitched from link', { from: CONFIG.userId, to: linkUserId });
+
+      if (currentStorage === 'cookie') {
+        CookieUtils.set(STORAGE_KEYS.USER_ID, linkUserId, 365, CONFIG.cookieDomain, CONFIG.cookieSecure, CONFIG.cookieSameSite);
+      } else {
+        localStorage.setItem(STORAGE_KEYS.USER_ID, linkUserId);
+      }
+
+      CONFIG.userId = linkUserId;
     }
 
     // Capture initial pageview
@@ -419,7 +637,7 @@
 
   // Public API
   var TRACE = {
-    version: '1.0.0',
+    version: '1.1.0',
 
     /**
      * Send a custom event
@@ -449,13 +667,23 @@
     /**
      * Identify user with custom ID
      * @param {string} userId - Custom user ID
+     * @param {object} options - Optional parameters
+     * @param {number} options.expires - Days until cookie expires (cookie storage only)
      */
-    identify: function(userId) {
+    identify: function(userId, options) {
       if (userId) {
-        localStorage.setItem(STORAGE_KEYS.USER_ID, userId);
+        options = options || {};
+        var expires = options.expires !== undefined ? options.expires : 365;
+
+        if (currentStorage === 'cookie') {
+          CookieUtils.set(STORAGE_KEYS.USER_ID, userId, expires, CONFIG.cookieDomain, CONFIG.cookieSecure, CONFIG.cookieSameSite);
+        } else {
+          localStorage.setItem(STORAGE_KEYS.USER_ID, userId);
+        }
+
         CONFIG.userId = userId;
         sendEvent('identify', { user_id: userId });
-        debug('User identified', userId);
+        debug('User identified', { userId: userId, storage: currentStorage });
       }
     },
 
@@ -477,10 +705,15 @@
      * Reset session (create new session)
      */
     reset: function() {
-      localStorage.removeItem(STORAGE_KEYS.SESSION_ID);
-      localStorage.removeItem(STORAGE_KEYS.SESSION_START);
+      if (currentStorage === 'cookie') {
+        CookieUtils.remove(STORAGE_KEYS.SESSION_ID, CONFIG.cookieDomain);
+        CookieUtils.remove(STORAGE_KEYS.SESSION_START, CONFIG.cookieDomain);
+      } else {
+        localStorage.removeItem(STORAGE_KEYS.SESSION_ID);
+        localStorage.removeItem(STORAGE_KEYS.SESSION_START);
+      }
       getOrCreateSessionId();
-      debug('Session reset');
+      debug('Session reset', { storage: currentStorage });
     }
   };
 
