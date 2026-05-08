@@ -29,5 +29,6 @@ COPY --from=builder /build/target/release/trace-flusher /app/trace-flusher
 ENV TRACE_LOG_DIR=/data/logs
 ENV TRACE_DLQ_DIR=/data/dlq
 ENV TRACE_S3_REGION=us-east-1
+ENV TRACE_S3_PREFIX=trace-events
 
 ENTRYPOINT ["/app/trace-flusher"]

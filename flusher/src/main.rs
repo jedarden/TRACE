@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::prelude::*;
 
@@ -42,6 +43,7 @@ struct S3Config {
     bucket: String,
     region: String,
     key_prefix: String,
+    endpoint_url: Option<String>,
 }
 
 /// S3 upload trait for testability
@@ -59,12 +61,27 @@ struct S3Client {
 impl S3Client {
     async fn new(config: S3Config) -> Result<Self> {
         let region = Region::new(config.region.clone());
-        let aws_config = aws_config::defaults(BehaviorVersion::latest())
-            .region(region)
-            .load()
-            .await;
 
-        let client = Client::new(&aws_config);
+        let client = if let Some(endpoint) = &config.endpoint_url {
+            // MinIO or S3-compatible service with custom endpoint
+            info!("Using custom S3 endpoint: {}", endpoint);
+            let s3_config = aws_sdk_s3::Config::builder()
+                .region(region)
+                .endpoint_url(endpoint)
+                .behavior_version_latest()
+                .build();
+
+            Client::from_conf(s3_config)
+        } else {
+            // Standard AWS S3
+            info!("Using AWS S3 in region: {}", config.region);
+            let aws_config = aws_config::defaults(BehaviorVersion::latest())
+                .region(region)
+                .load()
+                .await;
+
+            Client::new(&aws_config)
+        };
 
         Ok(Self { client, config })
     }
@@ -102,6 +119,109 @@ struct FlusherState {
     s3: Arc<dyn S3Upload>,
     dlq_dir: PathBuf,
     processed: Arc<Mutex<HashMap<String, bool>>>,
+    batch: Arc<Mutex<BatchAccumulator>>,
+}
+
+/// Batch accumulator configuration
+#[derive(Clone)]
+struct BatchConfig {
+    max_batch_size_bytes: usize,
+    max_batch_age_secs: u64,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            max_batch_size_bytes: 10 * 1024 * 1024,
+            max_batch_age_secs: 300,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct BatchEntry {
+    data: Vec<u8>,
+    key: String,
+    added_at: Instant,
+    source_file: PathBuf,
+}
+
+struct BatchAccumulator {
+    entries: HashMap<String, Vec<BatchEntry>>,
+    total_size_bytes: usize,
+    oldest_entry_at: Option<Instant>,
+    config: BatchConfig,
+}
+
+impl BatchAccumulator {
+    fn new(config: BatchConfig) -> Self {
+        Self {
+            entries: HashMap::new(),
+            total_size_bytes: 0,
+            oldest_entry_at: None,
+            config,
+        }
+    }
+
+    fn add(&mut self, partition_key: String, data: Vec<u8>, source_file: PathBuf) -> AddedToBatch {
+        let entry_size = data.len();
+        let now = Instant::now();
+
+        if self.oldest_entry_at.is_none() {
+            self.oldest_entry_at = Some(now);
+        }
+
+        let key = format!("{}/part-{:05}.parquet", partition_key, self.entries.len());
+        let entry = BatchEntry {
+            data,
+            key,
+            added_at: now,
+            source_file,
+        };
+
+        self.entries
+            .entry(partition_key)
+            .or_insert_with(Vec::new)
+            .push(entry);
+        self.total_size_bytes += entry_size;
+
+        self.should_flush()
+    }
+
+    fn should_flush(&self) -> AddedToBatch {
+        if self.total_size_bytes >= self.config.max_batch_size_bytes {
+            return AddedToBatch::ShouldFlushSize(self.total_size_bytes);
+        }
+
+        if let Some(oldest) = self.oldest_entry_at {
+            let elapsed = oldest.elapsed().as_secs();
+            if elapsed >= self.config.max_batch_age_secs {
+                return AddedToBatch::ShouldFlushTime(elapsed);
+            }
+        }
+
+        AddedToBatch::Continue
+    }
+
+    fn drain(&mut self) -> HashMap<String, Vec<BatchEntry>> {
+        self.total_size_bytes = 0;
+        self.oldest_entry_at = None;
+        std::mem::take(&mut self.entries)
+    }
+
+    fn size_bytes(&self) -> usize {
+        self.total_size_bytes
+    }
+
+    fn entry_count(&self) -> usize {
+        self.entries.values().map(|v| v.len()).sum()
+    }
+}
+
+enum AddedToBatch {
+    Continue,
+    ShouldFlushSize(usize),
+    ShouldFlushTime(u64),
 }
 
 /// Parse hour key from filename (events-YYYYMMDD-HH.jsonl.gz)
@@ -186,8 +306,8 @@ fn jsonl_to_parquet(events: Vec<CollectorEvent>) -> Result<Vec<u8>> {
     Ok(buffer)
 }
 
-/// Process a single JSONL.gz file
-async fn process_file(state: &FlusherState, path: &PathBuf) -> Result<()> {
+/// Process a single JSONL.gz file and add to batch
+async fn process_file(state: &FlusherState, path: &PathBuf) -> Result<AddedToBatch> {
     let filename = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -215,15 +335,25 @@ async fn process_file(state: &FlusherState, path: &PathBuf) -> Result<()> {
 
     if events.is_empty() {
         info!("No valid events in {}, skipping", filename);
-        return Ok(());
+        // Mark as processed and delete the empty file
+        {
+            let mut processed = state.processed.lock().await;
+            processed.insert(filename.to_string(), true);
+        }
+        tokio::fs::remove_file(path).await?;
+        info!("Removed empty file: {}", filename);
+        return Ok(AddedToBatch::Continue);
     }
 
     // Convert to Parquet
     let parquet_data = jsonl_to_parquet(events)?;
 
-    // Upload to S3 with partitioning
-    let key = format!("events/dt={}/hour={}/part-00000.parquet", dt, hour);
-    state.s3.upload(&key, parquet_data).await?;
+    // Add to batch accumulator
+    let partition_key = format!("events/dt={}/hour={}", dt, hour);
+    let result = {
+        let mut batch = state.batch.lock().await;
+        batch.add(partition_key, parquet_data, path.clone())
+    };
 
     // Mark as processed
     {
@@ -231,9 +361,74 @@ async fn process_file(state: &FlusherState, path: &PathBuf) -> Result<()> {
         processed.insert(filename.to_string(), true);
     }
 
-    // Delete original file after successful upload
-    tokio::fs::remove_file(path).await?;
-    info!("Removed processed file: {}", filename);
+    info!(
+        "Added {} to batch (size: {}, entries: {})",
+        filename,
+        state.batch.lock().await.size_bytes(),
+        state.batch.lock().await.entry_count()
+    );
+
+    Ok(result)
+}
+
+/// Flush the batch accumulator to S3
+async fn flush_batch(state: &FlusherState, reason: &str) -> Result<()> {
+    let entries = {
+        let mut batch = state.batch.lock().await;
+        if batch.entry_count() == 0 {
+            debug!("Batch is empty, nothing to flush");
+            return Ok(());
+        }
+        info!(
+            "Flushing batch: {} entries, {} bytes (reason: {})",
+            batch.entry_count(),
+            batch.size_bytes(),
+            reason
+        );
+        batch.drain()
+    };
+
+    let mut upload_errors = Vec::new();
+
+    // Upload all entries to S3
+    for (partition_key, entries) in &entries {
+        for entry in entries {
+            match state.s3.upload(&entry.key, entry.data.clone()).await {
+                Ok(()) => {
+                    info!("Uploaded: {}", entry.key);
+                }
+                Err(e) => {
+                    error!("Failed to upload {}: {}", entry.key, e);
+                    upload_errors.push((entry.clone(), e));
+                }
+            }
+        }
+    }
+
+    // Delete source files for successful uploads
+    for (partition_key, entries) in &entries {
+        for entry in entries {
+            // Only delete if upload succeeded (not in errors list)
+            let had_error = upload_errors.iter().any(|(e, _)| e.key == entry.key);
+            if !had_error {
+                if let Err(e) = tokio::fs::remove_file(&entry.source_file).await {
+                    warn!("Failed to remove source file {:?}: {}", entry.source_file, e);
+                } else {
+                    debug!("Removed source file: {:?}", entry.source_file);
+                }
+            }
+        }
+    }
+
+    // Move failed uploads to DLQ
+    for (entry, error) in upload_errors {
+        move_to_dlq(state, &entry.source_file, &error.to_string()).await;
+    }
+
+    info!(
+        "Batch flush complete: {} entries uploaded",
+        entries.values().map(|v| v.len()).sum::<usize>() - upload_errors.len()
+    );
 
     Ok(())
 }
@@ -293,8 +488,30 @@ async fn handle_file(state: Arc<FlusherState>, path: PathBuf) {
 
     while retries > 0 {
         match process_file(&state_clone, &path).await {
-            Ok(()) => {
-                info!("Successfully processed {}", filename);
+            Ok(AddedToBatch::Continue) => {
+                info!("Successfully processed {} (added to batch)", filename);
+                return;
+            }
+            Ok(AddedToBatch::ShouldFlushSize(size)) => {
+                info!(
+                    "Successfully processed {} (batch size limit reached: {} bytes)",
+                    filename, size
+                );
+                // Trigger flush
+                if let Err(e) = flush_batch(&state_clone, "size limit").await {
+                    error!("Failed to flush batch: {}", e);
+                }
+                return;
+            }
+            Ok(AddedToBatch::ShouldFlushTime(age)) => {
+                info!(
+                    "Successfully processed {} (batch age limit reached: {} secs)",
+                    filename, age
+                );
+                // Trigger flush
+                if let Err(e) = flush_batch(&state_clone, "age limit").await {
+                    error!("Failed to flush batch: {}", e);
+                }
                 return;
             }
             Err(e) => {
@@ -370,6 +587,7 @@ async fn main() -> Result<()> {
     let s3_bucket = std::env::var("TRACE_S3_BUCKET").expect("TRACE_S3_BUCKET must be set");
     let s3_region = std::env::var("TRACE_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
     let s3_prefix = std::env::var("TRACE_S3_PREFIX").unwrap_or_else(|_| "trace-events".to_string());
+    let s3_endpoint = std::env::var("TRACE_S3_ENDPOINT").ok();
 
     // Create directories
     tokio::fs::create_dir_all(&log_dir).await?;
@@ -379,16 +597,29 @@ async fn main() -> Result<()> {
         bucket: s3_bucket,
         region: s3_region,
         key_prefix: s3_prefix,
+        endpoint_url: s3_endpoint,
     };
+
+    info!(
+        "S3 config: bucket={}, region={}, prefix={}, endpoint={:?}",
+        s3_config.bucket, s3_config.region, s3_config.key_prefix, s3_config.endpoint_url
+    );
 
     let s3_client = S3Client::new(s3_config.clone()).await?;
     let s3: Arc<dyn S3Upload> = Arc::new(s3_client);
+
+    let batch_config = BatchConfig::default();
+    info!(
+        "Batch config: max_size_bytes={}, max_age_secs={}",
+        batch_config.max_batch_size_bytes, batch_config.max_batch_age_secs
+    );
 
     let state = Arc::new(FlusherState {
         log_dir,
         s3,
         dlq_dir,
         processed: Arc::new(Mutex::new(HashMap::new())),
+        batch: Arc::new(Mutex::new(BatchAccumulator::new(batch_config))),
     });
 
     // Scan existing files on startup
@@ -401,9 +632,52 @@ async fn main() -> Result<()> {
     info!("Starting file watcher for: {:?}", state.log_dir);
     let _watcher = setup_watcher(state.clone())?;
 
+    // Start periodic flush check task
+    let state_for_flush = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            let should_flush = {
+                let batch = state_for_flush.batch.lock().await;
+                matches!(
+                    batch.should_flush(),
+                    AddedToBatch::ShouldFlushSize(_) | AddedToBatch::ShouldFlushTime(_)
+                )
+            };
+            if should_flush {
+                info!("Periodic check: batch needs flush");
+                if let Err(e) = flush_batch(&state_for_flush, "periodic check").await {
+                    error!("Failed to flush batch during periodic check: {}", e);
+                }
+            }
+        }
+    });
+
     // Keep alive
     info!("TRACE flusher running");
-    tokio::signal::ctrl_c().await?;
+
+    // Wait for shutdown signal
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received shutdown signal");
+        }
+        _ = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())? => {
+            info!("Received TERM signal");
+        }
+    }
+
+    // Flush any remaining entries before shutdown
+    info!("Flushing remaining entries before shutdown...");
+    let entry_count = state.batch.lock().await.entry_count();
+    if entry_count > 0 {
+        if let Err(e) = flush_batch(&state, "shutdown").await {
+            error!("Failed to flush batch during shutdown: {}", e);
+        }
+    } else {
+        info!("No remaining entries to flush");
+    }
+
     info!("Shutting down...");
 
     Ok(())
