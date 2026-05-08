@@ -11,10 +11,19 @@ impl DuckDBClient {
         let conn = Connection::open_in_memory()?;
 
         // Install and load required extensions
-        conn.execute_batch(
-            "INSTALL httpfs;
-             LOAD httpfs;"
-        ).context("Failed to load DuckDB extensions")?;
+        let mut extensions = vec![
+            "INSTALL httpfs;",
+            "LOAD httpfs;"
+        ];
+
+        // Load Iceberg extension if catalog is configured
+        if config.iceberg_catalog_uri.is_some() {
+            extensions.push("INSTALL iceberg;");
+            extensions.push("LOAD iceberg;");
+        }
+
+        conn.execute_batch(&extensions.join("\n"))
+            .context("Failed to load DuckDB extensions")?;
 
         // Configure S3 credentials if provided
         if let (Some(access_key), Some(secret_key)) = (&config.s3_access_key_id, &config.s3_secret_access_key) {
@@ -88,6 +97,70 @@ impl DuckDBClient {
         self.conn.execute(&compacted_sql, params![])?;
 
         Ok(())
+    }
+
+    /// Setup views for Iceberg tables
+    /// Requires Iceberg extension and catalog URI to be configured
+    pub fn setup_iceberg_views(&self, config: &Config) -> Result<()> {
+        let catalog_uri = config.iceberg_catalog_uri.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Iceberg catalog URI not configured"))?;
+        let warehouse = config.iceberg_warehouse.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Iceberg warehouse not configured"))?;
+
+        // Create view for ad_events table
+        let ad_events_sql = format!(
+            "CREATE OR REPLACE VIEW iceberg_ad_events AS
+             SELECT * FROM iceberg_scan('{}',
+                 catalog_uri => '{}'
+             );",
+            format!("{}/ad_events", warehouse),
+            catalog_uri
+        );
+        self.conn.execute(&ad_events_sql, params![])?;
+
+        // Create view for campaigns dimension table
+        let campaigns_sql = format!(
+            "CREATE OR REPLACE VIEW iceberg_campaigns AS
+             SELECT * FROM iceberg_scan('{}',
+                 catalog_uri => '{}'
+             );",
+            format!("{}/campaigns", warehouse),
+            catalog_uri
+        );
+        self.conn.execute(&campaigns_sql, params![])?;
+
+        // Create view for creatives dimension table
+        let creatives_sql = format!(
+            "CREATE OR REPLACE VIEW iceberg_creatives AS
+             SELECT * FROM iceberg_scan('{}',
+                 catalog_uri => '{}'
+             );",
+            format!("{}/creatives", warehouse),
+            catalog_uri
+        );
+        self.conn.execute(&creatives_sql, params![])?;
+
+        Ok(())
+    }
+
+    /// Get the SQL fragment for querying events (either Iceberg or Parquet)
+    /// Returns Iceberg table SQL if configured, otherwise falls back to Parquet
+    pub fn events_table_sql(&self, config: &Config) -> String {
+        if config.is_iceberg_enabled() {
+            "iceberg_ad_events".to_string()
+        } else {
+            format!("read_parquet('{}/events/**/*.parquet')", config.s3_events_path())
+        }
+    }
+
+    /// Get the SQL fragment for querying compacted events
+    pub fn events_compacted_sql(&self, config: &Config) -> String {
+        if config.is_iceberg_enabled() {
+            // For Iceberg, we can filter on the main table
+            "iceberg_ad_events".to_string()
+        } else {
+            format!("read_parquet('{}/**/*.parquet')", config.s3_compacted_path())
+        }
     }
 }
 

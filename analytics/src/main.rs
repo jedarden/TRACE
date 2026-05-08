@@ -3,6 +3,7 @@ mod duckdb;
 mod queries;
 mod reporter;
 mod s3;
+mod session_stitcher;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

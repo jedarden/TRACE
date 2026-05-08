@@ -12,6 +12,10 @@ pub struct Config {
     pub s3_endpoint: Option<String>,
     pub data_path: String,
     pub reports_output_path: String,
+    /// Iceberg REST catalog URI (e.g., http://iceberg-catalog:8181)
+    pub iceberg_catalog_uri: Option<String>,
+    /// Iceberg warehouse path (e.g., s3://my-trace-bucket/iceberg)
+    pub iceberg_warehouse: Option<String>,
 }
 
 impl Config {
@@ -33,6 +37,8 @@ impl Config {
                 .unwrap_or_else(|_| "/data/analytics".to_string()),
             reports_output_path: env::var("TRACE_REPORTS_OUTPUT_PATH")
                 .unwrap_or_else(|_| "/data/reports".to_string()),
+            iceberg_catalog_uri: env::var("ICEBERG_CATALOG_URI").ok(),
+            iceberg_warehouse: env::var("ICEBERG_WAREHOUSE").ok(),
         })
     }
 
@@ -42,5 +48,16 @@ impl Config {
 
     pub fn s3_compacted_path(&self) -> String {
         format!("s3://{}/{}/events-compacted", self.s3_bucket, self.s3_prefix)
+    }
+
+    /// Check if Iceberg catalog is configured
+    pub fn is_iceberg_enabled(&self) -> bool {
+        self.iceberg_catalog_uri.is_some() && self.iceberg_warehouse.is_some()
+    }
+
+    /// Get the Iceberg table path for ad_events
+    pub fn iceberg_ad_events_path(&self) -> Option<String> {
+        self.iceberg_warehouse.as_ref()
+            .map(|w| format!("{}/ad_events", w))
     }
 }

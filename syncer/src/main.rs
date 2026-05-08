@@ -1,7 +1,9 @@
 mod api_client;
 mod creative;
+mod hierarchy;
 mod registry;
 mod s3_store;
+mod session_hierarchy;
 
 use anyhow::Result;
 use clap::Parser;
@@ -10,13 +12,13 @@ use tokio::time::interval;
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use api_client::{ApiClient, ApiSyncResult};
-use registry::CreativeRegistry;
-use s3_store::S3CreativeStore;
+use api_client::{ApiClient, ApiSyncResult, MetricsSyncResult};
+use registry::{CreativeRegistry, HierarchyRegistry, MetricsRegistry};
+use s3_store::{HierarchyStore, S3CreativeStore};
 
 /// TRACE Creative Syncer
 ///
-/// Fetches creative metadata from ad network APIs and stores it for attribution.
+/// Fetches creative metadata and performance metrics from ad network APIs and stores it for attribution.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -31,6 +33,22 @@ struct Args {
     /// Networks to sync (default: all)
     #[arg(short, long, value_delimiter = ',')]
     networks: Option<String>,
+
+    /// Sync mode: creatives, metrics, or both (default: creatives)
+    #[arg(short, long, default_value = "creatives")]
+    mode: String,
+
+    /// Metrics sync: number of days back to fetch (default: 7)
+    #[arg(short, long, default_value_t = 7)]
+    days_back: u32,
+
+    /// Metrics sync: fetch yesterday's metrics (sets days_back=1)
+    #[arg(long, default_value_t = false)]
+    yesterday: bool,
+
+    /// Sync hierarchy from ad network APIs
+    #[arg(long, default_value_t = false)]
+    hierarchy: bool,
 }
 
 #[tokio::main]
@@ -60,7 +78,17 @@ async fn main() -> Result<()> {
     let store = S3CreativeStore::new(s3_bucket, s3_region, s3_prefix).await?;
 
     // Initialize registry
-    let mut registry = CreativeRegistry::new(store);
+    let mut registry = CreativeRegistry::new(store.clone());
+    let mut metrics_registry = MetricsRegistry::new(store);
+
+    // Determine sync mode
+    let sync_creatives = args.mode == "creatives" || args.mode == "both";
+    let sync_metrics = args.mode == "metrics" || args.mode == "both";
+
+    // Determine metrics date range
+    let days_back = if args.yesterday { 1 } else { args.days_back };
+    let end_date = chrono::Utc::now().date_naive();
+    let start_date = end_date - chrono::Duration::days(days_back as i64);
 
     // Determine which networks to sync
     let networks_to_sync = args.networks.as_ref().map(|ns| {
@@ -121,17 +149,32 @@ async fn main() -> Result<()> {
         "TRACE creative syncer starting with {} API clients",
         clients.len()
     );
+    info!("Sync mode: {}", args.mode);
+    if sync_metrics {
+        info!("Metrics date range: {} to {}", start_date, end_date);
+    }
 
     if args.once {
         // Run once and exit
-        run_sync(&mut registry, &mut clients).await?;
+        if sync_creatives {
+            run_sync(&mut registry, &mut clients).await?;
+        }
+        if sync_metrics {
+            run_metrics_sync(&mut metrics_registry, &mut clients, start_date, end_date).await?;
+        }
     } else {
         // Continuous sync mode
         let mut timer = interval(Duration::from_secs(args.interval));
         timer.tick().await; // Skip first immediate tick
 
         loop {
-            run_sync(&mut registry, &mut clients).await?;
+            if sync_creatives {
+                run_sync(&mut registry, &mut clients).await?;
+            }
+            if sync_metrics {
+                run_metrics_sync(&mut metrics_registry, &mut clients, start_date, end_date)
+                    .await?;
+            }
             timer.tick().await;
         }
     }
@@ -178,6 +221,53 @@ async fn run_sync(
 
     info!(
         "Sync complete: {} creatives fetched, {} errors",
+        total_fetched, total_errors
+    );
+
+    Ok(())
+}
+
+async fn run_metrics_sync(
+    registry: &mut MetricsRegistry,
+    clients: &mut [Box<dyn ApiClient>],
+    start_date: chrono::NaiveDate,
+    end_date: chrono::NaiveDate,
+) -> Result<()> {
+    info!("Starting metrics sync from {} to {}...", start_date, end_date);
+
+    let mut total_fetched = 0;
+    let mut total_errors = 0;
+
+    for client in clients.iter_mut() {
+        info!("Fetching metrics from {}...", client.network_name());
+
+        match client.fetch_metrics(start_date, end_date).await {
+            Ok(MetricsSyncResult { metrics, .. }) => {
+                info!(
+                    "Fetched {} metrics from {}",
+                    metrics.len(),
+                    client.network_name()
+                );
+                total_fetched += metrics.len();
+
+                // Add to registry
+                for metric in metrics {
+                    registry.add_metrics(metric).await?;
+                }
+            }
+            Err(e) => {
+                error!("Failed to fetch metrics from {}: {}", client.network_name(), e);
+                total_errors += 1;
+            }
+        }
+    }
+
+    // Persist metrics to S3
+    info!("Persisting metrics to S3...");
+    registry.persist().await?;
+
+    info!(
+        "Metrics sync complete: {} metrics fetched, {} errors",
         total_fetched, total_errors
     );
 

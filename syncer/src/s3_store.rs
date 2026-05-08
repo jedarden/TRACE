@@ -7,7 +7,8 @@ use aws_smithy_types::byte_stream::ByteStream;
 use chrono::{DateTime, Utc};
 use parquet::arrow::arrow_writer::ArrowWriter;
 
-use crate::creative::CreativeMetadata;
+use crate::creative::{CreativeMetadata, PerformanceMetrics};
+use crate::hierarchy::AccountHierarchy;
 
 /// Trait for creative metadata storage
 #[async_trait]
@@ -17,6 +18,33 @@ pub trait CreativeStore: Send + Sync {
 
     /// Load creative metadata
     async fn load(&self) -> anyhow::Result<Vec<CreativeMetadata>>;
+}
+
+/// Trait for performance metrics storage
+#[async_trait]
+pub trait MetricsStore: Send + Sync {
+    /// Store performance metrics
+    async fn store_metrics(&self, metrics: Vec<PerformanceMetrics>) -> anyhow::Result<()>;
+
+    /// Load performance metrics for a date range
+    async fn load_metrics(
+        &self,
+        start_date: chrono::NaiveDate,
+        end_date: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<PerformanceMetrics>>;
+}
+
+/// Trait for hierarchy storage
+#[async_trait]
+pub trait HierarchyStore: Send + Sync {
+    /// Store account hierarchy
+    async fn store_hierarchy(&self, hierarchy: &AccountHierarchy) -> anyhow::Result<()>;
+
+    /// Load account hierarchy for a specific network and account
+    async fn load_hierarchy(&self, network: &str, account_id: &str) -> anyhow::Result<Option<AccountHierarchy>>;
+
+    /// List all available hierarchies
+    async fn list_hierarchies(&self) -> anyhow::Result<Vec<(String, String)>>;
 }
 
 /// S3-backed creative store
@@ -47,6 +75,217 @@ impl S3CreativeStore {
     /// Get the S3 key for the creative registry
     fn registry_key(&self) -> String {
         format!("{}/creative-registry.parquet", self.key_prefix)
+    }
+
+    /// Get the S3 key for performance metrics for a specific date
+    fn metrics_key(&self, date: chrono::NaiveDate) -> String {
+        format!("{}/metrics/metrics-{}.parquet", self.key_prefix, date)
+    }
+
+    /// Get the S3 key for hierarchy data
+    fn hierarchy_key(&self, network: &str, account_id: &str) -> String {
+        format!("{}/hierarchy/{}-{}.json", self.key_prefix, network, account_id)
+    }
+
+    /// Convert performance metrics to Parquet format
+    fn metrics_to_parquet(&self, metrics: Vec<PerformanceMetrics>) -> anyhow::Result<Vec<u8>> {
+        use arrow::array::{
+            Int64Array, LongArray, NullArray, StringArray, TimestampMillisecondArray,
+        };
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let networks: Vec<String> = metrics.iter().map(|m| m.network.clone()).collect();
+        let campaign_ids: Vec<String> = metrics.iter().map(|m| m.campaign_id.clone()).collect();
+        let campaign_names: Vec<Option<String>> =
+            metrics.iter().map(|m| m.campaign_name.clone()).collect();
+        let creative_ids: Vec<Option<String>> =
+            metrics.iter().map(|m| m.creative_id.clone()).collect();
+        let dates: Vec<i32> = metrics
+            .iter()
+            .map(|m| m.date.format("%Y%m%d").to_string().parse::<i32>().unwrap())
+            .collect();
+        let impressions: Vec<i64> = metrics.iter().map(|m| m.impressions).collect();
+        let clicks: Vec<i64> = metrics.iter().map(|m| m.clicks).collect();
+        let spend_micros: Vec<i64> = metrics.iter().map(|m| m.spend_micros).collect();
+        let conversions: Vec<Option<i64>> = metrics.iter().map(|m| m.conversions).collect();
+        let ctr_bps: Vec<Option<i32>> = metrics.iter().map(|m| m.ctr_bps).collect();
+        let cpc_micros: Vec<Option<i64>> = metrics.iter().map(|m| m.cpc_micros).collect();
+        let cpm_micros: Vec<Option<i64>> = metrics.iter().map(|m| m.cpm_micros).collect();
+        let synced_at: Vec<i64> = metrics
+            .iter()
+            .map(|m| m.synced_at.timestamp_millis())
+            .collect();
+
+        let schema = Schema::new(vec![
+            Field::new("network", DataType::Utf8, false),
+            Field::new("campaign_id", DataType::Utf8, false),
+            Field::new("campaign_name", DataType::Utf8, true),
+            Field::new("creative_id", DataType::Utf8, true),
+            Field::new("date", DataType::Int32, false),
+            Field::new("impressions", DataType::Int64, false),
+            Field::new("clicks", DataType::Int64, false),
+            Field::new("spend_micros", DataType::Int64, false),
+            Field::new("conversions", DataType::Int64, true),
+            Field::new("ctr_bps", DataType::Int32, true),
+            Field::new("cpc_micros", DataType::Int64, true),
+            Field::new("cpm_micros", DataType::Int64, true),
+            Field::new(
+                "synced_at",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                false,
+            ),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(networks)),
+                Arc::new(StringArray::from(campaign_ids)),
+                Arc::new(StringArray::from(campaign_names)),
+                Arc::new(StringArray::from(creative_ids)),
+                Arc::new(LongArray::from(dates)),
+                Arc::new(Int64Array::from(impressions)),
+                Arc::new(Int64Array::from(clicks)),
+                Arc::new(Int64Array::from(spend_micros)),
+                Arc::new(Int64Array::from(conversions)),
+                Arc::new(Int64Array::from(ctr_bps.map(|v| v as i64))),
+                Arc::new(Int64Array::from(cpc_micros)),
+                Arc::new(Int64Array::from(cpm_micros)),
+                Arc::new(TimestampMillisecondArray::from(synced_at)),
+            ],
+        )?;
+
+        let mut buffer = Vec::new();
+        let props = parquet::file::properties::WriterProperties::builder().build();
+        let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), Some(props))?;
+
+        writer.write(&batch)?;
+        writer.close()?;
+
+        Ok(buffer)
+    }
+
+    /// Convert Parquet data to performance metrics
+    fn parquet_to_metrics(&self, data: &[u8]) -> anyhow::Result<Vec<PerformanceMetrics>> {
+        use arrow::array::{Array, Int64Array, StringArray, TimestampMillisecondArray};
+        use bytes::Bytes;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let bytes = Bytes::from(data.to_vec());
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)?.build()?;
+
+        let mut metrics = Vec::new();
+
+        for batch in reader {
+            let batch = batch?;
+
+            let networks = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast network column"))?;
+
+            let campaign_ids = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast campaign_id column"))?;
+
+            let campaign_names = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast campaign_name column"))?;
+
+            let creative_ids = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast creative_id column"))?;
+
+            let dates = batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast date column"))?;
+
+            let impressions = batch
+                .column(5)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast impressions column"))?;
+
+            let clicks = batch
+                .column(6)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast clicks column"))?;
+
+            let spend_micros = batch
+                .column(7)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast spend_micros column"))?;
+
+            let conversions = batch
+                .column(8)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast conversions column"))?;
+
+            let ctr_bps = batch
+                .column(9)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast ctr_bps column"))?;
+
+            let cpc_micros = batch
+                .column(10)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast cpc_micros column"))?;
+
+            let cpm_micros = batch
+                .column(11)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast cpm_micros column"))?;
+
+            let synced_at = batch
+                .column(12)
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast synced_at column"))?;
+
+            for i in 0..batch.num_rows() {
+                let date_str = format!("{:08}", dates.value(i));
+                let date = chrono::NaiveDate::parse_from_str(&date_str, "%Y%m%d")?;
+
+                metrics.push(PerformanceMetrics {
+                    network: networks.value(i).to_string(),
+                    campaign_id: campaign_ids.value(i).to_string(),
+                    campaign_name: campaign_names
+                        .is_valid(i)
+                        .then(|| campaign_names.value(i).to_string()),
+                    creative_id: creative_ids
+                        .is_valid(i)
+                        .then(|| creative_ids.value(i).to_string()),
+                    date,
+                    impressions: impressions.value(i),
+                    clicks: clicks.value(i),
+                    spend_micros: spend_micros.value(i),
+                    conversions: conversions.is_valid(i).then(|| conversions.value(i)),
+                    ctr_bps: ctr_bps.is_valid(i).then(|| ctr_bps.value(i) as i32),
+                    cpc_micros: cpc_micros.is_valid(i).then(|| cpc_micros.value(i)),
+                    cpm_micros: cpm_micros.is_valid(i).then(|| cpm_micros.value(i)),
+                    synced_at: DateTime::from_timestamp_millis(synced_at.value(i)).unwrap(),
+                });
+            }
+        }
+
+        Ok(metrics)
     }
 
     /// Convert creatives to Parquet format
@@ -250,6 +489,156 @@ impl CreativeStore for S3CreativeStore {
 
         tracing::info!("Loaded {} creatives from s3://{}", creatives.len(), key);
         Ok(creatives)
+    }
+}
+
+#[async_trait]
+impl MetricsStore for S3CreativeStore {
+    async fn store_metrics(&self, metrics: Vec<PerformanceMetrics>) -> anyhow::Result<()> {
+        // Group metrics by date
+        let mut metrics_by_date: std::collections::HashMap<
+            chrono::NaiveDate,
+            Vec<PerformanceMetrics>,
+        > = std::collections::HashMap::new();
+
+        for metric in metrics {
+            metrics_by_date.entry(metric.date).or_default().push(metric);
+        }
+
+        // Store each date's metrics separately
+        for (date, date_metrics) in metrics_by_date {
+            let parquet_data = self.metrics_to_parquet(date_metrics)?;
+            let key = self.metrics_key(date);
+
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .body(ByteStream::from(parquet_data))
+                .send()
+                .await?;
+
+            tracing::info!("Stored metrics for {} to s3://{}", date, key);
+        }
+
+        Ok(())
+    }
+
+    async fn load_metrics(
+        &self,
+        start_date: chrono::NaiveDate,
+        end_date: chrono::NaiveDate,
+    ) -> anyhow::Result<Vec<PerformanceMetrics>> {
+        let mut all_metrics = Vec::new();
+        let mut current_date = start_date;
+
+        while current_date <= end_date {
+            let key = self.metrics_key(current_date);
+
+            match self
+                .client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    let data = response.body.collect().await?.into_bytes().to_vec();
+                    let metrics = self.parquet_to_metrics(&data)?;
+                    all_metrics.extend(metrics);
+                }
+                Err(e) => {
+                    // Log warning but continue - metrics might not exist for all dates
+                    tracing::warn!("Failed to load metrics for {}: {}", key, e);
+                }
+            }
+
+            current_date = current_date.succ_opt().unwrap_or(current_date);
+        }
+
+        tracing::info!(
+            "Loaded {} metrics from {} to {}",
+            all_metrics.len(),
+            start_date,
+            end_date
+        );
+        Ok(all_metrics)
+    }
+}
+
+#[async_trait]
+impl HierarchyStore for S3CreativeStore {
+    async fn store_hierarchy(&self, hierarchy: &AccountHierarchy) -> anyhow::Result<()> {
+        let json_data = serde_json::to_vec_pretty(hierarchy)?;
+        let key = self.hierarchy_key(&hierarchy.network, &hierarchy.account_id);
+
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .body(ByteStream::from(json_data))
+            .send()
+            .await?;
+
+        tracing::info!("Stored hierarchy for {}:{} to s3://{}", hierarchy.network, hierarchy.account_id, key);
+        Ok(())
+    }
+
+    async fn load_hierarchy(&self, network: &str, account_id: &str) -> anyhow::Result<Option<AccountHierarchy>> {
+        let key = self.hierarchy_key(network, account_id);
+
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let data = response.body.collect().await?.into_bytes().to_vec();
+                let hierarchy = serde_json::from_slice(&data)?;
+                tracing::info!("Loaded hierarchy for {}:{} from s3://{}", network, account_id, key);
+                Ok(Some(hierarchy))
+            }
+            Err(e) => {
+                tracing::debug!("No hierarchy found for {}:{}: {}", network, account_id, e);
+                Ok(None)
+            }
+        }
+    }
+
+    async fn list_hierarchies(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let prefix = format!("{}/hierarchy/", self.key_prefix);
+
+        let response = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(&prefix)
+            .send()
+            .await?;
+
+        let mut hierarchies = Vec::new();
+
+        if let Some(objects) = response.contents {
+            for obj in objects {
+                if let Some(key) = obj.key() {
+                    // Extract network and account_id from key pattern: "prefix/hierarchy/network-account_id.json"
+                    if let Some(filename) = key.strip_prefix(&prefix) {
+                        if let Some(stem) = filename.strip_suffix(".json") {
+                            if let Some((network, account_id)) = stem.split_once('-') {
+                                hierarchies.push((network.to_string(), account_id.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        tracing::info!("Found {} hierarchies in s3://{}", hierarchies.len(), self.bucket);
+        Ok(hierarchies)
     }
 }
 

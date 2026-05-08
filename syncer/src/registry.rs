@@ -4,8 +4,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::creative::CreativeMetadata;
-use crate::s3_store::CreativeStore;
+use crate::creative::{CreativeMetadata, PerformanceMetrics};
+use crate::hierarchy::AccountHierarchy;
+use crate::s3_store::{CreativeStore, HierarchyStore, MetricsStore};
 
 /// In-memory registry of creative metadata
 pub struct CreativeRegistry {
@@ -92,6 +93,197 @@ impl CreativeRegistry {
         }
 
         Ok(())
+    }
+}
+
+/// In-memory registry of performance metrics
+pub struct MetricsRegistry {
+    store: Box<dyn MetricsStore>,
+    metrics: Arc<RwLock<HashMap<String, PerformanceMetrics>>>,
+}
+
+impl MetricsRegistry {
+    /// Create a new metrics registry with the given store
+    pub fn new(store: impl MetricsStore + 'static) -> Self {
+        Self {
+            store: Box::new(store),
+            metrics: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Add metrics to the registry
+    pub async fn add_metrics(&mut self, metric: PerformanceMetrics) -> anyhow::Result<()> {
+        let key = metric.key();
+        let mut metrics = self.metrics.write().await;
+        metrics.insert(key, metric);
+        Ok(())
+    }
+
+    /// Add multiple metrics to the registry
+    pub async fn add_metrics_batch(&mut self, metrics: Vec<PerformanceMetrics>) -> anyhow::Result<()> {
+        for metric in metrics {
+            self.add_metrics(metric).await?;
+        }
+        Ok(())
+    }
+
+    /// Get metrics by key
+    pub async fn get_metrics(&self, key: &str) -> Option<PerformanceMetrics> {
+        let metrics = self.metrics.read().await;
+        metrics.get(key).cloned()
+    }
+
+    /// Get all metrics for a network
+    pub async fn get_network_metrics(&self, network: &str) -> Vec<PerformanceMetrics> {
+        let metrics = self.metrics.read().await;
+        metrics
+            .values()
+            .filter(|m| m.network == network)
+            .cloned()
+            .collect()
+    }
+
+    /// Get metrics for a campaign
+    pub async fn get_campaign_metrics(
+        &self,
+        network: &str,
+        campaign_id: &str,
+    ) -> Vec<PerformanceMetrics> {
+        let metrics = self.metrics.read().await;
+        metrics
+            .values()
+            .filter(|m| m.network == network && m.campaign_id == campaign_id)
+            .cloned()
+            .collect()
+    }
+
+    /// Get metrics for a date range
+    pub async fn get_metrics_in_range(
+        &self,
+        start_date: chrono::NaiveDate,
+        end_date: chrono::NaiveDate,
+    ) -> Vec<PerformanceMetrics> {
+        let metrics = self.metrics.read().await;
+        metrics
+            .values()
+            .filter(|m| m.date >= start_date && m.date <= end_date)
+            .cloned()
+            .collect()
+    }
+
+    /// Get the total number of metrics in the registry
+    pub async fn len(&self) -> usize {
+        let metrics = self.metrics.read().await;
+        metrics.len()
+    }
+
+    /// Persist the metrics to the store
+    pub async fn persist(&self) -> anyhow::Result<()> {
+        let metrics = self.metrics.read().await;
+        let metrics_vec: Vec<PerformanceMetrics> = metrics.values().cloned().collect();
+        self.store.store_metrics(metrics_vec).await?;
+        Ok(())
+    }
+
+    /// Load metrics from the store for a date range
+    pub async fn load(
+        &mut self,
+        start_date: chrono::NaiveDate,
+        end_date: chrono::NaiveDate,
+    ) -> anyhow::Result<()> {
+        let metrics = self.store.load_metrics(start_date, end_date).await?;
+        let mut registry = self.metrics.write().await;
+
+        for metric in metrics {
+            let key = metric.key();
+            registry.insert(key, metric);
+        }
+
+        Ok(())
+    }
+
+    /// Clear all metrics from the registry
+    pub async fn clear(&self) {
+        let mut metrics = self.metrics.write().await;
+        metrics.clear();
+    }
+}
+
+/// In-memory registry of account hierarchies
+pub struct HierarchyRegistry {
+    store: Box<dyn HierarchyStore>,
+    hierarchies: Arc<RwLock<HashMap<String, AccountHierarchy>>>,
+}
+
+impl HierarchyRegistry {
+    /// Create a new hierarchy registry with the given store
+    pub fn new(store: impl HierarchyStore + 'static) -> Self {
+        Self {
+            store: Box::new(store),
+            hierarchies: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Add a hierarchy to the registry
+    pub async fn add_hierarchy(&mut self, hierarchy: AccountHierarchy) -> anyhow::Result<()> {
+        let key = hierarchy.key();
+        let mut hierarchies = self.hierarchies.write().await;
+        hierarchies.insert(key, hierarchy);
+        Ok(())
+    }
+
+    /// Get a hierarchy by network and account ID
+    pub async fn get_hierarchy(&self, network: &str, account_id: &str) -> Option<AccountHierarchy> {
+        let key = format!("{}:{}", network, account_id);
+        let hierarchies = self.hierarchies.read().await;
+        hierarchies.get(&key).cloned()
+    }
+
+    /// Get all hierarchies for a network
+    pub async fn get_network_hierarchies(&self, network: &str) -> Vec<AccountHierarchy> {
+        let hierarchies = self.hierarchies.read().await;
+        hierarchies
+            .values()
+            .filter(|h| h.network == network)
+            .cloned()
+            .collect()
+    }
+
+    /// Get the total number of hierarchies in the registry
+    pub async fn len(&self) -> usize {
+        let hierarchies = self.hierarchies.read().await;
+        hierarchies.len()
+    }
+
+    /// Persist a hierarchy to the store
+    pub async fn persist_hierarchy(&self, hierarchy: &AccountHierarchy) -> anyhow::Result<()> {
+        self.store.store_hierarchy(hierarchy).await
+    }
+
+    /// Persist all hierarchies in the registry to the store
+    pub async fn persist_all(&self) -> anyhow::Result<()> {
+        let hierarchies = self.hierarchies.read().await;
+        for hierarchy in hierarchies.values() {
+            self.store.store_hierarchy(hierarchy).await?;
+        }
+        Ok(())
+    }
+
+    /// Load a hierarchy from the store
+    pub async fn load(&mut self, network: &str, account_id: &str) -> anyhow::Result<Option<AccountHierarchy>> {
+        if let Some(hierarchy) = self.store.load_hierarchy(network, account_id).await? {
+            let key = hierarchy.key();
+            let mut hierarchies = self.hierarchies.write().await;
+            hierarchies.insert(key, hierarchy.clone());
+            Ok(Some(hierarchy))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// List all available hierarchies
+    pub async fn list_available(&self) -> anyhow::Result<Vec<(String, String)>> {
+        self.store.list_hierarchies().await
     }
 }
 
