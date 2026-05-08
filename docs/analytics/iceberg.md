@@ -1,5 +1,7 @@
 # Apache Iceberg Integration for TRACE
 
+> **Schema Definition**: The complete Iceberg table schema for ad events is defined in `analytics/schemas/ad_events_iceberg.sql`. This file includes the main ad_events table, dimension tables for campaigns/creatives, and helper views for common analytics queries.
+
 ## Overview
 
 Apache Iceberg provides an open table format for huge analytic datasets. For TRACE, Iceberg offers:
@@ -97,7 +99,43 @@ catalog:
 
 ## Table Schema
 
-### Events Table
+### Ad Events Table (Recommended)
+
+For ad analytics use cases, use the dedicated ad events schema with normalized campaign fields:
+
+```sql
+-- Full schema defined in: analytics/schemas/ad_events_iceberg.sql
+CREATE TABLE trace.ad_events (
+  ts TIMESTAMP NOT NULL,
+  ip STRING,
+  ua STRING,
+  url STRING NOT NULL,
+  type STRING NOT NULL,
+  session_id STRING,
+  user_id STRING,
+  cookie_id STRING,
+  -- Normalized ad fields
+  network STRING,
+  campaign_id STRING,
+  campaign_name STRING,
+  creative_id STRING,
+  headline STRING,
+  image_id STRING,
+  item_id STRING,
+  params MAP<STRING, STRING>
+)
+PARTITIONED BY DAYS(ts)
+LOCATED AT 's3://my-trace-bucket/iceberg/ad_events';
+```
+
+See `analytics/schemas/ad_events_iceberg.sql` for the complete schema including:
+- Dimension tables for campaigns and creatives
+- Helper views for common analytics queries
+- Migration notes from existing Parquet data
+
+### Events Table (Generic)
+
+For general-purpose event tracking:
 
 ```sql
 CREATE TABLE trace.events (
