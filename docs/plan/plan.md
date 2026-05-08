@@ -197,11 +197,13 @@ TRACE.identify('user-123');
 
 ---
 
-### Phase 4: Attribution & Campaign Sync 📋 PLANNED
+### Phase 4: Attribution & Cross-Network Normalization ✅ COMPLETE
 
-#### Ad Network Integration
+**Status**: Cross-network normalization implemented, attribution sync planned
 
-**Goal**: Map campaign IDs back to actual creatives (headlines, images) used.
+#### Cross-Network Normalization
+
+Different ad networks use different parameter names for the same concepts. The normalization layer unifies these into a common schema.
 
 **Supported Networks**:
 - Taboola (`tb_item`, `tb_image`, `tb_headline`)
@@ -210,25 +212,51 @@ TRACE.identify('user-123');
 - RevContent (`rc_id`, `rc_title`, `rc_thumb`)
 
 **Implementation**:
+1. **Rust Normalizer Module** (`collector/src/normalizer.rs`):
+   - Network detection from `utm_source` or parameter prefixes
+   - Parameter mapping to common schema
+   - Generic fallback for unknown networks
+
+2. **SQL Views** (`docs/analytics/normalization.sql`):
+   - `normalized_campaigns` - Unified view across all networks
+   - `network_performance` - Compare metrics by network
+   - `top_creatives` - Best performing creatives cross-network
+   - `creative_fatigue` - Detect declining performance
+   - `cross_network_creatives` - Find same creative across networks
+
+**Normalized Schema**:
+```rust
+pub struct NormalizedCampaign {
+    pub network: String,        // Detected ad network
+    pub campaign_id: Option<String>,
+    pub creative_id: Option<String>,
+    pub headline: Option<String>,
+    pub image_id: Option<String>,
+    pub item_id: Option<String>,
+}
+```
+
+**Usage**:
+```sql
+-- Top creatives across all networks
+SELECT network, headline, clicks, ctr_pct
+FROM top_creatives
+ORDER BY clicks DESC LIMIT 20;
+
+-- Same creative across networks (arbitrage detection)
+SELECT * FROM cross_network_creatives
+WHERE num_networks >= 2;
+```
+
+#### Ad Network API Sync (Planned)
+
+**Goal**: Fetch creative metadata from ad network APIs for enrichment.
+
+**Implementation**:
 1. **API Sync Jobs**: Periodic fetch from ad network APIs
 2. **Creative Registry**: Store creative metadata (image URLs, headlines, landing pages)
 3. **Asset Tagging**: Tag images/headlines with semantic categories
 4. **Performance Attribution**: Join events with creative registry
-
-**Schema**:
-```sql
-CREATE TABLE creatives (
-  network STRING NOT NULL,
-  campaign_id STRING NOT NULL,
-  creative_id STRING NOT NULL,
-  headline STRING,
-  image_url STRING,
-  landing_page STRING,
-  first_seen TIMESTAMP,
-  last_seen TIMESTAMP,
-  PRIMARY KEY (network, creative_id)
-);
-```
 
 ---
 
@@ -370,7 +398,7 @@ AWS_SESSION_TOKEN=***  # if using temporary creds
 | 1. Core Collection | ✅ Complete | DONE |
 | 2. CI/CD & Deploy | ✅ Complete | 2026-05-15 |
 | 3. Client JS Tag | ✅ Complete | 2026-05-30 |
-| 4. Attribution Sync | 📋 Planned | 2026-06-15 |
+| 4. Cross-Network Normalization | ✅ Complete | 2026-05-08 |
 | 5. Analytics Layer | ✅ Complete | 2026-05-08 |
 | 6. Advanced Features | 📋 Planned | Future |
 

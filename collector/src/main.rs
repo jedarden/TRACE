@@ -1,3 +1,5 @@
+mod normalizer;
+
 use anyhow::Result;
 use axum::{
     extract::{Query, State},
@@ -54,6 +56,9 @@ struct Event {
     params: HashMap<String, String>,
     /// Event type
     r#type: String,
+    /// Normalized campaign data (cross-network)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    normalized: Option<normalizer::NormalizedCampaign>,
 }
 
 /// Shared state for the collector
@@ -195,6 +200,13 @@ async fn collect_json(
 
     let params = extract_params(&url);
 
+    // Normalize campaign data if present
+    let normalized = if normalizer::NetworkNormalizer::has_campaign_data(&params) {
+        Some(normalizer::NetworkNormalizer::normalize(&params))
+    } else {
+        None
+    };
+
     let event = Event {
         ts: Utc::now(),
         ip,
@@ -202,6 +214,7 @@ async fn collect_json(
         url,
         params,
         r#type: payload.r#type,
+        normalized,
     };
 
     write_event(&state, &event).await?;
@@ -239,6 +252,13 @@ async fn collect_query(
 
     let event_type = params.get("type").cloned().unwrap_or_else(|| "pageview".to_string());
 
+    // Normalize campaign data if present
+    let normalized = if normalizer::NetworkNormalizer::has_campaign_data(&params) {
+        Some(normalizer::NetworkNormalizer::normalize(&params))
+    } else {
+        None
+    };
+
     let event = Event {
         ts: Utc::now(),
         ip,
@@ -246,6 +266,7 @@ async fn collect_query(
         url: url.clone(),
         params,
         r#type: event_type,
+        normalized,
     };
 
     write_event(&state, &event).await?;
