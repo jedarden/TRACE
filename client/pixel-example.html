@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TRACE Pixel Tag Example</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        .example {
+            background: #f5f5f5;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+        code {
+            background: #e0e0e0;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+        }
+        pre {
+            background: #2d2d2d;
+            color: #f8f8f2;
+            padding: 15px;
+            border-radius: 6px;
+            overflow-x: auto;
+        }
+        pre code {
+            background: transparent;
+            padding: 0;
+        }
+        .note {
+            border-left: 4px solid #ffc107;
+            padding-left: 15px;
+            margin: 20px 0;
+            background: #fff8e1;
+        }
+    </style>
+</head>
+<body>
+    <h1>TRACE Pixel Tag Integration</h1>
+
+    <p>The TRACE pixel tag is a simple, backward-compatible way to track pageviews using a standard HTML image tag.</p>
+
+    <h2>Basic Pageview Tracking</h2>
+
+    <div class="example">
+        <h3>HTML Code:</h3>
+        <pre><code>&lt;img src="https://trace.example.com/collect?url=PAGE_URL&amp;type=pageview"
+     width="1"
+     height="1"
+     alt=""
+     style="display:none"&gt;</code></pre>
+    </div>
+
+    <h2>Dynamic Pixel Tag (JavaScript Helper)</h2>
+
+    <p>Use this JavaScript snippet to automatically populate the current page URL:</p>
+
+    <div class="example">
+        <h3>JavaScript Code:</h3>
+        <pre><code>&lt;script&gt;
+(function() {
+    var collectorUrl = 'https://trace.example.com/collect';
+    var params = '?url=' + encodeURIComponent(window.location.href) +
+                 '&amp;type=pageview' +
+                 '&amp;referrer=' + encodeURIComponent(document.referrer);
+
+    // Add campaign parameters from URL
+    var searchParams = new URLSearchParams(window.location.search);
+    searchParams.forEach(function(value, key) {
+        params += '&amp;' + encodeURIComponent(key) + '=' + encodeURIComponent(value);
+    });
+
+    var img = new Image();
+    img.src = collectorUrl + params;
+    img.width = 1;
+    img.height = 1;
+    img.style.display = 'none';
+    document.body.appendChild(img);
+})();
+&lt;/script&gt;</code></pre>
+    </div>
+
+    <h2>Tracking Custom Events</h2>
+
+    <div class="example">
+        <h3>Click Tracking:</h3>
+        <pre><code>&lt;a href="https://example.com" onclick="trackClick('buy-button')"&gt;Buy Now&lt;/a&gt;
+
+&lt;script&gt;
+function trackClick(elementId) {
+    var collectorUrl = 'https://trace.example.com/collect';
+    var params = '?type=click&amp;element=' + encodeURIComponent(elementId) +
+                 '&amp;url=' + encodeURIComponent(window.location.href);
+    var img = new Image();
+    img.src = collectorUrl + params;
+}
+&lt;/script&gt;</code></pre>
+    </div>
+
+    <h2>Parameters</h2>
+
+    <table>
+        <tr>
+            <th>Parameter</th>
+            <th>Required</th>
+            <th>Description</th>
+        </tr>
+        <tr>
+            <td><code>url</code></td>
+            <td>Yes</td>
+            <td>The URL of the page being tracked</td>
+        </tr>
+        <tr>
+            <td><code>type</code></td>
+            <td>No</td>
+            <td>Event type (default: <code>pageview</code>)</td>
+        </tr>
+        <tr>
+            <td><code>referrer</code></td>
+            <td>No</td>
+            <td>The referring page URL</td>
+        </tr>
+        <tr>
+            <td><em>any custom param</em></td>
+            <td>No</td>
+            <td>Any additional query parameters will be stored</td>
+        </tr>
+    </table>
+
+    <div class="note">
+        <strong>Note:</strong> The pixel tag only tracks pageviews. For advanced features like dwell time, scroll depth, click tracking, and session stitching, use the <a href="demo.html">JavaScript tag</a> instead.
+    </div>
+
+    <h2>Limitations</h2>
+
+    <ul>
+        <li>No automatic dwell time tracking</li>
+        <li>No scroll depth measurement</li>
+        <li>No automatic click tracking</li>
+        <li>Limited to GET requests (data in URL)</li>
+        <li>Cannot send events on page unload (beforeunload is unreliable for images)</li>
+    </ul>
+
+    <p><a href="demo.html">View JavaScript Tag Demo &rarr;</a></p>
+</body>
+</html>
