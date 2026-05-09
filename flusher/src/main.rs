@@ -1,3 +1,5 @@
+mod raw_log_parser;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
@@ -18,6 +20,7 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::prelude::*;
+use uuid::Uuid;
 
 /// Event from the collector (matches collector schema)
 /// All fields are optional to support gradual schema evolution
@@ -209,6 +212,7 @@ struct BatchEntry {
     key: String,
     added_at: Instant,
     source_file: PathBuf,
+    event_type: String,
 }
 
 struct BatchAccumulator {
@@ -228,7 +232,14 @@ impl BatchAccumulator {
         }
     }
 
-    fn add(&mut self, partition_key: String, data: Vec<u8>, source_file: PathBuf) -> AddedToBatch {
+    fn add(
+        &mut self,
+        event_type: String,
+        date_key: String,
+        hour_key: String,
+        data: Vec<u8>,
+        source_file: PathBuf,
+    ) -> AddedToBatch {
         let entry_size = data.len();
         let now = Instant::now();
 
@@ -236,22 +247,22 @@ impl BatchAccumulator {
             self.oldest_entry_at = Some(now);
         }
 
-        // Get the current count for this partition to generate a unique part number
-        let part_number = self
-            .entries
-            .get(&partition_key)
-            .map(|v| v.len())
-            .unwrap_or(0);
-        let key = format!("{}/part-{:05}.parquet", partition_key, part_number);
+        // Generate UUID for unique file name
+        let file_uuid = Uuid::new_v4();
+        let key = format!(
+            "{}/date={}/hour={}/{}.parquet",
+            event_type, date_key, hour_key, file_uuid
+        );
         let entry = BatchEntry {
             data,
             key,
             added_at: now,
             source_file,
+            event_type,
         };
 
         self.entries
-            .entry(partition_key)
+            .entry(key.clone())
             .or_insert_with(Vec::new)
             .push(entry);
         self.total_size_bytes += entry_size;
@@ -581,7 +592,221 @@ fn jsonl_to_parquet(events: Vec<CollectorEvent>) -> Result<Vec<u8>> {
     Ok(buffer)
 }
 
+/// Convert parsed events from raw log parser to Parquet in memory
+/// This matches the Iceberg schema defined in analytics/schemas/ad_events_iceberg.sql
+fn parsed_events_to_parquet(events: Vec<raw_log_parser::Event>) -> Result<Vec<u8>> {
+    use arrow::array::{
+        BooleanArray, Float64Array, Int64Array, MapArray, StringArray, TimestampMillisecondArray,
+    };
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    let n = events.len();
+
+    // Build column arrays for each field
+    let timestamps: Vec<i64> = events.iter().map(|e| e.ts.timestamp_millis()).collect();
+    let ips: Vec<Option<String>> = events.iter().map(|e| e.ip.clone()).collect();
+    let uas: Vec<Option<String>> = events.iter().map(|e| e.ua.clone()).collect();
+    let urls: Vec<String> = events.iter().map(|e| e.url.clone()).collect();
+    let types: Vec<String> = events
+        .iter()
+        .map(|e| e.event_type.as_str().to_string())
+        .collect();
+    let session_ids: Vec<Option<String>> = events.iter().map(|e| e.session_id.clone()).collect();
+    let user_ids: Vec<Option<String>> = events.iter().map(|e| e.user_id.clone()).collect();
+    let cookie_ids: Vec<Option<String>> = events.iter().map(|e| e.cookie_id.clone()).collect();
+    let referrers: Vec<Option<String>> = events.iter().map(|e| e.referer.clone()).collect();
+    let referrer_networks: Vec<Option<String>> = events
+        .iter()
+        .map(|e| e.referrer_network.clone())
+        .collect();
+
+    // All other fields are None for raw events (not enriched yet)
+    let networks: Vec<Option<String>> = vec![None; n];
+    let campaign_ids: Vec<Option<String>> = vec![None; n];
+    let campaign_names: Vec<Option<String>> = vec![None; n];
+    let creative_ids: Vec<Option<String>> = vec![None; n];
+    let headlines: Vec<Option<String>> = vec![None; n];
+    let image_ids: Vec<Option<String>> = vec![None; n];
+    let item_ids: Vec<Option<String>> = vec![None; n];
+    let attribution_campaign_ids: Vec<Option<String>> = vec![None; n];
+    let attribution_creative_ids: Vec<Option<String>> = vec![None; n];
+    let attribution_touches: Vec<Option<i64>> = vec![None; n];
+    let attribution_days_to_convert: Vec<Option<i64>> = vec![None; n];
+    let device_types: Vec<Option<String>> = vec![None; n];
+    let device_oss: Vec<Option<String>> = vec![None; n];
+    let device_browsers: Vec<Option<String>> = vec![None; n];
+    let scroll_depth_pcts: Vec<Option<i64>> = vec![None; n];
+    let scroll_time_mss: Vec<Option<i64>> = vec![None; n];
+    let dwell_time_mss: Vec<Option<i64>> = vec![None; n];
+    let dwell_visible_pcts: Vec<Option<i64>> = vec![None; n];
+    let viewport_widths: Vec<Option<i64>> = vec![None; n];
+    let viewport_heights: Vec<Option<i64>> = vec![None; n];
+    let quality_scores: Vec<Option<f64>> = vec![None; n];
+    let bot_probabilities: Vec<Option<f64>> = vec![None; n];
+    let fraud_scores: Vec<Option<f64>> = vec![None; n];
+    let is_valids: Vec<Option<bool>> = vec![None; n];
+    let is_verifieds: Vec<Option<bool>> = vec![None; n];
+    let validation_reasons: Vec<Option<String>> = vec![None; n];
+    let enriched_ats: Vec<Option<i64>> = vec![None; n];
+    let enrichment_versions: Vec<Option<String>> = vec![None; n];
+
+    // Build params as a MapArray for Iceberg compatibility
+    let mut all_params_keys = Vec::new();
+    let mut all_params_values = Vec::new();
+    let mut params_offsets = vec![0i32];
+    let mut current_offset = 0i32;
+
+    for event in &events {
+        for (key, value) in &event.params {
+            all_params_keys.push(key.clone());
+            all_params_values.push(value.clone());
+            current_offset += 1;
+        }
+        params_offsets.push(current_offset);
+    }
+
+    // Create the map field (struct with key and value)
+    let map_fields = vec![
+        Field::new("key", DataType::Utf8, false),
+        Field::new("value", DataType::Utf8, false),
+    ];
+    let map_data_type = DataType::Map(
+        Arc::new(Field::new("entries", DataType::Struct(map_fields), false)),
+        false,
+    );
+
+    let params_array = MapArray::new(
+        Arc::new(Field::new("entries", DataType::Struct(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, false),
+        ]), false)),
+        OffsetBuffer::new(params_offsets.into()),
+        Arc::new(arrow::array::StructArray::new(
+            DataType::Struct(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Utf8, false),
+            ])
+            .into(),
+            vec![
+                Arc::new(StringArray::from(all_params_keys)),
+                Arc::new(StringArray::from(all_params_values)),
+            ],
+            None,
+        )),
+        None,
+        false,
+    );
+
+    let schema = Schema::new(vec![
+        Field::new(
+            "ts",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+            false,
+        ),
+        Field::new("ip", DataType::Utf8, true),
+        Field::new("ua", DataType::Utf8, true),
+        Field::new("url", DataType::Utf8, false),
+        Field::new("type", DataType::Utf8, false),
+        Field::new("session_id", DataType::Utf8, true),
+        Field::new("user_id", DataType::Utf8, true),
+        Field::new("cookie_id", DataType::Utf8, true),
+        Field::new("network", DataType::Utf8, true),
+        Field::new("campaign_id", DataType::Utf8, true),
+        Field::new("campaign_name", DataType::Utf8, true),
+        Field::new("creative_id", DataType::Utf8, true),
+        Field::new("headline", DataType::Utf8, true),
+        Field::new("image_id", DataType::Utf8, true),
+        Field::new("item_id", DataType::Utf8, true),
+        Field::new("referrer", DataType::Utf8, true),
+        Field::new("referrer_network", DataType::Utf8, true),
+        Field::new("attribution_campaign_id", DataType::Utf8, true),
+        Field::new("attribution_creative_id", DataType::Utf8, true),
+        Field::new("attribution_touches", DataType::Int64, true),
+        Field::new("attribution_days_to_convert", DataType::Int64, true),
+        Field::new("device_type", DataType::Utf8, true),
+        Field::new("device_os", DataType::Utf8, true),
+        Field::new("device_browser", DataType::Utf8, true),
+        Field::new("scroll_depth_pct", DataType::Int64, true),
+        Field::new("scroll_time_ms", DataType::Int64, true),
+        Field::new("dwell_time_ms", DataType::Int64, true),
+        Field::new("dwell_visible_pct", DataType::Int64, true),
+        Field::new("viewport_width", DataType::Int64, true),
+        Field::new("viewport_height", DataType::Int64, true),
+        Field::new("quality_score", DataType::Float64, true),
+        Field::new("bot_probability", DataType::Float64, true),
+        Field::new("fraud_score", DataType::Float64, true),
+        Field::new("is_valid", DataType::Boolean, true),
+        Field::new("is_verified", DataType::Boolean, true),
+        Field::new("validation_reason", DataType::Utf8, true),
+        Field::new(
+            "enriched_at",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+            true,
+        ),
+        Field::new("enrichment_version", DataType::Utf8, true),
+        Field::new("params", map_data_type, true),
+    ]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(TimestampMillisecondArray::from(timestamps)),
+            Arc::new(StringArray::from(ips)),
+            Arc::new(StringArray::from(uas)),
+            Arc::new(StringArray::from(urls)),
+            Arc::new(StringArray::from(types)),
+            Arc::new(StringArray::from(session_ids)),
+            Arc::new(StringArray::from(user_ids)),
+            Arc::new(StringArray::from(cookie_ids)),
+            Arc::new(StringArray::from(networks)),
+            Arc::new(StringArray::from(campaign_ids)),
+            Arc::new(StringArray::from(campaign_names)),
+            Arc::new(StringArray::from(creative_ids)),
+            Arc::new(StringArray::from(headlines)),
+            Arc::new(StringArray::from(image_ids)),
+            Arc::new(StringArray::from(item_ids)),
+            Arc::new(StringArray::from(referrers)),
+            Arc::new(StringArray::from(referrer_networks)),
+            Arc::new(StringArray::from(attribution_campaign_ids)),
+            Arc::new(StringArray::from(attribution_creative_ids)),
+            Arc::new(Int64Array::from(attribution_touches)),
+            Arc::new(Int64Array::from(attribution_days_to_convert)),
+            Arc::new(StringArray::from(device_types)),
+            Arc::new(StringArray::from(device_oss)),
+            Arc::new(StringArray::from(device_browsers)),
+            Arc::new(Int64Array::from(scroll_depth_pcts)),
+            Arc::new(Int64Array::from(scroll_time_mss)),
+            Arc::new(Int64Array::from(dwell_time_mss)),
+            Arc::new(Int64Array::from(dwell_visible_pcts)),
+            Arc::new(Int64Array::from(viewport_widths)),
+            Arc::new(Int64Array::from(viewport_heights)),
+            Arc::new(Float64Array::from(quality_scores)),
+            Arc::new(Float64Array::from(bot_probabilities)),
+            Arc::new(Float64Array::from(fraud_scores)),
+            Arc::new(BooleanArray::from(is_valids)),
+            Arc::new(BooleanArray::from(is_verifieds)),
+            Arc::new(StringArray::from(validation_reasons)),
+            Arc::new(TimestampMillisecondArray::from(enriched_ats)),
+            Arc::new(StringArray::from(enrichment_versions)),
+            Arc::new(params_array),
+        ],
+    )?;
+
+    let mut buffer = Vec::new();
+    let props = WriterProperties::builder().build();
+    let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), Some(props))?;
+
+    writer.write(&batch)?;
+    writer.close()?;
+
+    Ok(buffer)
+}
+
 /// Process a single JSONL.gz file and add to batch
+/// Groups events by event_type and creates separate Parquet files per type
 async fn process_file(state: &FlusherState, path: &PathBuf) -> Result<AddedToBatch> {
     let filename = path
         .file_name()
@@ -593,22 +818,26 @@ async fn process_file(state: &FlusherState, path: &PathBuf) -> Result<AddedToBat
     let (dt, hour) = parse_hour_key(filename)
         .ok_or_else(|| anyhow::anyhow!("Cannot parse hour key from filename"))?;
 
-    // Parse JSONL and collect events
+    // Parse JSONL and collect events grouped by event_type
     let file = File::open(path)?;
     let decoder = GzDecoder::new(file);
     let reader = BufReader::new(decoder);
 
-    let mut events = Vec::new();
+    let mut events_by_type: HashMap<String, Vec<CollectorEvent>> = HashMap::new();
+
     for line in reader.lines() {
         let line = line?;
         if let Ok(event) = serde_json::from_str::<CollectorEvent>(&line) {
-            events.push(event);
+            events_by_type
+                .entry(event.event_type.clone())
+                .or_insert_with(Vec::new)
+                .push(event);
         } else {
             warn!("Skipping invalid JSON line in {}", filename);
         }
     }
 
-    if events.is_empty() {
+    if events_by_type.is_empty() {
         info!("No valid events in {}, skipping", filename);
         // Mark as processed and delete the empty file
         {
@@ -620,15 +849,182 @@ async fn process_file(state: &FlusherState, path: &PathBuf) -> Result<AddedToBat
         return Ok(AddedToBatch::Continue);
     }
 
-    // Convert to Parquet
-    let parquet_data = jsonl_to_parquet(events)?;
+    let mut result = AddedToBatch::Continue;
 
-    // Add to batch accumulator
-    let partition_key = format!("events/dt={}/hour={}", dt, hour);
-    let result = {
-        let mut batch = state.batch.lock().await;
-        batch.add(partition_key, parquet_data, path.clone())
-    };
+    // Process each event type separately
+    for (event_type, events) in events_by_type {
+        info!(
+            "Processing {} events of type '{}' from {}",
+            events.len(),
+            event_type,
+            filename
+        );
+
+        // Convert to Parquet for this event type
+        let parquet_data = jsonl_to_parquet(events)?;
+
+        // Add to batch accumulator with new partition format
+        let add_result = {
+            let mut batch = state.batch.lock().await;
+            batch.add(
+                event_type.clone(),
+                dt.clone(),
+                hour.clone(),
+                parquet_data,
+                path.clone(),
+            )
+        };
+
+        // Update result if this event should trigger a flush
+        match add_result {
+            AddedToBatch::Continue => {}
+            AddedToBatch::ShouldFlushSize(_) | AddedToBatch::ShouldFlushTime(_) => {
+                result = add_result;
+            }
+        }
+    }
+
+    // Mark as processed
+    {
+        let mut processed = state.processed.lock().await;
+        processed.insert(filename.to_string(), true);
+    }
+
+    info!(
+        "Added {} to batch (size: {}, entries: {})",
+        filename,
+        state.batch.lock().await.size_bytes(),
+        state.batch.lock().await.entry_count()
+    );
+
+    Ok(result)
+}
+
+/// Parse hour key from raw log filename (raw-YYYYMMDD-HH.jsonl or raw-YYYYMMDD-HH.jsonl.ready)
+fn parse_raw_hour_key(filename: &str) -> Option<(String, String)> {
+    // Remove .ready extension if present
+    let base = filename.strip_suffix(".ready").unwrap_or(filename);
+    // Remove .jsonl extension
+    let base = base.strip_suffix(".jsonl")?;
+
+    let rest = base.strip_prefix("raw-")?;
+
+    if let Some(idx) = rest.rfind('-') {
+        let date_part = &rest[..idx];
+        let hour_part = &rest[idx + 1..];
+
+        if date_part.len() == 8 && hour_part.len() == 2 {
+            // Format: YYYYMMDD-HH -> YYYY-MM-DD and HH
+            let dt = format!(
+                "{}-{}-{}",
+                &date_part[0..4],
+                &date_part[4..6],
+                &date_part[6..8]
+            );
+            return Some((dt, hour_part.to_string()));
+        }
+    }
+
+    None
+}
+
+/// Process a single raw log file and add to batch
+/// Parses raw collector log lines and groups by event_type
+async fn process_raw_log_file(state: &FlusherState, path: &PathBuf) -> Result<AddedToBatch> {
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("Invalid filename"))?;
+
+    info!("Processing raw log file: {}", filename);
+
+    let (dt, hour) = parse_raw_hour_key(filename)
+        .ok_or_else(|| anyhow::anyhow!("Cannot parse hour key from raw log filename"))?;
+
+    // Parse raw log lines
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+
+    let mut events_by_type: HashMap<String, Vec<raw_log_parser::Event>> = HashMap::new();
+    let mut parsed_count = 0;
+    let mut error_count = 0;
+
+    for line in reader.lines() {
+        let line = line?;
+        match raw_log_parser::RawLogParser::parse_line(&line) {
+            Ok(event) => {
+                let event_type = event.event_type.as_str().to_string();
+                events_by_type
+                    .entry(event_type)
+                    .or_insert_with(Vec::new)
+                    .push(event);
+                parsed_count += 1;
+            }
+            Err(e) => {
+                error_count += 1;
+                if error_count <= 10 {
+                    // Only log first 10 errors to avoid spam
+                    warn!("Failed to parse line in {}: {}", filename, e);
+                }
+            }
+        }
+    }
+
+    if error_count > 10 {
+        warn!("... and {} more parse errors in {}", error_count - 10, filename);
+    }
+
+    if events_by_type.is_empty() {
+        info!("No valid events in {}, skipping", filename);
+        // Mark as processed and delete the empty file
+        {
+            let mut processed = state.processed.lock().await;
+            processed.insert(filename.to_string(), true);
+        }
+        tokio::fs::remove_file(path).await?;
+        info!("Removed empty file: {}", filename);
+        return Ok(AddedToBatch::Continue);
+    }
+
+    info!(
+        "Parsed {} events from {} ({} errors)",
+        parsed_count, filename, error_count
+    );
+
+    let mut result = AddedToBatch::Continue;
+
+    // Process each event type separately
+    for (event_type, events) in events_by_type {
+        info!(
+            "Processing {} events of type '{}' from {}",
+            events.len(),
+            event_type,
+            filename
+        );
+
+        // Convert to Parquet for this event type
+        let parquet_data = parsed_events_to_parquet(events)?;
+
+        // Add to batch accumulator with new partition format
+        let add_result = {
+            let mut batch = state.batch.lock().await;
+            batch.add(
+                event_type.clone(),
+                dt.clone(),
+                hour.clone(),
+                parquet_data,
+                path.clone(),
+            )
+        };
+
+        // Update result if this event should trigger a flush
+        match add_result {
+            AddedToBatch::Continue => {}
+            AddedToBatch::ShouldFlushSize(_) | AddedToBatch::ShouldFlushTime(_) => {
+                result = add_result;
+            }
+        }
+    }
 
     // Mark as processed
     {
@@ -751,8 +1147,12 @@ async fn handle_file(state: Arc<FlusherState>, path: PathBuf) {
         }
     }
 
-    // Only process .jsonl.gz files
-    if !filename.ends_with(".jsonl.gz") {
+    // Determine file type and process accordingly
+    let is_raw_log = filename.starts_with("raw-") &&
+        (filename.ends_with(".jsonl") || filename.ends_with(".jsonl.ready"));
+    let is_enriched_log = filename.ends_with(".jsonl.gz");
+
+    if !is_raw_log && !is_enriched_log {
         return;
     }
 
@@ -763,7 +1163,13 @@ async fn handle_file(state: Arc<FlusherState>, path: PathBuf) {
     let state_clone = state.clone();
 
     while retries > 0 {
-        match process_file(&state_clone, &path).await {
+        let process_result = if is_raw_log {
+            process_raw_log_file(&state_clone, &path).await
+        } else {
+            process_file(&state_clone, &path).await
+        };
+
+        match process_result {
             Ok(AddedToBatch::Continue) => {
                 info!("Successfully processed {} (added to batch)", filename);
                 return;
@@ -1121,7 +1527,9 @@ mod tests {
 
         // Add first entry (50 bytes)
         let result = accumulator.add(
-            "events/dt=2026-05-08/hour=14".to_string(),
+            "pageview".to_string(),
+            "2026-05-08".to_string(),
+            "14".to_string(),
             vec![0u8; 50],
             PathBuf::from("/tmp/test1.jsonl.gz"),
         );
@@ -1129,7 +1537,9 @@ mod tests {
 
         // Add second entry (50 bytes, total 100 bytes)
         let result = accumulator.add(
-            "events/dt=2026-05-08/hour=14".to_string(),
+            "pageview".to_string(),
+            "2026-05-08".to_string(),
+            "14".to_string(),
             vec![0u8; 50],
             PathBuf::from("/tmp/test2.jsonl.gz"),
         );
@@ -1146,7 +1556,9 @@ mod tests {
 
         // Add entry
         let result = accumulator.add(
-            "events/dt=2026-05-08/hour=14".to_string(),
+            "pageview".to_string(),
+            "2026-05-08".to_string(),
+            "14".to_string(),
             vec![0u8; 100],
             PathBuf::from("/tmp/test1.jsonl.gz"),
         );
@@ -1167,12 +1579,16 @@ mod tests {
 
         // Add entries
         accumulator.add(
-            "events/dt=2026-05-08/hour=14".to_string(),
+            "pageview".to_string(),
+            "2026-05-08".to_string(),
+            "14".to_string(),
             vec![0u8; 100],
             PathBuf::from("/tmp/test1.jsonl.gz"),
         );
         accumulator.add(
-            "events/dt=2026-05-08/hour=15".to_string(),
+            "click".to_string(),
+            "2026-05-08".to_string(),
+            "15".to_string(),
             vec![0u8; 100],
             PathBuf::from("/tmp/test2.jsonl.gz"),
         );
@@ -1183,7 +1599,7 @@ mod tests {
         // Drain
         let entries = accumulator.drain();
 
-        assert_eq!(entries.len(), 2); // 2 partition keys
+        assert_eq!(entries.len(), 2); // 2 unique keys
         assert_eq!(accumulator.entry_count(), 0);
         assert_eq!(accumulator.size_bytes(), 0);
         assert!(accumulator.oldest_entry_at.is_none());
@@ -1194,19 +1610,25 @@ mod tests {
         let config = BatchConfig::default();
         let mut accumulator = BatchAccumulator::new(config);
 
-        // Add entries to different partitions
+        // Add entries to different partitions (event types and hours)
         accumulator.add(
-            "events/dt=2026-05-08/hour=14".to_string(),
+            "pageview".to_string(),
+            "2026-05-08".to_string(),
+            "14".to_string(),
             vec![0u8; 100],
             PathBuf::from("/tmp/test1.jsonl.gz"),
         );
         accumulator.add(
-            "events/dt=2026-05-08/hour=14".to_string(),
+            "pageview".to_string(),
+            "2026-05-08".to_string(),
+            "14".to_string(),
             vec![0u8; 100],
             PathBuf::from("/tmp/test2.jsonl.gz"),
         );
         accumulator.add(
-            "events/dt=2026-05-08/hour=15".to_string(),
+            "click".to_string(),
+            "2026-05-08".to_string(),
+            "15".to_string(),
             vec![0u8; 100],
             PathBuf::from("/tmp/test3.jsonl.gz"),
         );
@@ -1215,9 +1637,9 @@ mod tests {
         assert_eq!(accumulator.size_bytes(), 300);
 
         let entries = accumulator.drain();
-        assert_eq!(entries.len(), 2); // 2 partition keys
-        assert_eq!(entries.get("events/dt=2026-05-08/hour=14").unwrap().len(), 2);
-        assert_eq!(entries.get("events/dt=2026-05-08/hour=15").unwrap().len(), 1);
+        // Each unique combination (event_type + date + hour + UUID) creates a separate key
+        // So we have 3 unique entries, each with its own UUID-based key
+        assert_eq!(entries.len(), 3);
     }
 
     #[test]
@@ -1264,5 +1686,233 @@ mod tests {
 
         let result = jsonl_to_parquet(events);
         assert!(result.is_ok(), "Parquet conversion with empty params failed");
+    }
+
+    #[test]
+    fn test_partition_key_format() {
+        let config = BatchConfig::default();
+        let mut accumulator = BatchAccumulator::new(config);
+
+        accumulator.add(
+            "heartbeat".to_string(),
+            "2026-05-08".to_string(),
+            "14".to_string(),
+            vec![0u8; 100],
+            PathBuf::from("/tmp/test.jsonl.gz"),
+        );
+
+        let entries = accumulator.drain();
+        assert_eq!(entries.len(), 1);
+
+        // Get the key (should be the only one)
+        let key = entries.keys().next().unwrap();
+
+        // Verify format: <event_type>/date=YYYY-MM-DD/hour=HH/<uuid>.parquet
+        assert!(key.starts_with("heartbeat/date=2026-05-08/hour=14/"));
+        assert!(key.ends_with(".parquet"));
+
+        // Verify UUID format in filename (36 chars for UUID + .parquet extension)
+        let filename = key.split('/').last().unwrap();
+        assert!(filename.len() == 41); // 36 for UUID + 5 for ".parquet"
+    }
+
+    #[test]
+    fn test_partition_key_different_event_types() {
+        let config = BatchConfig::default();
+        let mut accumulator = BatchAccumulator::new(config);
+
+        // Same date/hour but different event types
+        accumulator.add(
+            "pageview".to_string(),
+            "2026-05-08".to_string(),
+            "14".to_string(),
+            vec![0u8; 100],
+            PathBuf::from("/tmp/test1.jsonl.gz"),
+        );
+        accumulator.add(
+            "click".to_string(),
+            "2026-05-08".to_string(),
+            "14".to_string(),
+            vec![0u8; 100],
+            PathBuf::from("/tmp/test2.jsonl.gz"),
+        );
+
+        let entries = accumulator.drain();
+        assert_eq!(entries.len(), 2);
+
+        // Verify each has the correct prefix
+        let keys: Vec<_> = entries.keys().collect();
+        assert!(keys.iter().any(|k| k.starts_with("pageview/")));
+        assert!(keys.iter().any(|k| k.starts_with("click/")));
+    }
+
+    #[test]
+    fn test_parse_raw_hour_key_valid() {
+        let cases = vec![
+            (
+                "raw-20260508-14.jsonl",
+                Some(("2026-05-08".to_string(), "14".to_string())),
+            ),
+            (
+                "raw-20260508-14.jsonl.ready",
+                Some(("2026-05-08".to_string(), "14".to_string())),
+            ),
+            (
+                "raw-20260101-00.jsonl",
+                Some(("2026-01-01".to_string(), "00".to_string())),
+            ),
+            (
+                "raw-20261231-23.jsonl.ready",
+                Some(("2026-12-31".to_string(), "23".to_string())),
+            ),
+        ];
+
+        for (filename, expected) in cases {
+            let result = parse_raw_hour_key(filename);
+            assert_eq!(result, expected, "Failed for filename: {}", filename);
+        }
+    }
+
+    #[test]
+    fn test_parse_raw_hour_key_invalid() {
+        let cases = vec![
+            "raw-20260508.jsonl",
+            "raw-20260508-14.json",
+            "events-20260508-14.jsonl",
+            "20260508-14.jsonl",
+            "raw-16-14.jsonl",
+        ];
+
+        for filename in cases {
+            let result = parse_raw_hour_key(filename);
+            assert!(result.is_none(), "Should return None for: {}", filename);
+        }
+    }
+
+    #[test]
+    fn test_parsed_events_to_parquet() {
+        use raw_log_parser::{Event, EventType};
+
+        let events = vec![
+            Event {
+                ts: DateTime::parse_from_rfc3339("2026-05-08T14:30:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                ip: Some("1.2.3.4".to_string()),
+                ua: Some("Mozilla/5.0".to_string()),
+                url: "https://example.com?utm_source=test".to_string(),
+                event_type: EventType::Pageview,
+                params: vec![("utm_source".to_string(), "test".to_string())]
+                    .into_iter()
+                    .collect(),
+                session_id: Some("sess-abc-123".to_string()),
+                user_id: Some("user-xyz-789".to_string()),
+                cookie_id: Some("cookie-123".to_string()),
+                referer: Some("https://google.com".to_string()),
+                referrer_network: Some("google".to_string()),
+            },
+            Event {
+                ts: DateTime::parse_from_rfc3339("2026-05-08T14:31:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                ip: None,
+                ua: None,
+                url: "https://example.com/page2".to_string(),
+                event_type: EventType::Click,
+                params: HashMap::new(),
+                session_id: None,
+                user_id: None,
+                cookie_id: None,
+                referer: None,
+                referrer_network: None,
+            },
+        ];
+
+        let result = parsed_events_to_parquet(events);
+        assert!(
+            result.is_ok(),
+            "Parquet conversion failed: {:?}",
+            result.err()
+        );
+
+        let parquet_data = result.unwrap();
+        assert!(!parquet_data.is_empty(), "Parquet data should not be empty");
+        assert!(
+            parquet_data.len() > 100,
+            "Parquet data should have meaningful content"
+        );
+    }
+
+    #[test]
+    fn test_parsed_events_to_parquet_empty() {
+        use raw_log_parser::Event;
+
+        let events: Vec<Event> = vec![];
+        let result = parsed_events_to_parquet(events);
+        assert!(result.is_ok(), "Should handle empty events");
+
+        let parquet_data = result.unwrap();
+        assert!(
+            !parquet_data.is_empty(),
+            "Empty events should still produce Parquet schema"
+        );
+    }
+
+    #[test]
+    fn test_parsed_events_to_parquet_with_heartbeat() {
+        use raw_log_parser::{Event, EventType};
+
+        let mut params = HashMap::new();
+        params.insert("dwell".to_string(), "30000".to_string());
+        params.insert("dwell_sec".to_string(), "30".to_string());
+
+        let events = vec![Event {
+            ts: DateTime::parse_from_rfc3339("2026-05-08T14:30:30Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            ip: Some("5.6.7.8".to_string()),
+            ua: Some("Chrome/120.0".to_string()),
+            url: "https://example.com".to_string(),
+            event_type: EventType::Heartbeat,
+            params,
+            session_id: Some("sess-456".to_string()),
+            user_id: None,
+            cookie_id: None,
+            referer: None,
+            referrer_network: None,
+        }];
+
+        let result = parsed_events_to_parquet(events);
+        assert!(result.is_ok(), "Parquet conversion with heartbeat failed: {:?}", result.err());
+
+        let parquet_data = result.unwrap();
+        assert!(!parquet_data.is_empty(), "Parquet data with heartbeat should not be empty");
+    }
+
+    #[test]
+    fn test_parsed_events_to_parquet_with_referrer_network() {
+        use raw_log_parser::{Event, EventType};
+
+        let events = vec![Event {
+            ts: DateTime::parse_from_rfc3339("2026-05-08T14:30:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            ip: Some("1.2.3.4".to_string()),
+            ua: Some("Mozilla/5.0".to_string()),
+            url: "https://example.com".to_string(),
+            event_type: EventType::Pageview,
+            params: HashMap::new(),
+            session_id: None,
+            user_id: None,
+            cookie_id: None,
+            referer: Some("https://taboola.com".to_string()),
+            referrer_network: Some("taboola".to_string()),
+        }];
+
+        let result = parsed_events_to_parquet(events);
+        assert!(result.is_ok(), "Parquet conversion with referrer network failed");
+
+        let parquet_data = result.unwrap();
+        assert!(!parquet_data.is_empty());
     }
 }
