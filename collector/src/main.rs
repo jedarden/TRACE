@@ -10,9 +10,10 @@
 //! - Must handle 100 rps on single core
 
 use axum::{
+    body::Body,
     extract::State,
-    http::{HeaderMap, StatusCode, Uri},
-    response::IntoResponse,
+    http::{header, HeaderMap, StatusCode, Uri},
+    response::{IntoResponse, Response},
 };
 use chrono::Utc;
 use serde::Serialize;
@@ -125,17 +126,39 @@ fn write_raw_request(log_dir: &PathBuf, raw: &RawRequest) -> std::io::Result<()>
     Ok(())
 }
 
-/// GET /collect - Query string endpoint
+/// 1x1 transparent GIF for pixel tracking
+const PIXEL_GIF: &[u8] = &[
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00,
+    0x01, 0x00, 0x80, 0x00, 0x00, 0xFF, 0xFF, 0xFF,
+    0x00, 0x00, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x04,
+    0x01, 0x00, 0x3B
+];
+
+/// Response wrapper for pixel GIF
+struct PixelResponse;
+
+impl IntoResponse for PixelResponse {
+    fn into_response(self) -> Response {
+        (
+            [(header::CONTENT_TYPE, "image/gif")],
+            PIXEL_GIF,
+        )
+            .into_response()
+    }
+}
+
+/// GET /p - Query string endpoint (pixel tracking)
 async fn collect_get(
     State(state): State<CollectorState>,
     uri: Uri,
     headers: HeaderMap,
-) -> impl IntoResponse {
+) -> PixelResponse {
     let query_string = uri.query().map(|s| s.to_string());
     let raw = RawRequest {
         ts: Utc::now().to_rfc3339(),
         method: "GET".to_string(),
-        path: format!("/collect{}", uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("")),
+        path: format!("/p{}", uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("")),
         headers: extract_headers(&headers),
         query_params: query_string,
         body: None,
@@ -146,10 +169,10 @@ async fn collect_get(
         error!("Failed to write request: {}", e);
     }
 
-    StatusCode::NO_CONTENT
+    PixelResponse
 }
 
-/// POST /collect - JSON body endpoint
+/// POST /e - JSON body endpoint
 async fn collect_post(
     State(state): State<CollectorState>,
     uri: Uri,
@@ -160,7 +183,7 @@ async fn collect_post(
     let raw = RawRequest {
         ts: Utc::now().to_rfc3339(),
         method: "POST".to_string(),
-        path: format!("/collect{}", uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("")),
+        path: format!("/e{}", uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("")),
         headers: extract_headers(&headers),
         query_params: query_string,
         body: Some(body),
@@ -244,6 +267,8 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let app = axum::Router::new()
+        .route("/e", axum::routing::post(collect_post))
+        .route("/p", axum::routing::get(collect_get))
         .route("/collect", axum::routing::get(collect_get).post(collect_post))
         .route("/health", axum::routing::get(health))
         .layer(TraceLayer::new_for_http())
