@@ -97,25 +97,45 @@ pub async fn run_scheduled_reports(config: Config, interval_secs: u64) -> Result
     }
 }
 
-async fn run_daily_reports(config: &Config) -> Result<()> {
+pub async fn run_daily_reports(config: &Config) -> Result<()> {
     let db = DuckDBClient::new(config)?;
 
+    // Ensure output directory exists
+    tokio::fs::create_dir_all(&config.reports_output_path).await?;
+
     let s3_path = format!("s3://{}/{}", config.s3_bucket, config.s3_prefix);
+    let date_stamp = Utc::now().format("%Y-%m-%d").to_string();
     let params = ReportParams {
         s3_path: Some(s3_path),
         start_date: Some((Utc::now() - chrono::Days::new(7)).format("%Y-%m-%d").to_string()),
         end_date: Some(Utc::now().format("%Y-%m-%d").to_string()),
     };
 
-    let reports = vec!["daily_summary", "ctr_by_campaign", "top_headlines", "network_comparison"];
+    // Daily reports: CTR summary, top performers, fatigued creatives
+    let reports = vec![
+        ("daily_summary", "Daily event summary"),
+        ("ctr_by_campaign", "CTR summary by campaign"),
+        ("top_headlines", "Top performing headlines"),
+        ("top_images", "Top performing images"),
+        ("creative_fatigue", "Fatigued creatives alert"),
+    ];
 
-    for report_name in reports {
-        info!("Running scheduled report: {}", report_name);
+    for (report_name, description) in reports {
+        info!("Running daily report: {} - {}", report_name, description);
 
-        if let Err(e) = run_report(&db, report_name, "json", None, &params, config) {
-            error!("Report '{}' failed: {}", report_name, e);
+        let base_path = format!("{}/{}_{}", config.reports_output_path, date_stamp, report_name);
+        let json_path = format!("{}.json", base_path);
+        let csv_path = format!("{}.csv", base_path);
+
+        // Generate both JSON and CSV outputs
+        if let Err(e) = run_report(&db, report_name, "json", Some(&json_path), &params, config).await {
+            error!("Report '{}' (JSON) failed: {}", report_name, e);
+        }
+        if let Err(e) = run_report(&db, report_name, "csv", Some(&csv_path), &params, config).await {
+            error!("Report '{}' (CSV) failed: {}", report_name, e);
         }
     }
 
+    info!("Daily reports completed in {}", config.reports_output_path);
     Ok(())
 }

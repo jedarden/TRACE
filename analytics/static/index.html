@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TRACE Analytics - Ad-Hoc Query Interface</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #f5f7fa;
+            color: #333;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            border-radius: 10px;
+            margin-bottom: 30px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        .header h1 { font-size: 28px; margin-bottom: 5px; }
+        .header p { opacity: 0.9; }
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        .tab {
+            padding: 12px 24px;
+            background: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.2s;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        }
+        .tab:hover { background: #f0f0f0; }
+        .tab.active {
+            background: #667eea;
+            color: white;
+        }
+        .panel {
+            display: none;
+            background: white;
+            border-radius: 10px;
+            padding: 25px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        }
+        .panel.active { display: block; }
+        .form-group { margin-bottom: 20px; }
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            color: #555;
+        }
+        .form-control {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 14px;
+            font-family: inherit;
+        }
+        .form-control:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+        textarea.form-control {
+            min-height: 150px;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 13px;
+            resize: vertical;
+        }
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+        .btn-primary:hover { background: #5568d3; }
+        .btn-secondary {
+            background: #e0e0e0;
+            color: #333;
+        }
+        .btn-secondary:hover { background: #d0d0d0; }
+        .btn-success {
+            background: #10b981;
+            color: white;
+        }
+        .btn-success:hover { background: #059669; }
+        .results {
+            margin-top: 30px;
+        }
+        .results-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        .results-header h3 { font-size: 18px; }
+        .table-container {
+            overflow-x: auto;
+            border-radius: 8px;
+            border: 1px solid #e0e0e0;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+        th, td {
+            padding: 12px 15px;
+            text-align: left;
+            border-bottom: 1px solid #f0f0f0;
+        }
+        th {
+            background: #f8f9fa;
+            font-weight: 600;
+            color: #555;
+            white-space: nowrap;
+        }
+        tr:hover { background: #f8f9fa; }
+        .error {
+            background: #fee;
+            color: #c33;
+            padding: 15px;
+            border-radius: 6px;
+            border-left: 4px solid #c33;
+        }
+        .report-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+        }
+        .report-card {
+            background: #f8f9fa;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 20px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .report-card:hover {
+            border-color: #667eea;
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.15);
+        }
+        .report-card h4 {
+            font-size: 15px;
+            margin-bottom: 8px;
+            color: #333;
+        }
+        .report-card p {
+            font-size: 13px;
+            color: #666;
+            line-height: 1.5;
+        }
+        .report-card .category {
+            display: inline-block;
+            background: #e0e7ff;
+            color: #4338ca;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 500;
+            margin-top: 10px;
+        }
+        .loading {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid #fff;
+            border-radius: 50%;
+            border-top-color: transparent;
+            animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .row { display: flex; gap: 15px; }
+        .col { flex: 1; }
+        .query-examples {
+            margin-top: 15px;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 6px;
+        }
+        .query-examples h4 {
+            font-size: 13px;
+            margin-bottom: 10px;
+            color: #555;
+        }
+        .example-link {
+            display: block;
+            padding: 8px 12px;
+            background: white;
+            border-radius: 4px;
+            margin-bottom: 6px;
+            font-size: 12px;
+            color: #667eea;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .example-link:hover {
+            background: #f0f0f0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>TRACE Analytics</h1>
+            <p>Ad-hoc DuckDB query interface against Parquet store</p>
+        </div>
+
+        <div class="tabs">
+            <button class="tab active" onclick="showPanel('query')">SQL Query</button>
+            <button class="tab" onclick="showPanel('reports')">Reports</button>
+        </div>
+
+        <div id="query-panel" class="panel active">
+            <div class="form-group">
+                <label for="sql-input">SQL Query</label>
+                <textarea id="sql-input" class="form-control" placeholder="SELECT * FROM parquet_events WHERE type = 'pageview' LIMIT 100"></textarea>
+            </div>
+            <button class="btn btn-primary" onclick="executeQuery()">
+                <span id="query-btn-text">Execute Query</span>
+            </button>
+
+            <div class="query-examples">
+                <h4>Example Queries</h4>
+                <div class="example-link" onclick="setQuery('SELECT * FROM parquet_events WHERE type = \'pageview\' ORDER BY ts DESC LIMIT 100')">
+                    Latest 100 pageviews
+                </div>
+                <div class="example-link" onclick="setQuery('SELECT COUNT(*) as total, type FROM parquet_events GROUP BY type')">
+                    Event counts by type
+                </div>
+                <div class="example-link" onclick="setQuery('SELECT params->>\'utm_source\' as source, COUNT(*) as events FROM parquet_events WHERE params->>\'utm_source\' IS NOT NULL GROUP BY source ORDER BY events DESC LIMIT 10')">
+                    Top traffic sources
+                </div>
+            </div>
+
+            <div id="query-results" class="results"></div>
+        </div>
+
+        <div id="reports-panel" class="panel">
+            <div class="form-group">
+                <label>Run Predefined Report</label>
+                <div class="row">
+                    <div class="col">
+                        <select id="report-select" class="form-control" onchange="selectReport()">
+                            <option value="">-- Select a report --</option>
+                        </select>
+                    </div>
+                    <div class="col">
+                        <select id="report-format" class="form-control">
+                            <option value="json">JSON</option>
+                            <option value="csv">CSV</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+            <div class="row">
+                <div class="col">
+                    <div class="form-group">
+                        <label>Start Date</label>
+                        <input type="date" id="report-start" class="form-control">
+                    </div>
+                </div>
+                <div class="col">
+                    <div class="form-group">
+                        <label>End Date</label>
+                        <input type="date" id="report-end" class="form-control">
+                    </div>
+                </div>
+            </div>
+            <button class="btn btn-success" onclick="runReport()">Run Report</button>
+
+            <div id="report-results" class="results"></div>
+        </div>
+    </div>
+
+    <script>
+        function showPanel(panel) {
+            document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.getElementById(panel + '-panel').classList.add('active');
+            event.target.classList.add('active');
+            if (panel === 'reports') loadReports();
+        }
+
+        function setQuery(sql) {
+            document.getElementById('sql-input').value = sql;
+        }
+
+        async function executeQuery() {
+            const sql = document.getElementById('sql-input').value;
+            if (!sql.trim()) return;
+
+            const btnText = document.getElementById('query-btn-text');
+            const originalText = btnText.innerHTML;
+            btnText.innerHTML = '<span class="loading"></span> Executing...';
+
+            try {
+                const response = await fetch('/api/query?sql=' + encodeURIComponent(sql));
+                const data = await response.json();
+
+                const resultsDiv = document.getElementById('query-results');
+                if (data.error) {
+                    resultsDiv.innerHTML = '<div class="error">' + data.error + '</div>';
+                } else {
+                    renderTable(resultsDiv, data.columns, data.rows);
+                }
+            } catch (e) {
+                document.getElementById('query-results').innerHTML = '<div class="error">Request failed: ' + e.message + '</div>';
+            } finally {
+                btnText.innerHTML = originalText;
+            }
+        }
+
+        async function loadReports() {
+            try {
+                const response = await fetch('/api/reports');
+                const data = await response.json();
+
+                const select = document.getElementById('report-select');
+                select.innerHTML = '<option value="">-- Select a report --</option>';
+                data.reports.forEach(r => {
+                    const opt = document.createElement('option');
+                    opt.value = r.name;
+                    opt.textContent = r.name + ' - ' + r.description;
+                    select.appendChild(opt);
+                });
+            } catch (e) {
+                console.error('Failed to load reports:', e);
+            }
+        }
+
+        function selectReport() {
+            const reportName = document.getElementById('report-select').value;
+            if (!reportName) return;
+
+            // Set default dates (last 7 days)
+            const end = new Date();
+            const start = new Date(end.getTime() - 7 * 24 * 60 * 60 * 1000);
+            document.getElementById('report-end').value = end.toISOString().split('T')[0];
+            document.getElementById('report-start').value = start.toISOString().split('T')[0];
+        }
+
+        async function runReport() {
+            const name = document.getElementById('report-select').value;
+            const format = document.getElementById('report-format').value;
+            const startDate = document.getElementById('report-start').value;
+            const endDate = document.getElementById('report-end').value;
+
+            if (!name) {
+                alert('Please select a report');
+                return;
+            }
+
+            let url = '/api/reports/run?name=' + encodeURIComponent(name);
+            if (format) url += '&format=' + format;
+            if (startDate) url += '&start_date=' + startDate;
+            if (endDate) url += '&end_date=' + endDate;
+
+            const resultsDiv = document.getElementById('report-results');
+            resultsDiv.innerHTML = '<p style="color: #666;">Running report...</p>';
+
+            try {
+                const response = await fetch(url);
+                if (format === 'csv') {
+                    const text = await response.text();
+                    resultsDiv.innerHTML = '<pre style="background: #f5f5f5; padding: 15px; border-radius: 6px; overflow-x: auto;">' + escapeHtml(text) + '</pre>';
+                } else {
+                    const data = await response.json();
+                    if (data.error) {
+                        resultsDiv.innerHTML = '<div class="error">' + data.error + '</div>';
+                    } else if (data.columns && data.rows) {
+                        renderTable(resultsDiv, data.columns, data.rows);
+                    } else {
+                        resultsDiv.innerHTML = '<pre style="background: #f5f5f5; padding: 15px; border-radius: 6px; overflow-x: auto;">' + escapeHtml(JSON.stringify(data, null, 2)) + '</pre>';
+                    }
+                }
+            } catch (e) {
+                resultsDiv.innerHTML = '<div class="error">Request failed: ' + e.message + '</div>';
+            }
+        }
+
+        function renderTable(container, columns, rows) {
+            if (!rows || rows.length === 0) {
+                container.innerHTML = '<p style="color: #666; padding: 20px; text-align: center;">No results</p>';
+                return;
+            }
+
+            let html = '<div class="results-header"><h3>Results (' + rows.length + ' rows)</h3></div>';
+            html += '<div class="table-container"><table><thead><tr>';
+            columns.forEach(col => {
+                html += '<th>' + escapeHtml(col) + '</th>';
+            });
+            html += '</tr></thead><tbody>';
+
+            rows.forEach(row => {
+                html += '<tr>';
+                row.forEach(cell => {
+                    html += '<td>' + escapeHtml(String(cell)) + '</td>';
+                });
+                html += '</tr>';
+            });
+
+            html += '</tbody></table></div>';
+            container.innerHTML = html;
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Set default dates on page load
+        window.addEventListener('DOMContentLoaded', () => {
+            const end = new Date();
+            const start = new Date(end.getTime() - 7 * 24 * 60 * 60 * 1000);
+            document.getElementById('report-end').value = end.toISOString().split('T')[0];
+            document.getElementById('report-start').value = start.toISOString().split('T')[0];
+        });
+    </script>
+</body>
+</html>

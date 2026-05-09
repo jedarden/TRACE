@@ -17,10 +17,7 @@ spec:
             imagePullPolicy: IfNotPresent
             command:
               - trace-analytics
-              - run
-              - daily_summary
-              - --format
-              - json
+              - daily
             env:
             - name: TRACE_S3_BUCKET
               valueFrom:
@@ -37,6 +34,8 @@ spec:
                 configMapKeyRef:
                   name: trace-config
                   key: s3-prefix
+            - name: TRACE_REPORTS_OUTPUT_PATH
+              value: "/data/reports"
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
@@ -61,6 +60,9 @@ spec:
                   optional: true
             - name: RUST_LOG
               value: "info"
+            volumeMounts:
+            - name: reports
+              mountPath: /data/reports
             resources:
               requests:
                 memory: "512Mi"
@@ -68,4 +70,110 @@ spec:
               limits:
                 memory: "2Gi"
                 cpu: "1000m"
+          volumes:
+          - name: reports
+            emptyDir: {}
           restartPolicy: OnFailure
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trace-analytics-ui
+  namespace: trace
+spec:
+  selector:
+    app: trace-analytics-ui
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: http
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trace-analytics-ui
+  namespace: trace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trace-analytics-ui
+  template:
+    metadata:
+      labels:
+        app: trace-analytics-ui
+    spec:
+      containers:
+      - name: analytics
+        image: trace-analytics:latest
+        imagePullPolicy: IfNotPresent
+        command:
+          - trace-analytics
+          - serve
+          - --port
+          - "8080"
+          - --host
+          - "0.0.0.0"
+        env:
+        - name: TRACE_S3_BUCKET
+          valueFrom:
+            configMapKeyRef:
+              name: trace-config
+              key: s3-bucket
+        - name: TRACE_S3_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: trace-config
+              key: s3-region
+        - name: TRACE_S3_PREFIX
+          valueFrom:
+            configMapKeyRef:
+              name: trace-config
+              key: s3-prefix
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: access-key-id
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: secret-access-key
+        - name: ICEBERG_CATALOG_URI
+          valueFrom:
+            configMapKeyRef:
+              name: trace-config
+              key: iceberg-catalog-uri
+              optional: true
+        - name: ICEBERG_WAREHOUSE
+          valueFrom:
+            configMapKeyRef:
+              name: trace-config
+              key: iceberg-warehouse
+              optional: true
+        - name: RUST_LOG
+          value: "info"
+        ports:
+        - containerPort: 8080
+          name: http
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10

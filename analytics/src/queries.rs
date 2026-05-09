@@ -30,6 +30,8 @@ pub enum ReportCategory {
     Journey,
     #[serde(rename = "alert")]
     Alert,
+    #[serde(rename = "daily")]
+    Daily,
 }
 
 pub fn list_reports() -> Vec<Report> {
@@ -37,7 +39,7 @@ pub fn list_reports() -> Vec<Report> {
         Report {
             name: "daily_summary".to_string(),
             description: "Daily event summary by type and source".to_string(),
-            category: ReportCategory::Metrics,
+            category: ReportCategory::Daily,
             sql_template: include_str!("../queries/daily_summary.sql").to_string(),
             default_params: HashMap::new(),
             supports_iceberg: true,
@@ -45,7 +47,7 @@ pub fn list_reports() -> Vec<Report> {
         Report {
             name: "ctr_by_campaign".to_string(),
             description: "Click-through rate by campaign".to_string(),
-            category: ReportCategory::Campaign,
+            category: ReportCategory::Daily,
             sql_template: include_str!("../queries/ctr_by_campaign.sql").to_string(),
             default_params: HashMap::new(),
             supports_iceberg: true,
@@ -61,7 +63,7 @@ pub fn list_reports() -> Vec<Report> {
         Report {
             name: "top_headlines".to_string(),
             description: "Top performing headlines".to_string(),
-            category: ReportCategory::Asset,
+            category: ReportCategory::Daily,
             sql_template: include_str!("../queries/top_headlines.sql").to_string(),
             default_params: HashMap::new(),
             supports_iceberg: true,
@@ -69,7 +71,7 @@ pub fn list_reports() -> Vec<Report> {
         Report {
             name: "top_images".to_string(),
             description: "Top performing images".to_string(),
-            category: ReportCategory::Asset,
+            category: ReportCategory::Daily,
             sql_template: include_str!("../queries/top_images.sql").to_string(),
             default_params: HashMap::new(),
             supports_iceberg: true,
@@ -259,6 +261,14 @@ pub fn get_report(name: &str) -> Option<Report> {
         .find(|r| r.name == name)
 }
 
+/// Get reports configured for daily scheduled execution
+pub fn get_daily_reports() -> Vec<Report> {
+    list_reports()
+        .into_iter()
+        .filter(|r| matches!(r.category, ReportCategory::Daily))
+        .collect()
+}
+
 /// Render template with Iceberg/Parquet-aware SQL substitution
 /// This version uses DuckDBClient to determine the correct table references
 pub fn render_template_with_client(
@@ -322,11 +332,21 @@ pub fn render_template(template: &str, params: &ReportParams) -> String {
     sql
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ReportParams {
     pub s3_path: Option<String>,
     pub start_date: Option<String>,
     pub end_date: Option<String>,
+}
+
+impl Default for ReportParams {
+    fn default() -> Self {
+        Self {
+            s3_path: None,
+            start_date: None,
+            end_date: None,
+        }
+    }
 }
 
 #[cfg(test)]
