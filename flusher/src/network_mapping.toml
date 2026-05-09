@@ -1,0 +1,116 @@
+# TRACE Network Normalization Mapping Configuration
+# This file defines how network-specific URL parameters map to canonical field names.
+#
+# Canonical field names:
+# - campaign_id: Campaign identifier
+# - ad_id: Ad/Advertisement identifier
+# - creative_id: Creative asset identifier (image, video, etc.)
+# - publisher_id: Publisher/site identifier
+# - placement_id: Placement position identifier
+# - headline: Headline/title text
+# - image_id: Image/thumbnail identifier
+
+[networks]
+# Network detection patterns (checked in order)
+# Each network can be detected by utm_source value or parameter prefix
+
+taboola.name = "taboola"
+taboola.utm_source_values = ["taboola", "tb"]
+taboola.param_prefix = "tb_"
+
+outbrain.name = "outbrain"
+outbrain.utm_source_values = ["outbrain", "ob"]
+outbrain.param_prefix = "ob_"
+
+mgid.name = "mgid"
+mgid.utm_source_values = ["mgid"]
+mgid.param_prefix = "mg_"
+
+revcontent.name = "revcontent"
+revcontent.utm_source_values = ["revcontent", "rc"]
+revcontent.param_prefix = "rc_"
+
+googleads.name = "googleads"
+googleads.utm_source_values = ["google", "googleads", "google-ads"]
+googleads.click_identifiers = ["gclid", "gclsrc"]
+
+meta.name = "meta"
+meta.utm_source_values = ["facebook", "instagram", "meta"]
+meta.click_identifiers = ["fbclid", "igshid"]
+
+# Default/generic network for unknown sources
+generic.name = "unknown"
+
+# Parameter mapping for each network
+# Maps network-specific parameter names to canonical field names
+
+[networks.taboola.mapping]
+campaign_id = ["utm_campaign"]
+ad_id = ["tb_item"]
+creative_id = ["tb_image"]
+publisher_id = ["tb_publisher", "tb_site"]
+placement_id = ["tb_placement"]
+headline = ["tb_headline"]
+image_id = ["tb_image"]
+item_id = ["tb_item"]
+
+[networks.outbrain.mapping]
+campaign_id = ["utm_campaign"]
+ad_id = ["ob_item"]
+creative_id = ["ob_creative"]
+publisher_id = ["ob_publisher", "ob_site"]
+placement_id = ["ob_placement"]
+headline = [] # Outbrain doesn't pass headline in URL
+image_id = ["ob_creative"]
+item_id = ["ob_item"]
+
+[networks.mgid.mapping]
+campaign_id = ["utm_campaign"]
+ad_id = ["mg_id"]
+creative_id = ["mg_id"]
+publisher_id = ["mg_site", "mg_publisher"]
+placement_id = ["mg_placement"]
+headline = ["mg_title"]
+image_id = ["mg_image"]
+item_id = ["mg_id"]
+
+[networks.revcontent.mapping]
+campaign_id = ["utm_campaign"]
+ad_id = ["rc_id"]
+creative_id = ["rc_id"]
+publisher_id = ["rc_site", "rc_publisher"]
+placement_id = ["rc_placement"]
+headline = ["rc_title"]
+image_id = ["rc_thumb"]
+item_id = ["rc_id"]
+
+[networks.googleads.mapping]
+campaign_id = ["utm_campaign", "campaignid", "campaign_id"]
+ad_id = ["adgroupid", "adgroup_id", "feeditemid", "feed_item_id"]
+creative_id = ["adgroupid", "adgroup_id", "feeditemid", "feed_item_id", "utm_content"]
+publisher_id = ["siteid", "site_id"]
+placement_id = ["targetid", "target_id", "placement"]
+headline = ["headline", "keyword", "placement", "utm_term", "target"]
+image_id = ["imageid", "image_id", "creative"]
+item_id = ["feeditemid", "feed_item_id", "adgroupid", "adgroup_id"]
+
+[networks.meta.mapping]
+campaign_id = ["utm_campaign", "campaignid", "campaign_id"]
+ad_id = ["ad_id", "adid"]
+creative_id = ["ad_id", "adid", "adset_id", "adsetid", "utm_content"]
+publisher_id = ["siteid", "site_id"]
+placement_id = ["placementid", "placement_id"]
+headline = ["headline", "ad_name", "adname", "utm_term"]
+image_id = ["imageid", "image_id", "creative"]
+item_id = ["ad_id", "adid", "adset_id", "adsetid"]
+
+# Generic fallback mapping (applied when network is unknown)
+[networks.generic.mapping]
+campaign_id = ["utm_campaign"]
+ad_id = ["ad_id", "adid", "item"]
+creative_id = ["creative", "creative_id", "asset"]
+publisher_id = ["publisher", "pub", "site"]
+placement_id = ["placement", "position"]
+headline = ["headline", "title", "head"]
+image_id = ["image", "img", "thumb", "thumbnail"]
+item_id = ["item", "asset"]
