@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trace-combined
+  namespace: trace
+  labels:
+    app: trace-combined
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trace-combined
+  template:
+    metadata:
+      labels:
+        app: trace-combined
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/health"
+    spec:
+      containers:
+        - name: trace-combined
+          image: ghcr.io/jedarden/trace-combined:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: TRACE_LOG_DIR
+              value: /data/logs
+            - name: TRACE_DLQ_DIR
+              value: /data/dlq
+            - name: TRACE_S3_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: trace-s3-credentials
+                  key: bucket
+            - name: TRACE_S3_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: trace-s3-credentials
+                  key: region
+            - name: TRACE_S3_PREFIX
+              value: trace-events
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: trace-s3-credentials
+                  key: access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: trace-s3-credentials
+                  key: secret-access-key
+            - name: RUST_LOG
+              value: info
+          volumeMounts:
+            - name: logs
+              mountPath: /data/logs
+            - name: dlq
+              mountPath: /data/dlq
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 700m
+              memory: 768Mi
+            limits:
+              cpu: 1500m
+              memory: 1536Mi
+      volumes:
+        - name: logs
+          persistentVolumeClaim:
+            claimName: trace-logs
+        - name: dlq
+          persistentVolumeClaim:
+            claimName: trace-dlq

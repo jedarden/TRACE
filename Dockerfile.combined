@@ -1,0 +1,43 @@
+# Multi-stage build for TRACE combined (collector + flusher)
+FROM rust:1.83-alpine AS builder
+
+RUN apk add --no-cache musl-dev
+
+WORKDIR /build
+
+# Build collector
+COPY collector/ ./collector/
+RUN cd collector && cargo build --release
+
+# Build flusher
+COPY flusher/ ./flusher/
+RUN cd flusher && cargo build --release
+
+# Runtime image
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates bash
+
+# Create directories
+RUN mkdir -p /data/logs /data/dlq /app
+
+WORKDIR /app
+
+# Copy binaries from builder
+COPY --from=builder /build/collector/target/release/trace-collector /app/trace-collector
+COPY --from=builder /build/flusher/target/release/trace-flusher /app/trace-flusher
+
+# Copy entrypoint script
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
+
+# Expose collector port
+EXPOSE 8080
+
+# Set environment defaults
+ENV TRACE_LOG_DIR=/data/logs
+ENV TRACE_DLQ_DIR=/data/dlq
+ENV TRACE_S3_REGION=us-east-1
+ENV TRACE_S3_PREFIX=trace-events
+
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
