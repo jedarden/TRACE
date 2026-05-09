@@ -44,6 +44,8 @@ struct QueryResponse {
     columns: Vec<String>,
     rows: Vec<Vec<String>>,
     error: Option<String>,
+    csv: Option<String>,
+    json: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -97,6 +99,8 @@ async fn execute_query(
                     columns: vec![],
                     rows: vec![],
                     error: Some(format!("Database connection failed: {}", e)),
+                    csv: None,
+                    json: None,
                 });
             }
         }
@@ -105,15 +109,23 @@ async fn execute_query(
     let db = db_guard.as_ref().unwrap();
 
     match db.execute_query(&params.sql) {
-        Ok(result) => Json(QueryResponse {
-            columns: result.columns,
-            rows: result.rows,
-            error: None,
-        }),
+        Ok(result) => {
+            let csv = result.to_csv();
+            let json = result.to_json();
+            Json(QueryResponse {
+                columns: result.columns,
+                rows: result.rows,
+                error: None,
+                csv: Some(csv),
+                json: Some(json),
+            })
+        },
         Err(e) => Json(QueryResponse {
             columns: vec![],
             rows: vec![],
             error: Some(format!("Query failed: {}", e)),
+            csv: None,
+            json: None,
         }),
     }
 }
@@ -149,6 +161,8 @@ async fn run_report_api(
                         columns: vec![],
                         rows: vec![],
                         error: Some(format!("Database connection failed: {}", e)),
+                        csv: None,
+                        json: None,
                     }),
                 );
             }
@@ -166,6 +180,8 @@ async fn run_report_api(
                     columns: vec![],
                     rows: vec![],
                     error: Some(format!("Report '{}' not found", params.name)),
+                    csv: None,
+                    json: None,
                 }),
             );
         }
@@ -181,12 +197,16 @@ async fn run_report_api(
 
     match db.execute_query(&sql) {
         Ok(result) => {
-            let format = if params.format == "csv" { "csv" } else { "json" };
-            let output_data = match format {
-                "csv" => result.to_csv(),
-                _ => result.to_json(),
+            let csv = result.to_csv();
+            let json = result.to_json();
+            let response = QueryResponse {
+                columns: result.columns,
+                rows: result.rows,
+                error: None,
+                csv: Some(csv),
+                json: Some(json),
             };
-            (StatusCode::OK, output_data)
+            (StatusCode::OK, Json(response))
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -194,6 +214,8 @@ async fn run_report_api(
                 columns: vec![],
                 rows: vec![],
                 error: Some(format!("Report execution failed: {}", e)),
+                csv: None,
+                json: None,
             }),
         ),
     }

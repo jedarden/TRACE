@@ -111,7 +111,7 @@ pub fn list_reports() -> Vec<Report> {
         Report {
             name: "creative_fatigue".to_string(),
             description: "Detect declining creative performance".to_string(),
-            category: ReportCategory::Asset,
+            category: ReportCategory::Daily,
             sql_template: include_str!("../queries/creative_fatigue.sql").to_string(),
             default_params: HashMap::new(),
             supports_iceberg: true,
