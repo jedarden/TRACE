@@ -9,6 +9,8 @@
 //! - No parsing at collection time
 //! - Must handle 100 rps on single core
 
+mod log_writer;
+
 use axum::{
     body::Body,
     extract::State,
@@ -17,8 +19,6 @@ use axum::{
 };
 use chrono::Utc;
 use serde::Serialize;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal;
@@ -64,20 +64,8 @@ struct RawHeaders {
 /// Shared state for log file rotation
 #[derive(Clone)]
 struct CollectorState {
-    /// Base directory for log files
-    log_dir: PathBuf,
-    /// Current hour bucket for rotation
-    current_hour: Arc<Mutex<String>>,
-}
-
-/// Get the current hour key for file rotation (UTC)
-fn current_hour_key() -> String {
-    Utc::now().format("%Y%m%d-%H").to_string()
-}
-
-/// Get log file path for the current hour
-fn log_file_path(log_dir: &PathBuf, hour_key: &str) -> PathBuf {
-    log_dir.join(format!("raw-{}.jsonl", hour_key))
+    /// Log file writer with buffered writes
+    log_writer: Arc<Mutex<log_writer::LogFileWriter>>,
 }
 
 /// Extract client IP from headers
@@ -101,28 +89,11 @@ fn extract_headers(headers: &HeaderMap) -> RawHeaders {
     }
 }
 
-/// Write raw request to log file (append mode, creating if needed)
-fn write_raw_request(log_dir: &PathBuf, raw: &RawRequest) -> std::io::Result<()> {
-    let hour_key = current_hour_key();
-    let path = log_file_path(log_dir, &hour_key);
-
-    // Create parent directory if it doesn't exist
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Open file in append mode, create if it doesn't exist
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-
-    // Serialize to JSON and write as a single line
-    let json_line = serde_json::to_string(raw)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-
-    writeln!(file, "{}", json_line)?;
-
+/// Write raw request to log file using the buffered writer
+async fn write_raw_request(state: &CollectorState, raw: &RawRequest) -> anyhow::Result<()> {
+    let json_line = serde_json::to_string(raw)?;
+    let mut writer = state.log_writer.lock().await;
+    writer.write_line(&json_line)?;
     Ok(())
 }
 
@@ -165,7 +136,7 @@ async fn collect_get(
         client_ip: extract_client_ip(&headers),
     };
 
-    if let Err(e) = write_raw_request(&state.log_dir, &raw) {
+    if let Err(e) = write_raw_request(&state, &raw).await {
         error!("Failed to write request: {}", e);
     }
 
@@ -190,7 +161,7 @@ async fn collect_post(
         client_ip: extract_client_ip(&headers),
     };
 
-    if let Err(e) = write_raw_request(&state.log_dir, &raw) {
+    if let Err(e) = write_raw_request(&state, &raw).await {
         error!("Failed to write request: {}", e);
     }
 
@@ -202,8 +173,8 @@ async fn health() -> &'static str {
     "OK"
 }
 
-/// Shutdown signal handler
-async fn shutdown_signal() {
+/// Shutdown signal handler with graceful log file shutdown
+async fn shutdown_signal(state: CollectorState) {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
@@ -226,7 +197,13 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
 
-    info!("Shutdown signal received");
+    info!("Shutdown signal received, flushing and closing log files...");
+
+    // Prepare for shutdown by flushing buffer, closing file, and signaling Flusher
+    let mut writer = state.log_writer.lock().await;
+    if let Err(e) = writer.prepare_shutdown() {
+        error!("Failed to prepare log writer shutdown: {}", e);
+    }
 }
 
 #[tokio::main]
@@ -246,9 +223,12 @@ async fn main() -> anyhow::Result<()> {
     // Create log directory if it doesn't exist
     tokio::fs::create_dir_all(&log_dir).await?;
 
+    // Initialize log file writer with buffered writes
+    let log_writer = log_writer::LogFileWriter::new(log_dir.clone())
+        .map_err(|e| anyhow::anyhow!("Failed to initialize log writer: {}", e))?;
+
     let state = CollectorState {
-        log_dir,
-        current_hour: Arc::new(Mutex::new(current_hour_key())),
+        log_writer: Arc::new(Mutex::new(log_writer)),
     };
 
     // Start rotation checker (runs every minute)
@@ -257,11 +237,16 @@ async fn main() -> anyhow::Result<()> {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
-            let mut current = rotation_state.current_hour.lock().await;
-            let new_hour = current_hour_key();
-            if *current != new_hour {
-                *current = new_hour;
-                info!("Log rotation: new hour bucket {}", new_hour);
+            let mut writer = rotation_state.log_writer.lock().await;
+            match writer.check_rotation() {
+                Ok(rotated) => {
+                    if rotated {
+                        info!("Log rotation completed successfully");
+                    }
+                }
+                Err(e) => {
+                    error!("Log rotation failed: {}", e);
+                }
             }
         }
     });
@@ -278,7 +263,7 @@ async fn main() -> anyhow::Result<()> {
     info!("TRACE collector listening on {}", listener.local_addr()?);
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(state))
         .await?;
 
     info!("TRACE collector shutdown complete");
