@@ -51,7 +51,7 @@ build_online() {
 /*!
  * TRACE - Traffic Recording, Attribution, and Campaign Events
  * Client-side tracking library
- * @version 1.0.0
+ * @version 1.2.0
  * @license MIT
  */
 EOF
