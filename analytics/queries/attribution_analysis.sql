@@ -10,7 +10,7 @@ WITH user_touchpoints AS (
         FIRST_VALUE(url) OVER (PARTITION BY user_id, session_id ORDER BY ts) AS url,
         FIRST_VALUE(type) OVER (PARTITION BY user_id, session_id ORDER BY ts) AS event_type,
         MIN(ts) OVER (PARTITION BY user_id, session_id ORDER BY ts) AS session_ts
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
         AND user_id IS NOT NULL
@@ -21,7 +21,7 @@ conversions AS (
         session_id,
         MIN(ts) AS conversion_ts,
         type AS conversion_type
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
         AND (type = 'conversion' OR type = 'purchase' OR type = 'signup')

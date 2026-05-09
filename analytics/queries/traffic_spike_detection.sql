@@ -13,7 +13,7 @@ WITH hourly_baseline AS (
             ORDER BY DATE_TRUNC('day', ts)
             ROWS BETWEEN 7 PRECEDING AND 1 PRECEDING
         ) AS baseline_stddev
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM {{events_table}}
     WHERE ts >= CURRENT_DATE - INTERVAL '14 days'
     GROUP BY 1
 )

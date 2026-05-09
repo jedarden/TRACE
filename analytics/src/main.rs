@@ -86,7 +86,7 @@ async fn main() -> Result<()> {
                 end_date,
             };
 
-            if let Err(e) = reporter::run_report(&db, &name, &format, output.as_deref(), &params) {
+            if let Err(e) = reporter::run_report(&db, &name, &format, output.as_deref(), &params, &config) {
                 error!("Report execution failed: {}", e);
                 std::process::exit(1);
             }

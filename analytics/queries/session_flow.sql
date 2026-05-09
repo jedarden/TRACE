@@ -7,7 +7,7 @@ WITH session_events AS (
         ts,
         LAG(type) OVER (PARTITION BY session_id ORDER BY ts) AS prev_type,
         LAG(url) OVER (PARTITION BY session_id ORDER BY ts) AS prev_url
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
         AND session_id IS NOT NULL

@@ -5,7 +5,7 @@ WITH creative_daily AS (
         params->>'tb_headline' AS headline,
         COUNT(*) FILTER (WHERE type = 'click') AS clicks,
         COUNT(*) FILTER (WHERE type = 'pageview') AS views
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM {{events_table}}
     WHERE ts >= CURRENT_DATE - INTERVAL '30 days'
         AND params->>'tb_headline' IS NOT NULL
     GROUP BY 1, 2

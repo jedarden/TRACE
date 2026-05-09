@@ -15,7 +15,7 @@ WITH funnel_steps AS (
             WHEN url LIKE '%/thank-you%' OR type = 'conversion' THEN 4
             ELSE 0
         END AS funnel_step
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
         AND user_id IS NOT NULL

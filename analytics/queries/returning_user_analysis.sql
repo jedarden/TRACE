@@ -9,7 +9,7 @@ WITH user_sessions_summary AS (
         COUNT(*) AS total_events,
         COUNT(DISTINCT url) AS total_unique_pages,
         COUNT(DISTINCT DATE_TRUNC('day', ts)) AS active_days
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
         AND user_id IS NOT NULL

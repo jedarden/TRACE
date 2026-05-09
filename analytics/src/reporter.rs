@@ -4,7 +4,7 @@ use tracing::{error, info};
 
 use crate::config::Config;
 use crate::duckdb::DuckDBClient;
-use crate::queries::{get_report, render_template, ReportParams};
+use crate::queries::{get_report, render_template, render_template_with_client, ReportParams};
 
 pub async fn run_report(
     db: &DuckDBClient,
@@ -12,13 +12,26 @@ pub async fn run_report(
     format: &str,
     output: Option<&str>,
     params: &ReportParams,
+    config: &Config,
 ) -> Result<()> {
     let report = get_report(name)
         .ok_or_else(|| anyhow::anyhow!("Report '{}' not found", name))?;
 
     info!("Running report: {}", name);
+    if config.is_iceberg_enabled() {
+        info!("Using Iceberg table backend");
+    } else {
+        info!("Using Parquet file backend");
+    }
 
-    let sql = render_template(&report.sql_template, params);
+    // Use Iceberg-aware rendering if configured
+    let sql = if config.is_iceberg_enabled() && report.supports_iceberg {
+        render_template_with_client(&report.sql_template, params, db, config)
+    } else {
+        // Fall back to legacy rendering for Parquet or unsupported reports
+        render_template(&report.sql_template, params)
+    };
+
     let result = db.execute_query(&sql)?;
 
     let output_data = match format {
@@ -99,7 +112,7 @@ async fn run_daily_reports(config: &Config) -> Result<()> {
     for report_name in reports {
         info!("Running scheduled report: {}", report_name);
 
-        if let Err(e) = run_report(&db, report_name, "json", None, &params) {
+        if let Err(e) = run_report(&db, report_name, "json", None, &params, config) {
             error!("Report '{}' failed: {}", report_name, e);
         }
     }

@@ -6,7 +6,7 @@ WITH session_paths AS (
         ARRAY_AGG(url ORDER BY ts) AS path,
         COUNT(*) AS steps,
         MIN(ts) AS session_start
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
         AND session_id IS NOT NULL

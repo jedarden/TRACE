@@ -5,7 +5,7 @@ WITH session_conversions AS (
         session_id,
         COUNT(*) FILTER (WHERE type = 'conversion') AS conversions,
         COALESCE(SUM((params->>'revenue')::DECIMAL) FILTER (WHERE type = 'conversion'), 0) AS revenue
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
         AND session_id IS NOT NULL
@@ -26,7 +26,7 @@ session_touchpoints AS (
         sc.conversions AS total_conversions,
         sc.revenue AS total_revenue,
         COUNT(*) OVER (PARTITION BY e.session_id) AS touchpoint_count
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet') e
+    FROM {{events_table}} e
     INNER JOIN session_conversions sc ON e.session_id = sc.session_id
     WHERE e.ts >= '{{start_date}}'::TIMESTAMP
         AND e.ts < '{{end_date}}'::TIMESTAMP

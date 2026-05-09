@@ -7,7 +7,7 @@ WITH page_transitions AS (
         LEAD(url) OVER (PARTITION BY session_id ORDER BY ts) AS next_url,
         type,
         LEAD(type) OVER (PARTITION BY session_id ORDER BY ts) AS next_type
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
         AND session_id IS NOT NULL

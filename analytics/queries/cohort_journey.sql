@@ -5,7 +5,7 @@ WITH user_cohorts AS (
         user_id,
         FIRST_VALUE(network) OVER (PARTITION BY user_id ORDER BY ts) AS acquisition_network,
         MIN(ts) OVER (PARTITION BY user_id) AS first_touch_ts
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
         AND user_id IS NOT NULL
@@ -20,7 +20,7 @@ user_sessions AS (
         COUNT(*) AS events,
         COUNT(DISTINCT e.url) AS unique_pages,
         EXTRACT(DAY FROM (MIN(e.ts) - c.first_touch_ts)) AS day_number
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet') e
+    FROM {{events_table}} e
     INNER JOIN user_cohorts c ON e.user_id = c.user_id
     WHERE e.ts >= '{{start_date}}'::TIMESTAMP
         AND e.ts < '{{end_date}}'::TIMESTAMP

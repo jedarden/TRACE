@@ -5,7 +5,7 @@ WITH sessions AS (
         MIN(url) AS landing_url,
         COUNT(*) AS events,
         COUNT(*) FILTER (WHERE type = 'pageview') AS pageviews
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
         AND session_id IS NOT NULL

@@ -7,7 +7,7 @@ WITH session_sequences AS (
         ARRAY_AGG(type ORDER BY ts) AS event_sequence,
         ARRAY_AGG(url ORDER BY ts) AS url_sequence,
         COUNT(*) AS total_events
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
         AND session_id IS NOT NULL

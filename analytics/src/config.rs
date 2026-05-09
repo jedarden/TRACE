@@ -61,3 +61,101 @@ impl Config {
             .map(|w| format!("{}/ad_events", w))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_default_values() {
+        // Create a config with minimal values
+        let config = Config {
+            s3_bucket: "test-bucket".to_string(),
+            s3_region: "us-east-1".to_string(),
+            s3_prefix: "test-events".to_string(),
+            s3_access_key_id: None,
+            s3_secret_access_key: None,
+            s3_endpoint: None,
+            data_path: "/data/analytics".to_string(),
+            reports_output_path: "/data/reports".to_string(),
+            iceberg_catalog_uri: None,
+            iceberg_warehouse: None,
+        };
+
+        assert_eq!(config.s3_bucket, "test-bucket");
+        assert_eq!(config.s3_region, "us-east-1");
+        assert_eq!(config.s3_prefix, "test-events");
+        assert!(!config.is_iceberg_enabled());
+    }
+
+    #[test]
+    fn test_config_is_iceberg_enabled() {
+        let mut config = Config {
+            s3_bucket: "test-bucket".to_string(),
+            s3_region: "us-east-1".to_string(),
+            s3_prefix: "test-events".to_string(),
+            s3_access_key_id: None,
+            s3_secret_access_key: None,
+            s3_endpoint: None,
+            data_path: "/data/analytics".to_string(),
+            reports_output_path: "/data/reports".to_string(),
+            iceberg_catalog_uri: None,
+            iceberg_warehouse: None,
+        };
+
+        // Not enabled when only catalog URI is set
+        config.iceberg_catalog_uri = Some("http://catalog:8181".to_string());
+        assert!(!config.is_iceberg_enabled());
+
+        // Not enabled when only warehouse is set
+        config.iceberg_catalog_uri = None;
+        config.iceberg_warehouse = Some("s3://bucket/iceberg".to_string());
+        assert!(!config.is_iceberg_enabled());
+
+        // Enabled when both are set
+        config.iceberg_catalog_uri = Some("http://catalog:8181".to_string());
+        assert!(config.is_iceberg_enabled());
+    }
+
+    #[test]
+    fn test_config_s3_paths() {
+        let config = Config {
+            s3_bucket: "my-bucket".to_string(),
+            s3_region: "us-west-2".to_string(),
+            s3_prefix: "trace-events".to_string(),
+            s3_access_key_id: None,
+            s3_secret_access_key: None,
+            s3_endpoint: None,
+            data_path: "/data/analytics".to_string(),
+            reports_output_path: "/data/reports".to_string(),
+            iceberg_catalog_uri: None,
+            iceberg_warehouse: None,
+        };
+
+        assert_eq!(config.s3_events_path(), "s3://my-bucket/trace-events/events");
+        assert_eq!(config.s3_compacted_path(), "s3://my-bucket/trace-events/events-compacted");
+    }
+
+    #[test]
+    fn test_config_iceberg_ad_events_path() {
+        let mut config = Config {
+            s3_bucket: "my-bucket".to_string(),
+            s3_region: "us-east-1".to_string(),
+            s3_prefix: "trace-events".to_string(),
+            s3_access_key_id: None,
+            s3_secret_access_key: None,
+            s3_endpoint: None,
+            data_path: "/data/analytics".to_string(),
+            reports_output_path: "/data/reports".to_string(),
+            iceberg_catalog_uri: None,
+            iceberg_warehouse: None,
+        };
+
+        // None when warehouse is not set
+        assert!(config.iceberg_ad_events_path().is_none());
+
+        // Some when warehouse is set
+        config.iceberg_warehouse = Some("s3://my-bucket/iceberg".to_string());
+        assert_eq!(config.iceberg_ad_events_path(), Some("s3://my-bucket/iceberg/ad_events".to_string()));
+    }
+}

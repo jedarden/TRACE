@@ -6,7 +6,7 @@ SELECT
     COUNT(DISTINCT params->>'utm_campaign') AS num_campaigns,
     MIN(ts) AS first_seen,
     MAX(ts) AS last_seen
-FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+FROM {{events_table}}
 WHERE params->>'tb_headline' IS NOT NULL
     AND ts >= '{{start_date}}'::TIMESTAMP
     AND ts < '{{end_date}}'::TIMESTAMP

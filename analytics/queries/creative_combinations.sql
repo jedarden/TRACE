@@ -8,7 +8,7 @@ SELECT
         NULLIF(COUNT(*) FILTER (WHERE type = 'pageview'), 0),
         2
     ) AS ctr
-FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+FROM {{events_table}}
 WHERE params->>'tb_headline' IS NOT NULL
     AND params->>'tb_image' IS NOT NULL
     AND ts >= '{{start_date}}'::TIMESTAMP

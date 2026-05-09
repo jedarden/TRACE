@@ -4,7 +4,7 @@ WITH daily_metrics AS (
         DATE(ts) AS date,
         params->>'utm_campaign' AS campaign,
         COUNT(*) FILTER (WHERE type = 'click') AS clicks
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM {{events_table}}
     WHERE ts >= CURRENT_DATE - INTERVAL '14 days'
     GROUP BY 1, 2
 ),

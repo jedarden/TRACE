@@ -4,7 +4,7 @@ WITH campaign_activity AS (
         params->>'utm_campaign' AS campaign,
         MAX(ts) AS last_event,
         COUNT(*) AS total_events
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM {{events_table}}
     WHERE ts >= CURRENT_DATE - INTERVAL '7 days'
     GROUP BY 1
 )

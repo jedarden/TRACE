@@ -14,7 +14,7 @@ WITH session_touches AS (
         FIRST_VALUE(params->>'creative_id') OVER (PARTITION BY session_id ORDER BY ts) AS first_creative_id,
         COUNT(*) FILTER (WHERE type = 'conversion') AS conversions,
         COALESCE(SUM((params->>'revenue')::DECIMAL) FILTER (WHERE type = 'conversion'), 0) AS revenue
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
         AND session_id IS NOT NULL

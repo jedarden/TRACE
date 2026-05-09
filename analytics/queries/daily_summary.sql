@@ -5,7 +5,7 @@ SELECT
     type,
     COUNT(*) AS events,
     COUNT(DISTINCT session_id) AS unique_sessions
-FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+FROM {{events_table}}
 WHERE ts >= '{{start_date}}'::TIMESTAMP
     AND ts < '{{end_date}}'::TIMESTAMP
 GROUP BY 1, 2, 3

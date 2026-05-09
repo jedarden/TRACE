@@ -6,7 +6,7 @@ WITH user_events AS (
         *,
         LAG(ts) OVER (PARTITION BY user_id ORDER BY ts) AS prev_ts,
         EXTRACT(EPOCH FROM (ts - LAG(ts) OVER (PARTITION BY user_id ORDER BY ts))) / 60 AS gap_minutes
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
         AND user_id IS NOT NULL

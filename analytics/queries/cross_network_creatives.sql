@@ -4,7 +4,7 @@ WITH creative_ids AS (
     SELECT
         params->>'tb_image' AS creative_id,
         'taboola' AS network
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM {{events_table}}
     WHERE params->>'tb_image' IS NOT NULL
         AND ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
@@ -13,7 +13,7 @@ WITH creative_ids AS (
     SELECT
         params->>'ob_creative' AS creative_id,
         'outbrain' AS network
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM {{events_table}}
     WHERE params->>'ob_creative' IS NOT NULL
         AND ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
