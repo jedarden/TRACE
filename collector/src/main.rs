@@ -1,479 +1,182 @@
-mod normalizer;
-mod queue;
-mod validator;
+//! TRACE Collector - Log-First Event Collection
+//!
+//! Accepts raw traffic signals and appends them to rotating log files.
+//! No parsing at collection time - all enrichment happens downstream.
+//!
+//! Design:
+//! - HTTP server accepting raw requests (pageviews, clicks, dwell heartbeats)
+//! - Log-first: append raw requests to rotating log files per hour (UTC)
+//! - No parsing at collection time
+//! - Must handle 100 rps on single core
 
-use anyhow::Result;
 use axum::{
-    extract::{Query, State},
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    Json,
+    extract::State,
+    http::{HeaderMap, StatusCode, Uri},
+    response::IntoResponse,
 };
-use chrono::{DateTime, Utc};
-use flate2::write::GzEncoder;
-use flate2::Compression;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use chrono::Utc;
+use serde::Serialize;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::signal;
+use tokio::sync::Mutex;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-/// Event payload received from clients
-#[derive(Debug, Deserialize, Serialize)]
-struct EventPayload {
-    /// Event type: pageview, click, scroll, dwell
-    #[serde(default = "default_event_type")]
-    r#type: String,
-    /// URL of the page (optional in body, will use query param if missing)
-    url: Option<String>,
-    /// Custom event data
-    #[serde(flatten)]
-    extra: HashMap<String, serde_json::Value>,
-}
-
-fn default_event_type() -> String {
-    "pageview".to_string()
-}
-
-/// Internal event representation with metadata
+/// Raw HTTP request captured as-is
 #[derive(Debug, Serialize)]
-struct Event {
-    /// ISO 8601 timestamp
-    ts: DateTime<Utc>,
-    /// Client IP (optional - may be stripped by proxy/load balancer)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ip: Option<String>,
-    /// User-Agent header
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ua: Option<String>,
-    /// Full URL with query parameters
-    url: String,
-    /// All query parameters as a map
-    params: HashMap<String, String>,
-    /// Event type
-    r#type: String,
-    /// Normalized campaign data (cross-network)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    normalized: Option<normalizer::NormalizedCampaign>,
-    /// Session ID for cross-page tracking
-    #[serde(skip_serializing_if = "Option::is_none")]
-    session_id: Option<String>,
-    /// User ID for cross-session tracking
-    #[serde(skip_serializing_if = "Option::is_none")]
-    user_id: Option<String>,
+struct RawRequest {
+    /// ISO 8601 timestamp when request was received
+    ts: String,
+    /// HTTP method (GET or POST)
+    method: String,
+    /// Full request path including query string
+    path: String,
+    /// Request headers (filtered)
+    headers: RawHeaders,
+    /// Raw query parameters (if GET request)
+    query_params: Option<String>,
+    /// Raw body (if POST request)
+    body: Option<String>,
+    /// Client IP (from X-Forwarded-For or X-Real-IP)
+    client_ip: Option<String>,
 }
 
-/// Shared state for the collector
+/// Headers we capture from the request
+#[derive(Debug, Serialize)]
+struct RawHeaders {
+    user_agent: Option<String>,
+    referer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x_forwarded_for: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x_real_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accept_language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accept_encoding: Option<String>,
+}
+
+/// Shared state for log file rotation
 #[derive(Clone)]
 struct CollectorState {
     /// Base directory for log files
     log_dir: PathBuf,
-    /// Current log file buffer
-    current: Arc<tokio::sync::Mutex<Option<LogFile>>>,
-    /// Queue producer for event buffering
-    queue: Arc<dyn queue::QueueProducer>,
+    /// Current hour bucket for rotation
+    current_hour: Arc<Mutex<String>>,
 }
 
-/// Handle to the current log file with rotation tracking
-struct LogFile {
-    /// Hour bucket this file is for (YYYYMMDD-HH)
-    hour_key: String,
-    /// Buffered writer for the JSONL file
-    writer: BufWriter<File>,
-}
-
-impl LogFile {
-    /// Open a new log file for the given hour
-    fn open(log_dir: &Path, hour_key: &str) -> Result<Self> {
-        let path = log_dir.join(format!("events-{}.jsonl", hour_key));
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-
-        Ok(Self {
-            hour_key: hour_key.to_string(),
-            writer: BufWriter::new(file),
-        })
-    }
-
-    /// Write a single event line
-    fn write_line(&mut self, line: &str) -> Result<()> {
-        use std::io::Write;
-        writeln!(self.writer, "{}", line)?;
-        Ok(())
-    }
-
-    /// Flush and close the file
-    fn flush(mut self) -> Result<()> {
-        use std::io::Write;
-        self.writer.flush()?;
-        Ok(())
-    }
-}
-
-/// Get the current hour key for file rotation
+/// Get the current hour key for file rotation (UTC)
 fn current_hour_key() -> String {
     Utc::now().format("%Y%m%d-%H").to_string()
 }
 
-/// Compress a JSONL file to gzip
-fn compress_file(src_path: &PathBuf) -> Result<PathBuf> {
-    let gz_path = src_path.with_extension("jsonl.gz");
-
-    let src_file = File::open(src_path)?;
-    let file_len = src_file.metadata()?.len();
-    let gz_file = File::create(&gz_path)?;
-    let encoder = GzEncoder::new(gz_file, Compression::default());
-
-    let mut encoder = BufWriter::new(encoder);
-    let src_reader = BufReader::new(src_file);
-    std::io::copy(&mut src_reader.take(file_len), &mut encoder)?;
-    encoder.flush()?;
-
-    // Remove original after successful compression
-    std::fs::remove_file(src_path)?;
-
-    Ok(gz_path)
+/// Get log file path for the current hour
+fn log_file_path(log_dir: &PathBuf, hour_key: &str) -> PathBuf {
+    log_dir.join(format!("raw-{}.jsonl", hour_key))
 }
 
-/// Rotate and compress the previous hour's log file
-async fn rotate_previous_hour(state: &CollectorState) -> Result<()> {
-    let current_key = current_hour_key();
-    let mut current = state.current.lock().await;
-
-    if let Some(log_file) = current.take() {
-        if log_file.hour_key != current_key {
-            // Hour has changed, rotate the old file
-            let hour_key = log_file.hour_key.clone();
-            drop(current); // Release lock before I/O
-
-            info!("Rotating log file for hour: {}", hour_key);
-
-            // Flush the file
-            if let Err(e) = log_file.flush() {
-                error!("Failed to flush log file: {}", e);
-            }
-
-            // Compress the file
-            let old_path = state.log_dir.join(format!("events-{}.jsonl", hour_key));
-            tokio::spawn(async move {
-                if let Err(e) = tokio::task::spawn_blocking(move || {
-                    compress_file(&old_path)
-                }).await {
-                    warn!("Failed to compress log file: {}", e);
-                }
-            });
-        } else {
-            *current = Some(log_file);
-        }
-    }
-
-    Ok(())
-}
-
-/// POST /collect - JSON payload endpoint
-async fn collect_json(
-    State(state): State<CollectorState>,
-    headers: axum::http::HeaderMap,
-    Json(payload): Json<EventPayload>,
-) -> Result<(), CollectError> {
-    let ip = headers
+/// Extract client IP from headers
+fn extract_client_ip(headers: &HeaderMap) -> Option<String> {
+    headers
         .get("x-forwarded-for")
         .or_else(|| headers.get("x-real-ip"))
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
-
-    let ua = headers
-        .get("user-agent")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    let url = payload
-        .url
-        .clone()
-        .or_else(|| {
-            payload.extra.get("url").and_then(|v| {
-                if let serde_json::Value::String(s) = v {
-                    Some(s.clone())
-                } else {
-                    None
-                }
-            })
-        })
-        .unwrap_or_else(|| "unknown".to_string());
-
-    let params = extract_params(&url);
-
-    // Validate and normalize the event payload
-    let validated = match validator::EventValidator::validate(
-        &payload.r#type,
-        Some(&url),
-        &params,
-        &payload.extra,
-    ) {
-        Ok(v) => v,
-        Err(errors) => {
-            // Log validation errors but still process with defaults
-            for e in &errors {
-                warn!("Validation error on field '{}': {}", e.field, e.message);
-            }
-            // Return early for critical errors (invalid event type or URL)
-            if errors.iter().any(|e| e.field == "type" || e.field == "url") {
-                return Err(CollectError::Validation);
-            }
-            // For non-critical errors, continue with sanitized data
-            validator::EventValidator::validate(
-                &payload.r#type,
-                Some(&url),
-                &params,
-                &payload.extra,
-            )
-            .unwrap_or_else(|_| validator::ValidatedEvent {
-                event_type: "pageview".to_string(),
-                url: "unknown".to_string(),
-                params: validator::EventValidator::sanitize_params(&params),
-                session_id: None,
-                user_id: None,
-                extra: payload.extra.clone(),
-            })
-        }
-    };
-
-    // Normalize campaign data if present
-    let normalized = if normalizer::NetworkNormalizer::has_campaign_data(&validated.params) {
-        Some(normalizer::NetworkNormalizer::normalize(&validated.params))
-    } else {
-        None
-    };
-
-    let event = Event {
-        ts: Utc::now(),
-        ip,
-        ua,
-        url: validated.url,
-        params: validated.params,
-        r#type: validated.event_type,
-        normalized,
-        session_id: validated.session_id,
-        user_id: validated.user_id,
-    };
-
-    write_event(&state, &event).await?;
-
-    Ok(())
+        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
 }
 
-/// Extract a string field from payload extra data
-fn extract_string_field(payload: &EventPayload, key: &str) -> Option<String> {
-    payload.extra.get(key).and_then(|v| {
-        if let serde_json::Value::String(s) = v {
-            Some(s.clone())
-        } else {
-            None
-        }
-    })
+/// Extract relevant headers (filtered, not all headers)
+fn extract_headers(headers: &HeaderMap) -> RawHeaders {
+    RawHeaders {
+        user_agent: headers.get("user-agent").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
+        referer: headers.get("referer").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
+        x_forwarded_for: headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
+        x_real_ip: headers.get("x-real-ip").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
+        accept_language: headers.get("accept-language").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
+        accept_encoding: headers.get("accept-encoding").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
+    }
+}
+
+/// Write raw request to log file (append mode, creating if needed)
+fn write_raw_request(log_dir: &PathBuf, raw: &RawRequest) -> std::io::Result<()> {
+    let hour_key = current_hour_key();
+    let path = log_file_path(log_dir, &hour_key);
+
+    // Create parent directory if it doesn't exist
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Open file in append mode, create if it doesn't exist
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+
+    // Serialize to JSON and write as a single line
+    let json_line = serde_json::to_string(raw)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+    writeln!(file, "{}", json_line)?;
+
+    Ok(())
 }
 
 /// GET /collect - Query string endpoint
-async fn collect_query(
+async fn collect_get(
     State(state): State<CollectorState>,
-    Query(params): Query<HashMap<String, String>>,
-    headers: axum::http::HeaderMap,
-) -> Result<(), CollectError> {
-    let ip = headers
-        .get("x-forwarded-for")
-        .or_else(|| headers.get("x-real-ip"))
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
-
-    let ua = headers
-        .get("user-agent")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    let url = params
-        .get("url")
-        .cloned()
-        .or_else(|| {
-            params
-                .iter()
-                .find(|(k, _)| *k == "referrer" || *k == "ref")
-                .map(|(_, v)| v.clone())
-        })
-        .unwrap_or_else(|| "unknown".to_string());
-
-    let event_type = params.get("type").cloned().unwrap_or_else(|| "pageview".to_string());
-
-    // Convert query params to extra format for validation
-    let extra: HashMap<String, serde_json::Value> = params
-        .iter()
-        .filter(|(k, _)| *k != "url" && *k != "type")
-        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-        .collect();
-
-    // Validate and normalize the event payload
-    let validated = match validator::EventValidator::validate(
-        &event_type,
-        Some(&url),
-        &params,
-        &extra,
-    ) {
-        Ok(v) => v,
-        Err(errors) => {
-            // Log validation errors but still process with defaults
-            for e in &errors {
-                warn!("Validation error on field '{}': {}", e.field, e.message);
-            }
-            // Return early for critical errors (invalid event type or URL)
-            if errors.iter().any(|e| e.field == "type" || e.field == "url") {
-                return Err(CollectError::Validation);
-            }
-            // For non-critical errors, continue with sanitized data
-            validator::EventValidator::validate(
-                &event_type,
-                Some(&url),
-                &params,
-                &extra,
-            )
-            .unwrap_or_else(|_| validator::ValidatedEvent {
-                event_type: "pageview".to_string(),
-                url: "unknown".to_string(),
-                params: validator::EventValidator::sanitize_params(&params),
-                session_id: None,
-                user_id: None,
-                extra,
-            })
-        }
+    uri: Uri,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let query_string = uri.query().map(|s| s.to_string());
+    let raw = RawRequest {
+        ts: Utc::now().to_rfc3339(),
+        method: "GET".to_string(),
+        path: format!("/collect{}", uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("")),
+        headers: extract_headers(&headers),
+        query_params: query_string,
+        body: None,
+        client_ip: extract_client_ip(&headers),
     };
 
-    // Normalize campaign data if present
-    let normalized = if normalizer::NetworkNormalizer::has_campaign_data(&validated.params) {
-        Some(normalizer::NetworkNormalizer::normalize(&validated.params))
-    } else {
-        None
+    if let Err(e) = write_raw_request(&state.log_dir, &raw) {
+        error!("Failed to write request: {}", e);
+    }
+
+    StatusCode::NO_CONTENT
+}
+
+/// POST /collect - JSON body endpoint
+async fn collect_post(
+    State(state): State<CollectorState>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: String,
+) -> impl IntoResponse {
+    let query_string = uri.query().map(|s| s.to_string());
+    let raw = RawRequest {
+        ts: Utc::now().to_rfc3339(),
+        method: "POST".to_string(),
+        path: format!("/collect{}", uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("")),
+        headers: extract_headers(&headers),
+        query_params: query_string,
+        body: Some(body),
+        client_ip: extract_client_ip(&headers),
     };
 
-    let event = Event {
-        ts: Utc::now(),
-        ip,
-        ua,
-        url: validated.url,
-        params: validated.params,
-        r#type: validated.event_type,
-        normalized,
-        session_id: validated.session_id,
-        user_id: validated.user_id,
-    };
+    if let Err(e) = write_raw_request(&state.log_dir, &raw) {
+        error!("Failed to write request: {}", e);
+    }
 
-    write_event(&state, &event).await?;
-
-    Ok(())
+    StatusCode::NO_CONTENT
 }
 
-/// Extract query parameters from URL
-fn extract_params(url: &str) -> HashMap<String, String> {
-    let mut params = HashMap::new();
-
-    if let Ok(parsed) = url::Url::parse(url) {
-        for (key, value) in parsed.query_pairs() {
-            params.insert(key.to_string(), value.to_string());
-        }
-    }
-
-    params
-}
-
-/// Write event to the current log file with rotation
-///
-/// First attempts to send the event to the configured queue backend.
-/// If queue send fails, falls back to writing directly to log files.
-async fn write_event(state: &CollectorState, event: &Event) -> Result<(), CollectError> {
-    let current_key = current_hour_key();
-    let line = serde_json::to_string(event).map_err(|e| {
-        error!("JSON serialization error: {}", e);
-        CollectError::Json
-    })?;
-
-    // Try to send to queue first
-    if let Err(e) = state.queue.send(&line).await {
-        warn!("Queue send failed ({}), falling back to file write: {}", state.queue.name(), e);
-    } else {
-        // Queue send succeeded, skip file write
-        return Ok(());
-    }
-
-    // Fallback: write directly to log file
-    let mut current = state.current.lock().await;
-
-    // Check if we need to rotate
-    let needs_rotation = current
-        .as_ref()
-        .map(|f| f.hour_key != current_key)
-        .unwrap_or(true);
-
-    if needs_rotation {
-        if let Some(log_file) = current.take() {
-            let hour_key = log_file.hour_key.clone();
-            let log_dir = state.log_dir.clone();
-
-            // Spawn compression task
-            tokio::spawn(async move {
-                info!("Rotating log file for hour: {}", hour_key);
-                if let Err(e) = log_file.flush() {
-                    error!("Failed to flush log file: {}", e);
-                }
-                let old_path = log_dir.join(format!("events-{}.jsonl", hour_key));
-                if let Err(e) = tokio::task::spawn_blocking(move || {
-                    compress_file(&old_path)
-                }).await {
-                    warn!("Failed to compress log file: {}", e);
-                }
-            });
-        }
-
-        // Open new file
-        match LogFile::open(&state.log_dir, &current_key) {
-            Ok(file) => *current = Some(file),
-            Err(e) => {
-                error!("Failed to open log file: {}", e);
-                return Err(CollectError::Io);
-            }
-        }
-    }
-
-    // Write the event line
-    if let Some(ref mut file) = *current {
-        if let Err(e) = file.write_line(&line) {
-            error!("Failed to write event: {}", e);
-            return Err(CollectError::Io);
-        }
-    }
-
-    Ok(())
-}
-
-/// Error type for collection failures
-#[derive(Debug)]
-enum CollectError {
-    Json,
-    Io,
-    Validation,
-}
-
-impl IntoResponse for CollectError {
-    fn into_response(self) -> Response {
-        error!("Collection error: {:?}", self);
-        // Still return 204 - we want fire-and-forget semantics
-        // Errors are logged but not exposed to clients
-        StatusCode::NO_CONTENT.into_response()
-    }
+/// Health check endpoint
+async fn health() -> &'static str {
+    "OK"
 }
 
 /// Shutdown signal handler
@@ -493,18 +196,18 @@ async fn shutdown_signal() {
     };
 
     #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+    let terminate = std::future::pending::<()>;
 
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
 
-    info!("Shutdown signal received, flushing buffers...");
+    info!("Shutdown signal received");
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -513,50 +216,35 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let log_dir = PathBuf::from(std::env::var("TRACE_LOG_DIR").unwrap_or_else(|_| "/data/logs".to_string()));
+    let log_dir = PathBuf::from(
+        std::env::var("TRACE_LOG_DIR").unwrap_or_else(|_| "/data/logs".to_string())
+    );
 
     // Create log directory if it doesn't exist
     tokio::fs::create_dir_all(&log_dir).await?;
 
-    // Initialize queue producer from environment configuration
-    let queue_backend = queue::QueueBackend::from_env();
-    let queue = queue::create_producer(queue_backend)?;
-    info!("Queue backend initialized: {}", queue.name());
-
     let state = CollectorState {
         log_dir,
-        current: Arc::new(tokio::sync::Mutex::new(None)),
-        queue,
+        current_hour: Arc::new(Mutex::new(current_hour_key())),
     };
 
-    // Initialize the first log file
-    {
-        let mut current = state.current.lock().await;
-        let hour_key = current_hour_key();
-        *current = Some(LogFile::open(&state.log_dir, &hour_key)?);
-    }
-
-    // Clone state for final flush before moving into app
-    let flush_state = state.clone();
-
-    // Start rotation checker (runs every 5 minutes)
+    // Start rotation checker (runs every minute)
     let rotation_state = state.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(300));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
-            if let Err(e) = rotate_previous_hour(&rotation_state).await {
-                error!("Rotation check failed: {}", e);
+            let mut current = rotation_state.current_hour.lock().await;
+            let new_hour = current_hour_key();
+            if *current != new_hour {
+                *current = new_hour;
+                info!("Log rotation: new hour bucket {}", new_hour);
             }
         }
     });
 
-    async fn health() -> &'static str {
-        "OK"
-    }
-
     let app = axum::Router::new()
-        .route("/collect", axum::routing::get(collect_query).post(collect_json))
+        .route("/collect", axum::routing::get(collect_get).post(collect_post))
         .route("/health", axum::routing::get(health))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -567,19 +255,6 @@ async fn main() -> Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
-
-    // Final flush on shutdown
-    info!("Flushing queue before shutdown...");
-    if let Err(e) = flush_state.queue.flush().await {
-        error!("Failed to flush queue on shutdown: {}", e);
-    }
-
-    if let Some(log_file) = flush_state.current.lock().await.take() {
-        info!("Flushing final log file...");
-        if let Err(e) = log_file.flush() {
-            error!("Failed to flush on shutdown: {}", e);
-        }
-    }
 
     info!("TRACE collector shutdown complete");
     Ok(())
