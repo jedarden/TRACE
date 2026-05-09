@@ -12,7 +12,7 @@ use tokio::time::interval;
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use api_client::{ApiClient, ApiSyncResult, MetricsSyncResult};
+use api_client::{ApiClient, ApiSyncResult, HierarchySyncResult, MetricsSyncResult};
 use registry::{CreativeRegistry, HierarchyRegistry, MetricsRegistry};
 use s3_store::{HierarchyStore, S3CreativeStore};
 
@@ -79,11 +79,13 @@ async fn main() -> Result<()> {
 
     // Initialize registry
     let mut registry = CreativeRegistry::new(store.clone());
-    let mut metrics_registry = MetricsRegistry::new(store);
+    let mut metrics_registry = MetricsRegistry::new(store.clone());
+    let mut hierarchy_registry = HierarchyRegistry::new(store.clone());
 
     // Determine sync mode
     let sync_creatives = args.mode == "creatives" || args.mode == "both";
     let sync_metrics = args.mode == "metrics" || args.mode == "both";
+    let sync_hierarchy = args.hierarchy;
 
     // Determine metrics date range
     let days_back = if args.yesterday { 1 } else { args.days_back };
@@ -162,6 +164,9 @@ async fn main() -> Result<()> {
         if sync_metrics {
             run_metrics_sync(&mut metrics_registry, &mut clients, start_date, end_date).await?;
         }
+        if sync_hierarchy {
+            run_hierarchy_sync(&mut hierarchy_registry, &mut clients).await?;
+        }
     } else {
         // Continuous sync mode
         let mut timer = interval(Duration::from_secs(args.interval));
@@ -174,6 +179,9 @@ async fn main() -> Result<()> {
             if sync_metrics {
                 run_metrics_sync(&mut metrics_registry, &mut clients, start_date, end_date)
                     .await?;
+            }
+            if sync_hierarchy {
+                run_hierarchy_sync(&mut hierarchy_registry, &mut clients).await?;
             }
             timer.tick().await;
         }
@@ -268,6 +276,48 @@ async fn run_metrics_sync(
 
     info!(
         "Metrics sync complete: {} metrics fetched, {} errors",
+        total_fetched, total_errors
+    );
+
+    Ok(())
+}
+
+async fn run_hierarchy_sync(
+    registry: &mut HierarchyRegistry,
+    clients: &mut [Box<dyn ApiClient>],
+) -> Result<()> {
+    info!("Starting hierarchy sync...");
+
+    let mut total_fetched = 0;
+    let mut total_errors = 0;
+
+    for client in clients.iter_mut() {
+        info!("Fetching hierarchy from {}...", client.network_name());
+
+        match client.fetch_hierarchy().await {
+            Ok(HierarchySyncResult { hierarchies, .. }) => {
+                info!(
+                    "Fetched {} hierarchies from {}",
+                    hierarchies.len(),
+                    client.network_name()
+                );
+                total_fetched += hierarchies.len();
+
+                // Add to registry and persist each hierarchy
+                for hierarchy in hierarchies {
+                    registry.add_hierarchy(hierarchy.clone()).await?;
+                    registry.persist_hierarchy(&hierarchy).await?;
+                }
+            }
+            Err(e) => {
+                error!("Failed to fetch hierarchy from {}: {}", client.network_name(), e);
+                total_errors += 1;
+            }
+        }
+    }
+
+    info!(
+        "Hierarchy sync complete: {} hierarchies fetched, {} errors",
         total_fetched, total_errors
     );
 

@@ -4,10 +4,11 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use serde::Deserialize;
 
-use crate::creative::CreativeMetadata;
+use crate::creative::{CreativeMetadata, PerformanceMetrics};
+use crate::hierarchy::AccountHierarchy;
 
 /// Result of an API sync operation
 #[derive(Debug)]
@@ -17,11 +18,31 @@ pub struct ApiSyncResult {
     pub next_page_token: Option<String>,
 }
 
+/// Result of a metrics sync operation
+#[derive(Debug)]
+pub struct MetricsSyncResult {
+    pub metrics: Vec<PerformanceMetrics>,
+    pub next_page_token: Option<String>,
+}
+
+/// Result of a hierarchy sync operation
+#[derive(Debug)]
+pub struct HierarchySyncResult {
+    pub hierarchies: Vec<AccountHierarchy>,
+    pub next_page_token: Option<String>,
+}
+
 /// Trait for ad network API clients
 #[async_trait]
 pub trait ApiClient: Send + Sync {
     /// Fetch creative metadata from the API
     async fn fetch_creatives(&mut self) -> Result<ApiSyncResult>;
+
+    /// Fetch performance metrics for a date range
+    async fn fetch_metrics(&mut self, start_date: NaiveDate, end_date: NaiveDate) -> Result<MetricsSyncResult>;
+
+    /// Fetch account hierarchy from the API
+    async fn fetch_hierarchy(&mut self) -> Result<HierarchySyncResult>;
 
     /// Get the network name for this client
     fn network_name(&self) -> &str;
@@ -129,6 +150,52 @@ impl ApiClient for TaboolaClient {
         })
     }
 
+    async fn fetch_metrics(&mut self, start_date: NaiveDate, end_date: NaiveDate) -> Result<MetricsSyncResult> {
+        // Placeholder implementation - Taboola API metrics endpoint would be called here
+        // For now, return empty metrics
+        Ok(MetricsSyncResult {
+            metrics: vec![],
+            next_page_token: None,
+        })
+    }
+
+    async fn fetch_hierarchy(&mut self) -> Result<HierarchySyncResult> {
+        let campaigns = self.fetch_campaigns().await?;
+
+        let hierarchy = AccountHierarchy {
+            network: "taboola".to_string(),
+            account_id: self.account_id.clone().unwrap_or_else(|| "default".to_string()),
+            account_name: None,
+            campaigns: campaigns
+                .into_iter()
+                .map(|campaign| crate::hierarchy::CampaignHierarchy {
+                    campaign_id: campaign.id,
+                    campaign_name: Some(campaign.name),
+                    status: Some("active".to_string()),
+                    ad_groups: vec![],
+                    creatives: campaign
+                        .items
+                        .into_iter()
+                        .map(|item| crate::hierarchy::CreativeHierarchy {
+                            creative_id: item.id,
+                            headline: item.title,
+                            image_url: item.thumbnail_url,
+                            landing_page_url: item.url,
+                            item_id: Some(item.id),
+                            status: None,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            synced_at: Utc::now(),
+        };
+
+        Ok(HierarchySyncResult {
+            hierarchies: vec![hierarchy],
+            next_page_token: None,
+        })
+    }
+
     fn network_name(&self) -> &str {
         "taboola"
     }
@@ -223,6 +290,51 @@ impl ApiClient for OutbrainClient {
         })
     }
 
+    async fn fetch_metrics(&mut self, _start_date: NaiveDate, _end_date: NaiveDate) -> Result<MetricsSyncResult> {
+        // Placeholder implementation - Outbrain API metrics endpoint would be called here
+        Ok(MetricsSyncResult {
+            metrics: vec![],
+            next_page_token: None,
+        })
+    }
+
+    async fn fetch_hierarchy(&mut self) -> Result<HierarchySyncResult> {
+        let campaigns = self.fetch_campaigns().await?;
+
+        let hierarchy = AccountHierarchy {
+            network: "outbrain".to_string(),
+            account_id: "default".to_string(),
+            account_name: None,
+            campaigns: campaigns
+                .into_iter()
+                .map(|campaign| crate::hierarchy::CampaignHierarchy {
+                    campaign_id: campaign.id,
+                    campaign_name: Some(campaign.name),
+                    status: Some("active".to_string()),
+                    ad_groups: vec![],
+                    creatives: campaign
+                        .links
+                        .into_iter()
+                        .map(|link| crate::hierarchy::CreativeHierarchy {
+                            creative_id: link.id,
+                            headline: link.metadata.as_ref().and_then(|m| m.title.clone()),
+                            image_url: link.image_url,
+                            landing_page_url: link.url,
+                            item_id: Some(link.id),
+                            status: None,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            synced_at: Utc::now(),
+        };
+
+        Ok(HierarchySyncResult {
+            hierarchies: vec![hierarchy],
+            next_page_token: None,
+        })
+    }
+
     fn network_name(&self) -> &str {
         "outbrain"
     }
@@ -312,6 +424,51 @@ impl ApiClient for MgidClient {
 
         Ok(ApiSyncResult {
             creatives,
+            next_page_token: None,
+        })
+    }
+
+    async fn fetch_metrics(&mut self, _start_date: NaiveDate, _end_date: NaiveDate) -> Result<MetricsSyncResult> {
+        // Placeholder implementation - MGID API metrics endpoint would be called here
+        Ok(MetricsSyncResult {
+            metrics: vec![],
+            next_page_token: None,
+        })
+    }
+
+    async fn fetch_hierarchy(&mut self) -> Result<HierarchySyncResult> {
+        let campaigns = self.fetch_campaigns().await?;
+
+        let hierarchy = AccountHierarchy {
+            network: "mgid".to_string(),
+            account_id: "default".to_string(),
+            account_name: None,
+            campaigns: campaigns
+                .into_iter()
+                .map(|campaign| crate::hierarchy::CampaignHierarchy {
+                    campaign_id: campaign.id,
+                    campaign_name: Some(campaign.name),
+                    status: Some("active".to_string()),
+                    ad_groups: vec![],
+                    creatives: campaign
+                        .teasers
+                        .into_iter()
+                        .map(|teaser| crate::hierarchy::CreativeHierarchy {
+                            creative_id: teaser.id,
+                            headline: teaser.title,
+                            image_url: teaser.image,
+                            landing_page_url: teaser.url,
+                            item_id: Some(teaser.id),
+                            status: None,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            synced_at: Utc::now(),
+        };
+
+        Ok(HierarchySyncResult {
+            hierarchies: vec![hierarchy],
             next_page_token: None,
         })
     }
@@ -412,6 +569,51 @@ impl ApiClient for RevcontentClient {
         })
     }
 
+    async fn fetch_metrics(&mut self, _start_date: NaiveDate, _end_date: NaiveDate) -> Result<MetricsSyncResult> {
+        // Placeholder implementation - Revcontent API metrics endpoint would be called here
+        Ok(MetricsSyncResult {
+            metrics: vec![],
+            next_page_token: None,
+        })
+    }
+
+    async fn fetch_hierarchy(&mut self) -> Result<HierarchySyncResult> {
+        let campaigns = self.fetch_campaigns().await?;
+
+        let hierarchy = AccountHierarchy {
+            network: "revcontent".to_string(),
+            account_id: "default".to_string(),
+            account_name: None,
+            campaigns: campaigns
+                .into_iter()
+                .map(|campaign| crate::hierarchy::CampaignHierarchy {
+                    campaign_id: campaign.id,
+                    campaign_name: Some(campaign.name),
+                    status: Some("active".to_string()),
+                    ad_groups: vec![],
+                    creatives: campaign
+                        .widgets
+                        .into_iter()
+                        .map(|widget| crate::hierarchy::CreativeHierarchy {
+                            creative_id: widget.id,
+                            headline: widget.title,
+                            image_url: widget.thumbnail,
+                            landing_page_url: widget.url,
+                            item_id: Some(widget.id),
+                            status: None,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            synced_at: Utc::now(),
+        };
+
+        Ok(HierarchySyncResult {
+            hierarchies: vec![hierarchy],
+            next_page_token: None,
+        })
+    }
+
     fn network_name(&self) -> &str {
         "revcontent"
     }
@@ -485,6 +687,49 @@ impl ApiClient for DemoClient {
     async fn fetch_creatives(&mut self) -> Result<ApiSyncResult> {
         Ok(ApiSyncResult {
             creatives: self.generate_demo_creatives(),
+            next_page_token: None,
+        })
+    }
+
+    async fn fetch_metrics(&mut self, _start_date: NaiveDate, _end_date: NaiveDate) -> Result<MetricsSyncResult> {
+        Ok(MetricsSyncResult {
+            metrics: vec![],
+            next_page_token: None,
+        })
+    }
+
+    async fn fetch_hierarchy(&mut self) -> Result<HierarchySyncResult> {
+        let hierarchy = AccountHierarchy {
+            network: "demo".to_string(),
+            account_id: "demo-account".to_string(),
+            account_name: Some("Demo Account".to_string()),
+            campaigns: self
+                .generate_demo_creatives()
+                .into_iter()
+                .map(|c| {
+                    let campaign_id = c.campaign_id.clone().unwrap_or_else(|| "unknown".to_string());
+                    let campaign_name = c.campaign_name.clone();
+                    crate::hierarchy::CampaignHierarchy {
+                        campaign_id,
+                        campaign_name,
+                        status: Some("active".to_string()),
+                        ad_groups: vec![],
+                        creatives: vec![crate::hierarchy::CreativeHierarchy {
+                            creative_id: c.creative_id.unwrap_or_else(|| "unknown".to_string()),
+                            headline: c.headline,
+                            image_url: c.image_url,
+                            landing_page_url: c.landing_page_url,
+                            item_id: c.item_id,
+                            status: None,
+                        }],
+                    }
+                })
+                .collect(),
+            synced_at: Utc::now(),
+        };
+
+        Ok(HierarchySyncResult {
+            hierarchies: vec![hierarchy],
             next_page_token: None,
         })
     }
