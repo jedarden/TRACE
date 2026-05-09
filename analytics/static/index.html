@@ -105,6 +105,15 @@
             color: white;
         }
         .btn-success:hover { background: #059669; }
+        .btn-sm {
+            padding: 6px 12px;
+            font-size: 12px;
+        }
+        .download-buttons {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
         .results {
             margin-top: 30px;
         }
@@ -326,7 +335,7 @@
                 if (data.error) {
                     resultsDiv.innerHTML = '<div class="error">' + data.error + '</div>';
                 } else {
-                    renderTable(resultsDiv, data.columns, data.rows);
+                    renderTable(resultsDiv, data.columns, data.rows, data.csv, data.json);
                 }
             } catch (e) {
                 document.getElementById('query-results').innerHTML = '<div class="error">Request failed: ' + e.message + '</div>';
@@ -403,13 +412,26 @@
             }
         }
 
-        function renderTable(container, columns, rows) {
+        function renderTable(container, columns, rows, csvData, jsonData) {
             if (!rows || rows.length === 0) {
                 container.innerHTML = '<p style="color: #666; padding: 20px; text-align: center;">No results</p>';
                 return;
             }
 
             let html = '<div class="results-header"><h3>Results (' + rows.length + ' rows)</h3></div>';
+
+            // Add download buttons if data is available
+            if (csvData || jsonData) {
+                html += '<div class="download-buttons">';
+                if (csvData) {
+                    html += '<button class="btn btn-secondary btn-sm" onclick="downloadCSV()">Download CSV</button>';
+                }
+                if (jsonData) {
+                    html += '<button class="btn btn-secondary btn-sm" onclick="downloadJSON()">Download JSON</button>';
+                }
+                html += '</div>';
+            }
+
             html += '<div class="table-container"><table><thead><tr>';
             columns.forEach(col => {
                 html += '<th>' + escapeHtml(col) + '</th>';
@@ -426,6 +448,36 @@
 
             html += '</tbody></table></div>';
             container.innerHTML = html;
+
+            // Store data for download functions
+            if (csvData) window.currentCSV = csvData;
+            if (jsonData) window.currentJSON = jsonData;
+        }
+
+        function downloadCSV() {
+            if (!window.currentCSV) return;
+            const blob = new Blob([window.currentCSV], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'query_results_' + new Date().getTime() + '.csv';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+
+        function downloadJSON() {
+            if (!window.currentJSON) return;
+            const blob = new Blob([window.currentJSON], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'query_results_' + new Date().getTime() + '.json';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
         }
 
         function escapeHtml(text) {
