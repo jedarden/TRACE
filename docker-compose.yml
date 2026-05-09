@@ -10,5 +10,22 @@ services:
       RUST_LOG: info
     restart: unless-stopped
 
+  analytics:
+    build: ./analytics
+    volumes:
+      - trace-reports:/data/reports
+    environment:
+      TRACE_S3_BUCKET: ${TRACE_S3_BUCKET:-my-trace-bucket}
+      TRACE_S3_REGION: ${TRACE_S3_REGION:-us-east-1}
+      TRACE_S3_PREFIX: ${TRACE_S3_PREFIX:-trace-events}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      ICEBERG_CATALOG_URI: ${ICEBERG_CATALOG_URI:-http://iceberg-rest:8181}
+      ICEBERG_WAREHOUSE: ${ICEBERG_WAREHOUSE:-s3://my-trace-bucket/iceberg}
+      RUST_LOG: info
+    command: ["schedule", "--interval", "86400"]
+    restart: unless-stopped
+
 volumes:
   trace-logs:
+  trace-reports:

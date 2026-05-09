@@ -1,0 +1,71 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: trace-analytics-daily
+  namespace: trace
+spec:
+  schedule: "0 2 * * *"  # Run daily at 2 AM
+  successfulJobsHistoryLimit: 7
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: analytics
+            image: trace-analytics:latest
+            imagePullPolicy: IfNotPresent
+            command:
+              - trace-analytics
+              - run
+              - daily_summary
+              - --format
+              - json
+            env:
+            - name: TRACE_S3_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: trace-config
+                  key: s3-bucket
+            - name: TRACE_S3_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: trace-config
+                  key: s3-region
+            - name: TRACE_S3_PREFIX
+              valueFrom:
+                configMapKeyRef:
+                  name: trace-config
+                  key: s3-prefix
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: s3-credentials
+                  key: access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: s3-credentials
+                  key: secret-access-key
+            - name: ICEBERG_CATALOG_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: trace-config
+                  key: iceberg-catalog-uri
+                  optional: true
+            - name: ICEBERG_WAREHOUSE
+              valueFrom:
+                configMapKeyRef:
+                  name: trace-config
+                  key: iceberg-warehouse
+                  optional: true
+            - name: RUST_LOG
+              value: "info"
+            resources:
+              requests:
+                memory: "512Mi"
+                cpu: "250m"
+              limits:
+                memory: "2Gi"
+                cpu: "1000m"
+          restartPolicy: OnFailure
