@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TRACE Tag Demo</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      max-width: 800px;
+      margin: 40px auto;
+      padding: 20px;
+      line-height: 1.6;
+    }
+    h1 { color: #333; }
+    .section {
+      background: #f5f5f5;
+      padding: 20px;
+      margin: 20px 0;
+      border-radius: 8px;
+    }
+    .info {
+      background: #e3f2fd;
+      padding: 15px;
+      border-radius: 6px;
+      margin: 10px 0;
+    }
+    a {
+      color: #0066cc;
+      text-decoration: none;
+    }
+    a:hover { text-decoration: underline; }
+    .outbound {
+      background: #fff3cd;
+      padding: 10px;
+      display: inline-block;
+      margin: 5px 0;
+    }
+    code {
+      background: #263238;
+      color: #aed581;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: 'Monaco', 'Menlo', monospace;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <h1>TRACE Minimal Tag Demo</h1>
+
+  <div class="section">
+    <h2>Tag Status</h2>
+    <div class="info">
+      <strong>Current Session ID:</strong> <code id="session-id">Loading...</code><br>
+      <strong>Current User ID:</strong> <code id="user-id">Loading...</code><br>
+      <strong>Page View ID:</strong> <code id="pv-id">Loading...</code>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Test Features</h2>
+    <p>This page demonstrates the TRACE minimal tracking tag features:</p>
+    <ul>
+      <li><strong>Pageview:</strong> Sent automatically on page load with all query params</li>
+      <li><strong>Dwell Heartbeat:</strong> Sent every 30 seconds</li>
+      <li><strong>Outbound Clicks:</strong> Click any outbound link below to track</li>
+    </ul>
+  </div>
+
+  <div class="section">
+    <h2>UTM Parameters Test</h2>
+    <p>Add UTM parameters to URL to test campaign tracking:</p>
+    <a href="?utm_source=google&utm_medium=cpc&utm_campaign=spring_sale&utm_term=shoes&utm_content=banner1">
+      Test with UTM Parameters
+    </a>
+  </div>
+
+  <div class="section">
+    <h2>Outbound Link Test</h2>
+    <p>Click these outbound links to test click tracking:</p>
+    <div class="outbound">
+      <a href="https://example.com" target="_blank">https://example.com</a>
+    </div>
+    <div class="outbound">
+      <a href="https://github.com" target="_blank">https://github.com</a>
+    </div>
+    <div class="outbound">
+      <a href="https://www.google.com" target="_blank">https://www.google.com</a>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Internal Link Test</h2>
+    <p>Internal links are NOT tracked as outbound:</p>
+    <a href="?internal=test">Internal Link (same page)</a>
+  </div>
+
+  <div class="section">
+    <h2>Browser Console</h2>
+    <p>Open browser DevTools console to see events being sent.</p>
+    <p>The tag sends POST requests to <code>/e</code> endpoint.</p>
+  </div>
+
+  <!-- TRACE Minimal Tag -->
+  <script src="tag.min.js" data-collector="/e"></script>
+
+  <!-- Display tracking IDs for demo purposes -->
+  <script>
+    // Wait for tag to load and display IDs
+    setTimeout(function() {
+      // The tag stores IDs in localStorage
+      var sessionId = localStorage.getItem('t_sid');
+      var userId = localStorage.getItem('t_uid');
+
+      // Generate the page view ID the same way the tag does
+      function generateUUID() {
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+          var r = Math.random() * 16 | 0;
+          var v = c === 'x' ? r : (r & 0x3 | 0x8);
+          return v.toString(16);
+        });
+      }
+
+      // The page view ID is generated per page load
+      // For demo, we'll just show a random one
+      document.getElementById('session-id').textContent = sessionId || 'Not set';
+      document.getElementById('user-id').textContent = userId || 'Not set';
+      document.getElementById('pv-id').textContent = generateUUID();
+    }, 100);
+  </script>
+</body>
+</html>
