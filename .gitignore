@@ -18,9 +18,15 @@
 Thumbs.db
 
 # Beads (local task tracking)
-.beads/
+.beads/*
 .needle-predispatch-sha
 
 # Build artifacts in subdirectories
 **/target/
 !.beads/issues.jsonl
+
+# bead-rs store: the durable artefact is the checkpoint plus config.json.
+# (`beads.db` stays ignored — it is per-machine live state.)
+!.beads/checkpoint/
+!.beads/checkpoint/**
+!.beads/config.json
