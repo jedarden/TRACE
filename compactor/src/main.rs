@@ -452,7 +452,7 @@ struct CompactorState {
     last_run: Arc<Mutex<Option<DateTime<Utc>>>>,
 }
 
-/// Run scheduled compaction (called by cron/scheduler)
+/// Run scheduled compaction (called by the internal scheduler)
 async fn scheduled_compaction(state: Arc<CompactorState>) -> Result<()> {
     // Check if we need to run (at most once per day)
     {
@@ -508,6 +508,12 @@ async fn main() -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(7);
 
+    let interval_seconds = std::env::var("COMPACTOR_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(86_400);
+
     let s3_config = S3Config {
         bucket: s3_bucket,
         region: s3_region,
@@ -549,15 +555,37 @@ async fn main() -> Result<()> {
             error!("Initial compaction failed: {}", e);
         }
 
-        // Enter scheduling mode - wait for SIGTERM
-        info!("TRACE compactor running (waiting for scheduled runs or shutdown)");
+        // Enter scheduling mode so the Deployment owns the recurring work.
+        info!(
+            "TRACE compactor running (next run in {} seconds)",
+            interval_seconds
+        );
+        let mut schedule = tokio::time::interval(std::time::Duration::from_secs(
+            interval_seconds,
+        ));
+        // The first tick is immediate; the initial compaction above already
+        // handled startup, so wait for the configured interval before looping.
+        schedule.tick().await;
+        let ctrl_c = tokio::signal::ctrl_c();
+        tokio::pin!(ctrl_c);
+        let shutdown = shutdown_signal();
+        tokio::pin!(shutdown);
 
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                info!("Shutting down...");
-            }
-            _ = shutdown_signal() => {
-                info!("Shutting down...");
+        loop {
+            tokio::select! {
+                _ = schedule.tick() => {
+                    if let Err(e) = scheduled_compaction(state.clone()).await {
+                        error!("Scheduled compaction failed: {}", e);
+                    }
+                }
+                _ = &mut ctrl_c => {
+                    info!("Shutting down...");
+                    break;
+                }
+                _ = &mut shutdown => {
+                    info!("Shutting down...");
+                    break;
+                }
             }
         }
     }

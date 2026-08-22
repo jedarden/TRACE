@@ -34,6 +34,8 @@ spec:
               value: trace-events
             - name: COMPACTOR_LOOKBACK_DAYS
               value: "7"
+            - name: COMPACTOR_INTERVAL_SECONDS
+              value: "86400"
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
