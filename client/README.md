@@ -554,7 +554,7 @@ Update `data-collector` to point to your TRACE collector:
 
 ## License
 
-MIT
+Apache-2.0 — see the repository [LICENSE](../LICENSE).
 
 ---
 

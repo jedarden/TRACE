@@ -71,16 +71,27 @@ TRACE is a lightweight, self-hosted event tracking system built for affiliate ma
 
 ```
 TRACE/
+├── collector/        # HTTP event collector
+├── flusher/          # raw-event to Parquet pipeline
+├── syncer/           # object-store synchronization
+├── compactor/        # Parquet compaction
+├── analytics/        # DuckDB-backed query service
+├── client/           # browser tracking client
 ├── docs/
 │   ├── research/    # Market research, competitive analysis, technical spikes
 │   └── plan/        # Architecture decisions, implementation phases, roadmap
+├── docker-compose.yml
 └── README.md
 ```
 
 ## 🚀 Status
 
-TRACE is in the early design and planning phase. Follow along as it's built in public.
+**Implemented prototype, not a turnkey release.** The collector, flusher,
+syncer, compactor, analytics service, and browser client exist with tests.
+There are no published binaries or container images, and the current Compose
+file expects an external S3-compatible store and Iceberg REST catalog. Expect
+to supply and operate that infrastructure before evaluating the full pipeline.
 
 ## 📄 License
 
-MIT
+Apache-2.0 — see [LICENSE](LICENSE).

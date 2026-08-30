@@ -16,7 +16,7 @@
     "tag"
   ],
   "author": "",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "devDependencies": {
     "@terser/webpack-plugin": "^5.3.10",
     "terser": "^5.36.0"
