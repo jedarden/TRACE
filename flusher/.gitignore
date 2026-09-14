@@ -1,2 +1,3 @@
+# Cargo.lock is committed: binaries get reproducible builds, and the
+# Dockerfile COPYs it into the build context.
 /target
-Cargo.lock
