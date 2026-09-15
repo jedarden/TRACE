@@ -61,6 +61,14 @@ pub enum EventType {
     Click,
     /// Scroll depth threshold reached
     Scroll,
+    /// Conversion event (carries conversion_type and revenue in params)
+    Conversion,
+    /// Purchase event (a conversion flavor the attribution queries query
+    /// alongside type = 'conversion')
+    Purchase,
+    /// Signup event (a conversion flavor the attribution queries query
+    /// alongside type = 'conversion')
+    Signup,
     /// Unknown event type
     Unknown,
 }
@@ -73,6 +81,9 @@ impl EventType {
             "dwell" | "heartbeat" => EventType::Heartbeat,
             "click" => EventType::Click,
             "scroll" => EventType::Scroll,
+            "conversion" => EventType::Conversion,
+            "purchase" => EventType::Purchase,
+            "signup" => EventType::Signup,
             _ => EventType::Unknown,
         }
     }
@@ -84,6 +95,9 @@ impl EventType {
             EventType::Heartbeat => "heartbeat",
             EventType::Click => "click",
             EventType::Scroll => "scroll",
+            EventType::Conversion => "conversion",
+            EventType::Purchase => "purchase",
+            EventType::Signup => "signup",
             EventType::Unknown => "unknown",
         }
     }
@@ -159,12 +173,37 @@ impl RawLogParser {
         // Extract user agent
         let ua = raw.headers.user_agent;
 
-        // Determine event type and extract data based on method
-        let (event_type, params, session_id, user_id, cookie_id) = match raw.method.as_str() {
-            "POST" => Self::parse_post_request(&raw.body)?,
-            "GET" => Self::parse_get_request(&raw.query_params)?,
+        // Determine event type and extract data based on method. The
+        // conversion endpoint (/c) defaults hits to conversion events so a
+        // bare pixel or postback ping — where the caller often cannot add a
+        // type parameter — still lands as type = 'conversion' in ad_events.
+        // Bare hits on the other endpoints keep their original defaults
+        // (pageview for pixels, unknown for bodyless POSTs).
+        let is_conversion = Self::is_conversion_endpoint(&raw.path);
+        let (event_type, mut params, session_id, user_id, cookie_id) = match raw.method.as_str() {
+            "POST" => Self::parse_post_request(
+                &raw.body,
+                if is_conversion {
+                    EventType::Conversion
+                } else {
+                    EventType::Unknown
+                },
+            )?,
+            "GET" => Self::parse_get_request(
+                &raw.query_params,
+                if is_conversion {
+                    EventType::Conversion
+                } else {
+                    EventType::Pageview
+                },
+            )?,
             _ => (EventType::Unknown, HashMap::new(), None, None, None),
         };
+
+        // A non-numeric revenue value would break the documented attribution
+        // queries, which cast (params->>'revenue')::DECIMAL. Drop it rather
+        // than poison the conversion sums; everything else stays raw.
+        Self::sanitize_revenue(&mut params);
 
         // Build URL from path and params
         let url = Self::build_url(&raw.path, &params);
@@ -201,10 +240,12 @@ impl RawLogParser {
         })
     }
 
-    /// Parse POST request body to extract event type and params
-    fn parse_post_request(body: &Option<String>) -> Result<ParsedRequest> {
+    /// Parse POST request body to extract event type and params.
+    /// `default_type` applies when the body carries no explicit event type
+    /// (the conversion endpoint passes Conversion here).
+    fn parse_post_request(body: &Option<String>, default_type: EventType) -> Result<ParsedRequest> {
         let Some(body_str) = body else {
-            return Ok((EventType::Unknown, HashMap::new(), None, None, None));
+            return Ok((default_type, HashMap::new(), None, None, None));
         };
 
         // Try to parse as JSON
@@ -214,7 +255,7 @@ impl RawLogParser {
                 .get("type")
                 .and_then(|v| v.as_str())
                 .map(EventType::from_str)
-                .unwrap_or(EventType::Unknown);
+                .unwrap_or(default_type);
 
             // Extract IDs
             let session_id = json_data
@@ -251,25 +292,35 @@ impl RawLogParser {
             return Ok((event_type, params, session_id, user_id, cookie_id));
         }
 
-        // If not JSON, try URL-encoded form data
-        Ok((
-            EventType::Unknown,
-            Self::parse_query_string(body_str)?,
-            None,
-            None,
-            None,
-        ))
+        // Not JSON: URL-encoded form data, the format ad networks use for
+        // server-to-server postbacks. Parse it like a query string so the
+        // type, IDs, and revenue survive.
+        let params = Self::parse_query_string(body_str)?;
+        let event_type = params
+            .get("type")
+            .map(|t| EventType::from_str(t))
+            .unwrap_or(default_type);
+        let session_id = params.get("sid").cloned();
+        let user_id = params.get("uid").cloned();
+        let cookie_id = params.get("cid").cloned();
+
+        Ok((event_type, params, session_id, user_id, cookie_id))
     }
 
-    /// Parse GET request query params to extract event type and params
-    fn parse_get_request(query_params: &Option<String>) -> Result<ParsedRequest> {
+    /// Parse GET request query params to extract event type and params.
+    /// `default_type` applies when no explicit `type` param is present
+    /// (pageview for the pixel endpoints, conversion for /c).
+    fn parse_get_request(
+        query_params: &Option<String>,
+        default_type: EventType,
+    ) -> Result<ParsedRequest> {
         let params = Self::parse_query_string(query_params.as_deref().unwrap_or(""))?;
 
         // Determine event type from "type" param
         let event_type = params
             .get("type")
             .map(|t| EventType::from_str(t))
-            .unwrap_or(EventType::Pageview); // Default to pageview for pixel requests
+            .unwrap_or(default_type);
 
         // Extract IDs
         let session_id = params.get("sid").cloned();
@@ -277,6 +328,28 @@ impl RawLogParser {
         let cookie_id = params.get("cid").cloned();
 
         Ok((event_type, params, session_id, user_id, cookie_id))
+    }
+
+    /// True when the request path is the conversion endpoint (`/c`). Only
+    /// the first path segment is compared, so `/collect` is not matched —
+    /// its hits keep the ordinary pageview/unknown defaults.
+    fn is_conversion_endpoint(path: &str) -> bool {
+        let without_query = path.split('?').next().unwrap_or(path);
+        let first_segment = without_query.split('/').find(|s| !s.is_empty());
+        first_segment == Some("c")
+    }
+
+    /// Drop a `revenue` param that is not a finite number. The documented
+    /// attribution and ROI queries cast `(params->>'revenue')::DECIMAL`, so
+    /// one malformed value would fail every query that touches the column.
+    fn sanitize_revenue(params: &mut HashMap<String, String>) {
+        let valid = params
+            .get("revenue")
+            .map(|r| r.parse::<f64>().map(|v| v.is_finite()).unwrap_or(false))
+            .unwrap_or(true);
+        if !valid {
+            params.remove("revenue");
+        }
     }
 
     /// Parse URL query string into HashMap
@@ -414,6 +487,29 @@ mod tests {
             Some(&"https://example.com".to_string())
         );
         assert_eq!(event.params.get("outbound"), Some(&"true".to_string()));
+    }
+
+    #[test]
+    fn test_parse_post_scroll() {
+        let json = r#"{
+            "ts": "2026-05-08T14:32:00Z",
+            "method": "POST",
+            "path": "/e",
+            "headers": {
+                "user_agent": "Mozilla/5.0"
+            },
+            "body": "{\"type\":\"scroll\",\"sid\":\"sess-123\",\"url\":\"https://example.com\",\"scroll_depth\":75,\"max_scroll_depth\":78}"
+        }"#;
+
+        let event = RawLogParser::parse_line(json).unwrap();
+
+        assert_eq!(event.event_type, EventType::Scroll);
+        assert_eq!(event.session_id, Some("sess-123".to_string()));
+        assert_eq!(event.params.get("scroll_depth"), Some(&"75".to_string()));
+        assert_eq!(
+            event.params.get("max_scroll_depth"),
+            Some(&"78".to_string())
+        );
     }
 
     #[test]
@@ -566,7 +662,259 @@ mod tests {
         assert_eq!(EventType::from_str("dwell"), EventType::Heartbeat);
         assert_eq!(EventType::from_str("heartbeat"), EventType::Heartbeat);
         assert_eq!(EventType::from_str("click"), EventType::Click);
+        assert_eq!(EventType::from_str("conversion"), EventType::Conversion);
+        assert_eq!(EventType::from_str("purchase"), EventType::Purchase);
+        assert_eq!(EventType::from_str("signup"), EventType::Signup);
         assert_eq!(EventType::from_str("unknown"), EventType::Unknown);
+    }
+
+    #[test]
+    fn test_event_type_conversion_as_str() {
+        assert_eq!(EventType::Conversion.as_str(), "conversion");
+        assert_eq!(EventType::Purchase.as_str(), "purchase");
+        assert_eq!(EventType::Signup.as_str(), "signup");
+    }
+
+    /// The JS tag's conversion API POSTs type=conversion with the conversion
+    /// kind and revenue alongside. This is the event every documented
+    /// attribution query counts on.
+    #[test]
+    fn test_parse_post_conversion_with_revenue() {
+        let json = r#"{
+            "ts": "2026-05-08T14:40:00Z",
+            "method": "POST",
+            "path": "/e",
+            "headers": {
+                "user_agent": "Mozilla/5.0"
+            },
+            "body": "{\"type\":\"conversion\",\"sid\":\"sess-123\",\"conversion_type\":\"purchase\",\"revenue\":49.99,\"currency\":\"USD\"}",
+            "client_ip": "1.2.3.4"
+        }"#;
+
+        let event = RawLogParser::parse_line(json).unwrap();
+
+        assert_eq!(event.event_type, EventType::Conversion);
+        assert_eq!(event.session_id, Some("sess-123".to_string()));
+        assert_eq!(
+            event.params.get("conversion_type"),
+            Some(&"purchase".to_string())
+        );
+        assert_eq!(event.params.get("revenue"), Some(&"49.99".to_string()));
+        assert_eq!(event.params.get("currency"), Some(&"USD".to_string()));
+    }
+
+    /// A pixel GET can carry the conversion explicitly via type=conversion.
+    #[test]
+    fn test_parse_get_conversion_pixel() {
+        let json = r#"{
+            "ts": "2026-05-08T14:40:00Z",
+            "method": "GET",
+            "path": "/p",
+            "headers": {},
+            "query_params": "type=conversion&conversion_type=lead&revenue=12.50&sid=sess-789",
+            "body": null
+        }"#;
+
+        let event = RawLogParser::parse_line(json).unwrap();
+
+        assert_eq!(event.event_type, EventType::Conversion);
+        assert_eq!(event.session_id, Some("sess-789".to_string()));
+        assert_eq!(
+            event.params.get("conversion_type"),
+            Some(&"lead".to_string())
+        );
+        assert_eq!(event.params.get("revenue"), Some(&"12.50".to_string()));
+    }
+
+    /// A bare hit on the conversion endpoint (no type param — the common
+    /// shape for ad-network postback pixels) defaults to a conversion.
+    #[test]
+    fn test_parse_conversion_endpoint_defaults_to_conversion() {
+        let json = r#"{
+            "ts": "2026-05-08T14:40:00Z",
+            "method": "GET",
+            "path": "/c",
+            "headers": {},
+            "query_params": "sid=sess-5&uid=user-5&revenue=20&conversion_type=purchase",
+            "body": null
+        }"#;
+
+        let event = RawLogParser::parse_line(json).unwrap();
+
+        assert_eq!(event.event_type, EventType::Conversion);
+        assert_eq!(event.session_id, Some("sess-5".to_string()));
+        assert_eq!(event.user_id, Some("user-5".to_string()));
+        assert_eq!(event.params.get("revenue"), Some(&"20".to_string()));
+    }
+
+    /// /collect must not inherit the conversion default — its bare hits stay
+    /// pageviews as before.
+    #[test]
+    fn test_parse_collect_endpoint_does_not_default_to_conversion() {
+        let json = r#"{
+            "ts": "2026-05-08T14:40:00Z",
+            "method": "GET",
+            "path": "/collect",
+            "headers": {},
+            "query_params": "url=https%3A%2F%2Fexample.com",
+            "body": null
+        }"#;
+
+        let event = RawLogParser::parse_line(json).unwrap();
+
+        assert_eq!(event.event_type, EventType::Pageview);
+    }
+
+    /// Form-encoded postbacks (the standard ad-network server-to-server
+    /// format) keep their IDs and revenue instead of collapsing to unknown.
+    #[test]
+    fn test_parse_form_encoded_postback() {
+        let json = r#"{
+            "ts": "2026-05-08T14:40:00Z",
+            "method": "POST",
+            "path": "/c",
+            "headers": {},
+            "query_params": null,
+            "body": "sid=sess-9&uid=user-9&conversion_type=purchase&revenue=33.75&utm_source=taboola&utm_campaign=c-77"
+        }"#;
+
+        let event = RawLogParser::parse_line(json).unwrap();
+
+        assert_eq!(event.event_type, EventType::Conversion);
+        assert_eq!(event.session_id, Some("sess-9".to_string()));
+        assert_eq!(event.user_id, Some("user-9".to_string()));
+        assert_eq!(
+            event.params.get("conversion_type"),
+            Some(&"purchase".to_string())
+        );
+        assert_eq!(event.params.get("revenue"), Some(&"33.75".to_string()));
+        assert_eq!(event.params.get("utm_campaign"), Some(&"c-77".to_string()));
+    }
+
+    /// A JSON postback without a type field on /c defaults to conversion.
+    #[test]
+    fn test_parse_json_postback_without_type_defaults_to_conversion() {
+        let json = r#"{
+            "ts": "2026-05-08T14:40:00Z",
+            "method": "POST",
+            "path": "/c",
+            "headers": {},
+            "query_params": null,
+            "body": "{\"sid\":\"sess-11\",\"revenue\":5}"
+        }"#;
+
+        let event = RawLogParser::parse_line(json).unwrap();
+
+        assert_eq!(event.event_type, EventType::Conversion);
+        assert_eq!(event.params.get("revenue"), Some(&"5".to_string()));
+    }
+
+    /// An explicit type always wins over the endpoint default.
+    #[test]
+    fn test_parse_explicit_type_overrides_conversion_endpoint() {
+        let json = r#"{
+            "ts": "2026-05-08T14:40:00Z",
+            "method": "GET",
+            "path": "/c",
+            "headers": {},
+            "query_params": "type=pageview&url=https%3A%2F%2Fexample.com",
+            "body": null
+        }"#;
+
+        let event = RawLogParser::parse_line(json).unwrap();
+
+        assert_eq!(event.event_type, EventType::Pageview);
+    }
+
+    /// A bodyless POST to /c is still a conversion (bare postback ping).
+    #[test]
+    fn test_parse_bodyless_conversion_postback() {
+        let json = r#"{
+            "ts": "2026-05-08T14:40:00Z",
+            "method": "POST",
+            "path": "/c",
+            "headers": {},
+            "query_params": null,
+            "body": null
+        }"#;
+
+        let event = RawLogParser::parse_line(json).unwrap();
+
+        assert_eq!(event.event_type, EventType::Conversion);
+    }
+
+    /// purchase and signup are first-class event types — the attribution
+    /// analysis query filters on all three (conversion/purchase/signup).
+    #[test]
+    fn test_parse_purchase_and_signup_types() {
+        for (type_str, expected) in [
+            ("purchase", EventType::Purchase),
+            ("signup", EventType::Signup),
+        ] {
+            let json = format!(
+                r#"{{"ts":"2026-05-08T14:40:00Z","method":"POST","path":"/e","headers":{{}},"body":"{{\"type\":\"{type_str}\",\"sid\":\"s1\"}}"}}"#
+            );
+            let event = RawLogParser::parse_line(&json).unwrap();
+            assert_eq!(event.event_type, expected);
+            assert_eq!(event.event_type.as_str(), type_str);
+        }
+    }
+
+    /// Non-numeric revenue is dropped so (params->>'revenue')::DECIMAL in
+    /// the attribution queries cannot fail on one malformed event; finite
+    /// numeric revenue is kept verbatim.
+    #[test]
+    fn test_revenue_sanitization() {
+        let make_line = |revenue: &str| {
+            format!(
+                r#"{{"ts":"2026-05-08T14:40:00Z","method":"POST","path":"/e","headers":{{}},"body":"{{\"type\":\"conversion\",\"revenue\":\"{revenue}\"}}"}}"#
+            )
+        };
+
+        // Numeric revenue kept as-is
+        let event = RawLogParser::parse_line(&make_line("42.50")).unwrap();
+        assert_eq!(event.params.get("revenue"), Some(&"42.50".to_string()));
+
+        // Negative and exponent forms are valid numbers
+        let event = RawLogParser::parse_line(&make_line("-3.5")).unwrap();
+        assert_eq!(event.params.get("revenue"), Some(&"-3.5".to_string()));
+
+        // Garbage, infinity, and NaN are dropped
+        for bad in ["abc", "inf", "nan", "12ab"] {
+            let event = RawLogParser::parse_line(&make_line(bad)).unwrap();
+            assert_eq!(
+                event.params.get("revenue"),
+                None,
+                "revenue {bad:?} should have been dropped"
+            );
+            // The event itself survives — only the bad value goes
+            assert_eq!(event.event_type, EventType::Conversion);
+        }
+
+        // No revenue at all is untouched
+        let json = r#"{
+            "ts": "2026-05-08T14:40:00Z",
+            "method": "POST",
+            "path": "/e",
+            "headers": {},
+            "body": "{\"type\":\"conversion\"}"
+        }"#;
+        let event = RawLogParser::parse_line(json).unwrap();
+        assert_eq!(event.params.get("revenue"), None);
+    }
+
+    #[test]
+    fn test_is_conversion_endpoint() {
+        assert!(RawLogParser::is_conversion_endpoint("/c"));
+        assert!(RawLogParser::is_conversion_endpoint("/c?revenue=1"));
+        assert!(RawLogParser::is_conversion_endpoint("/c/c?revenue=1"));
+        // /collect shares the prefix but is a different endpoint
+        assert!(!RawLogParser::is_conversion_endpoint("/collect"));
+        assert!(!RawLogParser::is_conversion_endpoint("/collect?url=x"));
+        assert!(!RawLogParser::is_conversion_endpoint("/p"));
+        assert!(!RawLogParser::is_conversion_endpoint("/e"));
+        // A /c deeper in the path is not the endpoint
+        assert!(!RawLogParser::is_conversion_endpoint("/p/c"));
     }
 
     #[test]

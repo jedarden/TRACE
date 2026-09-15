@@ -1,14 +1,15 @@
 /*!
  * TRACE - Minimal async tracking tag
- * @version 1.0.0
+ * @version 1.1.0
  *
  * Features:
  * - Pageview on DOMContentLoaded (captures all query params including UTM)
  * - Dwell heartbeat every 30 seconds
  * - Click tracking on outbound links
  * - Scroll depth tracking (25/50/75/100% thresholds)
+ * - Conversion tracking with revenue via TRACE.conversion()
  * - Sends POST to /e endpoint with JSON payload
- * - Async, non-blocking, <2KB
+ * - Async, non-blocking, <4KB minified
  *
  * Usage:
  * <script src="tag.min.js" data-collector="/e"></script>
@@ -302,5 +303,40 @@
       unload: true
     });
   });
+
+  /**
+   * Track a conversion event (purchase, signup, lead, ...).
+   *
+   * The event type is always 'conversion' — that is what the attribution
+   * queries count (type = 'conversion'). What kind of conversion it was
+   * travels in conversion_type, and revenue rides along in params:
+   *
+   *   TRACE.conversion({ conversion_type: 'purchase', revenue: 49.99 });
+   *   TRACE.conversion('signup');                       // no revenue
+   *   TRACE.conversion({ type: 'lead', revenue: 10 });  // type becomes conversion_type
+   *
+   * Any extra keys (currency, order_id, ...) are passed through as params.
+   *
+   * @param {object|string} [options] - Conversion details, or just the type
+   */
+  function trackConversion(options) {
+    if (typeof options === 'string') {
+      options = { conversion_type: options };
+    }
+    options = options || {};
+
+    if (!options.conversion_type) {
+      options.conversion_type = options.type || 'conversion';
+    }
+    // Keep the payload type stable: sendEvent merges data over the envelope,
+    // and a stray type key would reclassify the event.
+    delete options.type;
+
+    sendEvent('conversion', options);
+  }
+
+  // Public API
+  window.TRACE = window.TRACE || {};
+  window.TRACE.conversion = trackConversion;
 
 })();

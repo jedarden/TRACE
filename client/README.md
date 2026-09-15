@@ -28,6 +28,48 @@ For basic pageview tracking only:
 
 ---
 
+## Conversion Tracking
+
+Conversions (with revenue) are what the attribution and Campaign ROI reports
+count — see [docs/notes/conversion-capture.md](../docs/notes/conversion-capture.md)
+for the full contract.
+
+### From the JS tag
+
+```javascript
+// After an order completes:
+TRACE.conversion({ conversion_type: 'purchase', revenue: 49.99, currency: 'USD' });
+
+// String shorthand (no revenue):
+TRACE.conversion('signup');
+
+// options.type is accepted and becomes conversion_type:
+TRACE.conversion({ type: 'lead', revenue: 10 });
+```
+
+The event is always sent as `type: 'conversion'`; the kind of conversion
+travels in `conversion_type`, and `revenue` (plus any extra keys) passes
+through as params.
+
+### Conversion pixel (no JavaScript)
+
+```html
+<img src="https://your-domain.com/c?conversion_type=purchase&revenue=49.99&sid=SESSION_ID"
+     width="1" height="1" alt="" style="display:none">
+```
+
+### Server-to-server postback
+
+```bash
+curl -X POST https://your-domain.com/c \
+  -d 'sid=sess-9&conversion_type=purchase&revenue=33.75'
+```
+
+`POST /c` accepts JSON or URL-encoded form data. Hits on `/c` default to
+conversion events even without an explicit `type` parameter.
+
+---
+
 ## Features
 
 ### JavaScript Tag Features

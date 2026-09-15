@@ -1975,6 +1975,52 @@ mod tests {
         values
     }
 
+    /// Read the params map column back out of in-memory Parquet as one
+    /// HashMap per row, so tests can assert on param content.
+    fn read_params_column(parquet_data: &[u8], column: &str) -> Vec<HashMap<String, String>> {
+        use arrow::array::{Array, MapArray, StringArray};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), parquet_data).unwrap();
+
+        let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(file.path()).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut rows = Vec::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let array = batch
+                .column_by_name(column)
+                .unwrap_or_else(|| panic!("column {} missing from Parquet schema", column));
+            let map = array
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .unwrap_or_else(|| panic!("column {} is not a Map", column));
+            for i in 0..map.len() {
+                let entries = map.value(i);
+                let keys = entries
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let vals = entries
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let mut row = HashMap::new();
+                for j in 0..keys.len() {
+                    row.insert(keys.value(j).to_string(), vals.value(j).to_string());
+                }
+                rows.push(row);
+            }
+        }
+        rows
+    }
+
     /// The enriched-events path must persist referrer into the V002 column
     /// documented in iceberg_backward_compatibility.md.
     #[test]
@@ -2053,5 +2099,131 @@ mod tests {
             read_string_column(&parquet_data, "referrer_network"),
             vec![Some("google".to_string()), None,]
         );
+    }
+
+    /// Round trip: a conversion event POSTed by the JS tag (raw collector
+    /// log line -> raw log parser -> Parquet) must come out with
+    /// type = 'conversion' and its conversion_type and revenue intact in
+    /// params — exactly what the attribution queries read.
+    #[test]
+    fn test_conversion_round_trip_tag_event_to_parquet() {
+        let line = r#"{
+            "ts": "2026-05-08T14:40:00Z",
+            "method": "POST",
+            "path": "/e",
+            "headers": {
+                "user_agent": "Mozilla/5.0"
+            },
+            "query_params": null,
+            "body": "{\"type\":\"conversion\",\"sid\":\"sess-123\",\"uid\":\"user-456\",\"conversion_type\":\"purchase\",\"revenue\":49.99,\"currency\":\"USD\",\"utm_source\":\"taboola\",\"utm_campaign\":\"camp-1\"}",
+            "client_ip": "1.2.3.4"
+        }"#;
+
+        let event = raw_log_parser::RawLogParser::parse_line(line).unwrap();
+        assert_eq!(event.event_type, raw_log_parser::EventType::Conversion);
+
+        let parquet_data = parsed_events_to_parquet(vec![event]).unwrap();
+
+        assert_eq!(
+            read_string_column(&parquet_data, "type"),
+            vec![Some("conversion".to_string())]
+        );
+        assert_eq!(
+            read_string_column(&parquet_data, "session_id"),
+            vec![Some("sess-123".to_string())]
+        );
+
+        let params = read_params_column(&parquet_data, "params");
+        assert_eq!(params.len(), 1);
+        assert_eq!(
+            params[0].get("conversion_type").map(String::as_str),
+            Some("purchase")
+        );
+        assert_eq!(params[0].get("revenue").map(String::as_str), Some("49.99"));
+        assert_eq!(
+            params[0].get("utm_source").map(String::as_str),
+            Some("taboola")
+        );
+        assert_eq!(
+            params[0].get("utm_campaign").map(String::as_str),
+            Some("camp-1")
+        );
+    }
+
+    /// Round trip: a bare conversion pixel/postback hit on /c defaults to
+    /// type = 'conversion' in the Parquet output even with no type param.
+    #[test]
+    fn test_conversion_round_trip_pixel_postback_to_parquet() {
+        let line = r#"{
+            "ts": "2026-05-08T14:41:00Z",
+            "method": "GET",
+            "path": "/c",
+            "headers": {},
+            "query_params": "sid=sess-9&uid=user-9&conversion_type=lead&revenue=12.50",
+            "body": null
+        }"#;
+
+        let event = raw_log_parser::RawLogParser::parse_line(line).unwrap();
+        assert_eq!(event.event_type, raw_log_parser::EventType::Conversion);
+
+        let parquet_data = parsed_events_to_parquet(vec![event]).unwrap();
+
+        assert_eq!(
+            read_string_column(&parquet_data, "type"),
+            vec![Some("conversion".to_string())]
+        );
+        let params = read_params_column(&parquet_data, "params");
+        assert_eq!(params[0].get("revenue").map(String::as_str), Some("12.50"));
+        assert_eq!(
+            params[0].get("conversion_type").map(String::as_str),
+            Some("lead")
+        );
+    }
+
+    /// Malformed revenue must not reach ad_events: one bad value would fail
+    /// the ::DECIMAL cast in every documented attribution query.
+    #[test]
+    fn test_conversion_round_trip_drops_bad_revenue() {
+        let line = r#"{
+            "ts": "2026-05-08T14:42:00Z",
+            "method": "POST",
+            "path": "/e",
+            "headers": {},
+            "body": "{\"type\":\"conversion\",\"sid\":\"sess-1\",\"conversion_type\":\"purchase\",\"revenue\":\"not-a-number\"}"
+        }"#;
+
+        let event = raw_log_parser::RawLogParser::parse_line(line).unwrap();
+
+        let parquet_data = parsed_events_to_parquet(vec![event]).unwrap();
+        assert_eq!(
+            read_string_column(&parquet_data, "type"),
+            vec![Some("conversion".to_string())]
+        );
+        let params = read_params_column(&parquet_data, "params");
+        assert!(!params[0].contains_key("revenue"));
+        assert_eq!(
+            params[0].get("conversion_type").map(String::as_str),
+            Some("purchase")
+        );
+    }
+
+    /// Conversion events partition under type=conversion/ like every other
+    /// event type (batch key format).
+    #[test]
+    fn test_conversion_partition_key() {
+        let config = BatchConfig::default();
+        let mut accumulator = BatchAccumulator::new(config);
+
+        accumulator.add(
+            "conversion".to_string(),
+            "2026-05-08".to_string(),
+            "14".to_string(),
+            vec![0u8; 100],
+            PathBuf::from("/tmp/test-conversion.jsonl.gz"),
+        );
+
+        let entries = accumulator.drain();
+        let key = entries.keys().next().unwrap();
+        assert!(key.starts_with("conversion/date=2026-05-08/hour=14/"));
     }
 }

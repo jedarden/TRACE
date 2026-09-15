@@ -4,10 +4,17 @@
 //! No parsing at collection time - all enrichment happens downstream.
 //!
 //! Design:
-//! - HTTP server accepting raw requests (pageviews, clicks, dwell heartbeats)
+//! - HTTP server accepting raw requests (pageviews, clicks, dwell heartbeats,
+//!   conversions)
 //! - Log-first: append raw requests to rotating log files per hour (UTC)
 //! - No parsing at collection time
 //! - Must handle 100 rps on single core
+//!
+//! Endpoints:
+//! - `POST /e`      - JSON event body (JS tag)
+//! - `GET /p`       - query-string pixel (pageviews)
+//! - `GET/POST /c`  - conversion pixel / server-to-server postback
+//! - `GET/POST /collect` - combined endpoint
 
 mod log_writer;
 
@@ -17,7 +24,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal;
@@ -27,7 +34,7 @@ use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Raw HTTP request captured as-is
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawRequest {
     /// ISO 8601 timestamp when request was received
     ts: String,
@@ -46,7 +53,7 @@ struct RawRequest {
 }
 
 /// Headers we capture from the request
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawHeaders {
     user_agent: Option<String>,
     referer: Option<String>,
@@ -136,24 +143,7 @@ async fn collect_get(
     uri: Uri,
     headers: HeaderMap,
 ) -> PixelResponse {
-    let query_string = uri.query().map(|s| s.to_string());
-    let raw = RawRequest {
-        ts: Utc::now().to_rfc3339(),
-        method: "GET".to_string(),
-        path: format!(
-            "/p{}",
-            uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("")
-        ),
-        headers: extract_headers(&headers),
-        query_params: query_string,
-        body: None,
-        client_ip: extract_client_ip(&headers),
-    };
-
-    if let Err(e) = write_raw_request(&state, &raw).await {
-        error!("Failed to write request: {}", e);
-    }
-
+    record_request(&state, "GET", &uri, &headers, None).await;
     PixelResponse
 }
 
@@ -164,25 +154,58 @@ async fn collect_post(
     headers: HeaderMap,
     body: String,
 ) -> impl IntoResponse {
-    let query_string = uri.query().map(|s| s.to_string());
+    record_request(&state, "POST", &uri, &headers, Some(body)).await;
+    StatusCode::NO_CONTENT
+}
+
+/// GET /c - Conversion pixel. Query string carries the conversion details
+/// (conversion_type, revenue) plus IDs and any passthrough parameters. The
+/// flusher defaults hits on /c to type = 'conversion', so the pixel works
+/// even without an explicit type parameter.
+async fn collect_conversion_get(
+    State(state): State<CollectorState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> PixelResponse {
+    record_request(&state, "GET", &uri, &headers, None).await;
+    PixelResponse
+}
+
+/// POST /c - Conversion postback for server-to-server calls (ad networks,
+/// order webhooks). Body may be JSON or URL-encoded form data; both are
+/// stored raw and parsed downstream.
+async fn collect_conversion_post(
+    State(state): State<CollectorState>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: String,
+) -> impl IntoResponse {
+    record_request(&state, "POST", &uri, &headers, Some(body)).await;
+    StatusCode::NO_CONTENT
+}
+
+/// Record a raw request to the log. The request target is kept verbatim:
+/// `path` stores the URL path and `query_params` the raw query string.
+async fn record_request(
+    state: &CollectorState,
+    method: &str,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: Option<String>,
+) {
     let raw = RawRequest {
         ts: Utc::now().to_rfc3339(),
-        method: "POST".to_string(),
-        path: format!(
-            "/e{}",
-            uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("")
-        ),
-        headers: extract_headers(&headers),
-        query_params: query_string,
-        body: Some(body),
-        client_ip: extract_client_ip(&headers),
+        method: method.to_string(),
+        path: uri.path().to_string(),
+        headers: extract_headers(headers),
+        query_params: uri.query().map(|s| s.to_string()),
+        body,
+        client_ip: extract_client_ip(headers),
     };
 
-    if let Err(e) = write_raw_request(&state, &raw).await {
+    if let Err(e) = write_raw_request(state, &raw).await {
         error!("Failed to write request: {}", e);
     }
-
-    StatusCode::NO_CONTENT
 }
 
 /// Health check endpoint
@@ -271,6 +294,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/e", axum::routing::post(collect_post))
         .route("/p", axum::routing::get(collect_get))
         .route(
+            "/c",
+            axum::routing::get(collect_conversion_get).post(collect_conversion_post),
+        )
+        .route(
             "/collect",
             axum::routing::get(collect_get).post(collect_post),
         )
@@ -293,6 +320,8 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+    use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn test_extract_headers_captures_referer() {
@@ -317,5 +346,106 @@ mod tests {
         let raw = extract_headers(&headers);
 
         assert_eq!(raw.referer, None);
+    }
+
+    /// Build collector state writing into a temp dir, and a helper that
+    /// reads back the single logged RawRequest after flushing the buffer.
+    fn test_state() -> (CollectorState, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let writer = log_writer::LogFileWriter::new(dir.path().to_path_buf()).unwrap();
+        let state = CollectorState {
+            log_writer: Arc::new(Mutex::new(writer)),
+        };
+        (state, dir)
+    }
+
+    /// Flush the buffered writer and deserialize the one logged request.
+    fn read_logged_request(dir: &TempDir) -> RawRequest {
+        let mut log_path = None;
+        for entry in fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("raw-") && name.ends_with(".jsonl") {
+                log_path = Some(entry.path());
+            }
+        }
+        let log_path = log_path.expect("no raw log file written");
+
+        let content = fs::read_to_string(log_path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1, "expected exactly one logged request");
+        serde_json::from_str(lines[0]).unwrap()
+    }
+
+    /// The conversion pixel logs the request target verbatim so the flusher
+    /// can (a) default the event to type=conversion via the /c path and
+    /// (b) read revenue and conversion_type from the query string.
+    #[tokio::test]
+    async fn test_conversion_pixel_request_is_logged() {
+        let (state, dir) = test_state();
+
+        let uri = Uri::from_static(
+            "/c?type=conversion&conversion_type=purchase&revenue=49.99&sid=sess-1",
+        );
+        collect_conversion_get(State(state.clone()), uri, HeaderMap::new()).await;
+
+        state.log_writer.lock().await.flush().unwrap();
+        let raw = read_logged_request(&dir);
+
+        assert_eq!(raw.method, "GET");
+        assert_eq!(raw.path, "/c");
+        assert_eq!(
+            raw.query_params.as_deref(),
+            Some("type=conversion&conversion_type=purchase&revenue=49.99&sid=sess-1")
+        );
+    }
+
+    /// The conversion postback logs the body raw (JSON or form data) for
+    /// downstream parsing.
+    #[tokio::test]
+    async fn test_conversion_postback_body_is_logged() {
+        let (state, dir) = test_state();
+
+        let uri = Uri::from_static("/c");
+        let body =
+            r#"{"type":"conversion","conversion_type":"purchase","revenue":33.75,"sid":"sess-9"}"#;
+        collect_conversion_post(
+            State(state.clone()),
+            uri,
+            HeaderMap::new(),
+            body.to_string(),
+        )
+        .await;
+
+        state.log_writer.lock().await.flush().unwrap();
+        let raw = read_logged_request(&dir);
+
+        assert_eq!(raw.method, "POST");
+        assert_eq!(raw.path, "/c");
+        assert_eq!(raw.body.as_deref(), Some(body));
+    }
+
+    /// Regular endpoints keep their recorded shape: the path is the URL
+    /// path alone (no doubled prefix) and the query string is separate.
+    #[tokio::test]
+    async fn test_pixel_and_event_requests_record_path_and_query() {
+        let (state, dir) = test_state();
+
+        collect_get(
+            State(state.clone()),
+            Uri::from_static("/p?url=https%3A%2F%2Fexample.com&type=pageview"),
+            HeaderMap::new(),
+        )
+        .await;
+
+        state.log_writer.lock().await.flush().unwrap();
+        let raw = read_logged_request(&dir);
+
+        assert_eq!(raw.path, "/p");
+        assert_eq!(
+            raw.query_params.as_deref(),
+            Some("url=https%3A%2F%2Fexample.com&type=pageview")
+        );
+        assert_eq!(raw.body, None);
     }
 }
