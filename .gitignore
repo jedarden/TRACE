@@ -23,6 +23,7 @@ Thumbs.db
 
 # Build artifacts in subdirectories
 **/target/
+client/node_modules/
 !.beads/issues.jsonl
 
 # bead-rs store: the durable artefact is the checkpoint plus config.json.

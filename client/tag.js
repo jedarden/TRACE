@@ -6,6 +6,7 @@
  * - Pageview on DOMContentLoaded (captures all query params including UTM)
  * - Dwell heartbeat every 30 seconds
  * - Click tracking on outbound links
+ * - Scroll depth tracking (25/50/75/100% thresholds)
  * - Sends POST to /e endpoint with JSON payload
  * - Async, non-blocking, <2KB
  *
@@ -65,7 +66,7 @@
 
   /**
    * Send event to collector
-   * @param {string} type - Event type (pageview, dwell, click)
+   * @param {string} type - Event type (pageview, dwell, click, scroll)
    * @param {object} data - Event data
    */
   function sendEvent(type, data) {
@@ -180,6 +181,58 @@
     });
   }
 
+  // Scroll depth tracking: fire a scroll event once per threshold reached
+  var scrollThresholds = [25, 50, 75, 100];
+  var sentThresholds = {};
+  var maxScrollDepth = 0;
+  var scrollTimer = null;
+
+  /**
+   * Compute current scroll depth and emit a scroll event for each
+   * newly-reached threshold
+   */
+  function computeScrollDepth() {
+    scrollTimer = null;
+
+    var doc = document.documentElement;
+    var scrollable = doc.scrollHeight - window.innerHeight;
+
+    // A page shorter than the viewport counts as fully viewed
+    var pct = scrollable > 0
+      ? Math.round((window.pageYOffset / scrollable) * 100)
+      : 100;
+    if (pct > 100) {
+      pct = 100;
+    }
+
+    if (pct > maxScrollDepth) {
+      maxScrollDepth = pct;
+    }
+
+    for (var i = 0; i < scrollThresholds.length; i++) {
+      var threshold = scrollThresholds[i];
+      if (maxScrollDepth >= threshold && !sentThresholds[threshold]) {
+        sentThresholds[threshold] = true;
+        sendEvent('scroll', {
+          scroll_depth: threshold,
+          max_scroll_depth: maxScrollDepth
+        });
+      }
+    }
+  }
+
+  /**
+   * Track scroll depth (trailing-edge throttled)
+   */
+  function trackScrollDepth() {
+    window.addEventListener('scroll', function() {
+      if (scrollTimer) {
+        clearTimeout(scrollTimer);
+      }
+      scrollTimer = setTimeout(computeScrollDepth, 100);
+    });
+  }
+
   /**
    * Initialize tracking
    */
@@ -189,6 +242,9 @@
 
     // Start heartbeat (every 30 seconds)
     heartbeatTimer = setInterval(sendHeartbeat, 30000);
+
+    // Track scroll depth thresholds
+    trackScrollDepth();
   }
 
   // Wait for DOM to be ready
