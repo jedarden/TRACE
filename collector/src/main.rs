@@ -305,7 +305,8 @@ async fn main() -> anyhow::Result<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+    let port = std::env::var("TRACE_PORT").unwrap_or_else(|_| "8080".to_string());
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
     info!("TRACE collector listening on {}", listener.local_addr()?);
 
     axum::serve(listener, app)
