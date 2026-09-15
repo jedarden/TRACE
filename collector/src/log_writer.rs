@@ -8,8 +8,8 @@ use anyhow::Result;
 use chrono::Utc;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
-use tracing::{debug, info, warn};
+use std::path::{Path, PathBuf};
+use tracing::{debug, info};
 
 /// Current hour key for file rotation (UTC)
 fn current_hour_key() -> String {
@@ -17,12 +17,12 @@ fn current_hour_key() -> String {
 }
 
 /// Get log file path for a given hour key
-fn log_file_path(log_dir: &PathBuf, hour_key: &str) -> PathBuf {
+fn log_file_path(log_dir: &Path, hour_key: &str) -> PathBuf {
     log_dir.join(format!("raw-{}.jsonl", hour_key))
 }
 
 /// Get ready file path (signals Flusher to process)
-fn ready_file_path(log_dir: &PathBuf, hour_key: &str) -> PathBuf {
+fn ready_file_path(log_dir: &Path, hour_key: &str) -> PathBuf {
     log_dir.join(format!("raw-{}.jsonl.ready", hour_key))
 }
 
@@ -52,7 +52,7 @@ impl LogFileWriter {
     }
 
     /// Open a new log file for writing
-    fn open_log_file(log_dir: &PathBuf, hour_key: &str) -> Result<BufWriter<File>> {
+    fn open_log_file(log_dir: &Path, hour_key: &str) -> Result<BufWriter<File>> {
         let path = log_file_path(log_dir, hour_key);
 
         // Create parent directory if it doesn't exist
@@ -61,10 +61,7 @@ impl LogFileWriter {
         }
 
         // Open file in append mode, create if it doesn't exist
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
         debug!("Opened log file: {}", path.display());
 
@@ -101,10 +98,7 @@ impl LogFileWriter {
     /// 3. Rename to .ready to signal Flusher
     /// 4. Open new file for new hour
     fn rotate(&mut self, new_hour: &str) -> Result<()> {
-        info!(
-            "Rotating log files: {} -> {}",
-            self.current_hour, new_hour
-        );
+        info!("Rotating log files: {} -> {}", self.current_hour, new_hour);
 
         // Flush and close current writer
         if let Some(mut writer) = self.writer.take() {
@@ -137,11 +131,13 @@ impl LogFileWriter {
     }
 
     /// Get the current hour key
+    #[cfg(test)]
     pub fn current_hour(&self) -> &str {
         &self.current_hour
     }
 
     /// Flush the buffer (useful for testing and immediate writes)
+    #[cfg(test)]
     pub fn flush(&mut self) -> Result<()> {
         if let Some(ref mut writer) = self.writer {
             writer.flush()?;
@@ -224,12 +220,16 @@ mod tests {
         // Write some data
         writer.write_line(r#"{"test": "before"}"#).unwrap();
 
+        // Capture the old hour BEFORE rotating — rotation renames the old
+        // hour's file to .ready (that is the signal the Flusher consumes).
+        let old_hour = writer.current_hour().to_string();
+
         // Force rotation by directly calling rotate with a new hour
-        let new_hour = format!("{}-00", &writer.current_hour()[..8]);
+        let new_hour = format!("{}-00", &old_hour[..8]);
         writer.rotate(&new_hour).unwrap();
 
-        // Check that a .ready file exists
-        let ready_path = ready_file_path(&log_dir, &writer.current_hour());
+        // Check that a .ready file exists for the rotated (old) hour
+        let ready_path = ready_file_path(&log_dir, &old_hour);
         assert!(ready_path.exists());
     }
 }

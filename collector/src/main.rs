@@ -12,7 +12,6 @@
 mod log_writer;
 
 use axum::{
-    body::Body,
     extract::State,
     http::{header, HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
@@ -80,12 +79,30 @@ fn extract_client_ip(headers: &HeaderMap) -> Option<String> {
 /// Extract relevant headers (filtered, not all headers)
 fn extract_headers(headers: &HeaderMap) -> RawHeaders {
     RawHeaders {
-        user_agent: headers.get("user-agent").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
-        referer: headers.get("referer").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
-        x_forwarded_for: headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
-        x_real_ip: headers.get("x-real-ip").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
-        accept_language: headers.get("accept-language").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
-        accept_encoding: headers.get("accept-encoding").and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
+        user_agent: headers
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+        referer: headers
+            .get("referer")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+        x_forwarded_for: headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+        x_real_ip: headers
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+        accept_language: headers
+            .get("accept-language")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+        accept_encoding: headers
+            .get("accept-encoding")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
     }
 }
 
@@ -99,11 +116,9 @@ async fn write_raw_request(state: &CollectorState, raw: &RawRequest) -> anyhow::
 
 /// 1x1 transparent GIF for pixel tracking
 const PIXEL_GIF: &[u8] = &[
-    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00,
-    0x01, 0x00, 0x80, 0x00, 0x00, 0xFF, 0xFF, 0xFF,
-    0x00, 0x00, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00,
-    0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x04,
-    0x01, 0x00, 0x3B
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0xFF, 0xFF, 0xFF,
+    0x00, 0x00, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x04,
+    0x01, 0x00, 0x3B,
 ];
 
 /// Response wrapper for pixel GIF
@@ -111,11 +126,7 @@ struct PixelResponse;
 
 impl IntoResponse for PixelResponse {
     fn into_response(self) -> Response {
-        (
-            [(header::CONTENT_TYPE, "image/gif")],
-            PIXEL_GIF,
-        )
-            .into_response()
+        ([(header::CONTENT_TYPE, "image/gif")], PIXEL_GIF).into_response()
     }
 }
 
@@ -129,7 +140,10 @@ async fn collect_get(
     let raw = RawRequest {
         ts: Utc::now().to_rfc3339(),
         method: "GET".to_string(),
-        path: format!("/p{}", uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("")),
+        path: format!(
+            "/p{}",
+            uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("")
+        ),
         headers: extract_headers(&headers),
         query_params: query_string,
         body: None,
@@ -154,7 +168,10 @@ async fn collect_post(
     let raw = RawRequest {
         ts: Utc::now().to_rfc3339(),
         method: "POST".to_string(),
-        path: format!("/e{}", uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("")),
+        path: format!(
+            "/e{}",
+            uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("")
+        ),
         headers: extract_headers(&headers),
         query_params: query_string,
         body: Some(body),
@@ -216,9 +233,8 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let log_dir = PathBuf::from(
-        std::env::var("TRACE_LOG_DIR").unwrap_or_else(|_| "/data/logs".to_string())
-    );
+    let log_dir =
+        PathBuf::from(std::env::var("TRACE_LOG_DIR").unwrap_or_else(|_| "/data/logs".to_string()));
 
     // Create log directory if it doesn't exist
     tokio::fs::create_dir_all(&log_dir).await?;
@@ -254,10 +270,13 @@ async fn main() -> anyhow::Result<()> {
     let app = axum::Router::new()
         .route("/e", axum::routing::post(collect_post))
         .route("/p", axum::routing::get(collect_get))
-        .route("/collect", axum::routing::get(collect_get).post(collect_post))
+        .route(
+            "/collect",
+            axum::routing::get(collect_get).post(collect_post),
+        )
         .route("/health", axum::routing::get(health))
         .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
     info!("TRACE collector listening on {}", listener.local_addr()?);
@@ -268,4 +287,35 @@ async fn main() -> anyhow::Result<()> {
 
     info!("TRACE collector shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn test_extract_headers_captures_referer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", HeaderValue::from_static("Mozilla/5.0"));
+        headers.insert(
+            "referer",
+            HeaderValue::from_static("https://taboola.com/story"),
+        );
+
+        let raw = extract_headers(&headers);
+
+        assert_eq!(raw.referer, Some("https://taboola.com/story".to_string()));
+        assert_eq!(raw.user_agent, Some("Mozilla/5.0".to_string()));
+    }
+
+    #[test]
+    fn test_extract_headers_without_referer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", HeaderValue::from_static("Mozilla/5.0"));
+
+        let raw = extract_headers(&headers);
+
+        assert_eq!(raw.referer, None);
+    }
 }

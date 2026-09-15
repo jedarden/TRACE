@@ -30,6 +30,13 @@ CREATE TABLE IF NOT EXISTS trace.ad_events (
     url STRING NOT NULL,
     type STRING NOT NULL,  -- pageview, click, scroll, dwell
 
+    -- Traffic source referrer (V002 — see docs/analytics/iceberg_backward_compatibility.md).
+    -- document.referrer from the JS tag (POST body / pixel query param),
+    -- falling back to the HTTP Referer header captured by the collector.
+    -- Pre-existing tables get this column via:
+    --   ALTER TABLE trace.ad_events ADD COLUMN referrer STRING DEFAULT NULL;
+    referrer STRING,
+
     -- Identity fields
     session_id STRING,
     user_id STRING,

@@ -210,9 +210,7 @@ impl Default for BatchConfig {
 struct BatchEntry {
     data: Vec<u8>,
     key: String,
-    added_at: Instant,
     source_file: PathBuf,
-    event_type: String,
 }
 
 struct BatchAccumulator {
@@ -255,16 +253,11 @@ impl BatchAccumulator {
         );
         let entry = BatchEntry {
             data,
-            key,
-            added_at: now,
+            key: key.clone(),
             source_file,
-            event_type,
         };
 
-        self.entries
-            .entry(key.clone())
-            .or_insert_with(Vec::new)
-            .push(entry);
+        self.entries.entry(key.clone()).or_default().push(entry);
         self.total_size_bytes += entry_size;
 
         self.should_flush()
@@ -341,8 +334,6 @@ fn jsonl_to_parquet(events: Vec<CollectorEvent>) -> Result<Vec<u8>> {
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
-    let n = events.len();
-
     // Build column arrays for each field
     let timestamps: Vec<i64> = events.iter().map(|e| e.ts.timestamp_millis()).collect();
     let ips: Vec<Option<String>> = events.iter().map(|e| e.ip.clone()).collect();
@@ -353,12 +344,10 @@ fn jsonl_to_parquet(events: Vec<CollectorEvent>) -> Result<Vec<u8>> {
     let user_ids: Vec<Option<String>> = events.iter().map(|e| e.user_id.clone()).collect();
     let cookie_ids: Vec<Option<String>> = events.iter().map(|e| e.cookie_id.clone()).collect();
     let networks: Vec<Option<String>> = events.iter().map(|e| e.network.clone()).collect();
-    let campaign_ids: Vec<Option<String>> =
-        events.iter().map(|e| e.campaign_id.clone()).collect();
+    let campaign_ids: Vec<Option<String>> = events.iter().map(|e| e.campaign_id.clone()).collect();
     let campaign_names: Vec<Option<String>> =
         events.iter().map(|e| e.campaign_name.clone()).collect();
-    let creative_ids: Vec<Option<String>> =
-        events.iter().map(|e| e.creative_id.clone()).collect();
+    let creative_ids: Vec<Option<String>> = events.iter().map(|e| e.creative_id.clone()).collect();
     let headlines: Vec<Option<String>> = events.iter().map(|e| e.headline.clone()).collect();
     let image_ids: Vec<Option<String>> = events.iter().map(|e| e.image_id.clone()).collect();
     let item_ids: Vec<Option<String>> = events.iter().map(|e| e.item_id.clone()).collect();
@@ -381,16 +370,13 @@ fn jsonl_to_parquet(events: Vec<CollectorEvent>) -> Result<Vec<u8>> {
         .iter()
         .map(|e| e.attribution_days_to_convert.filter(|&v| v >= 0))
         .collect();
-    let device_types: Vec<Option<String>> =
-        events.iter().map(|e| e.device_type.clone()).collect();
+    let device_types: Vec<Option<String>> = events.iter().map(|e| e.device_type.clone()).collect();
     let device_oss: Vec<Option<String>> = events.iter().map(|e| e.device_os.clone()).collect();
-    let device_browsers: Vec<Option<String>> = events
-        .iter()
-        .map(|e| e.device_browser.clone())
-        .collect();
+    let device_browsers: Vec<Option<String>> =
+        events.iter().map(|e| e.device_browser.clone()).collect();
     let scroll_depth_pcts: Vec<Option<i64>> = events
         .iter()
-        .map(|e| e.scroll_depth_pct.filter(|&v| v >= 0 && v <= 100))
+        .map(|e| e.scroll_depth_pct.filter(|&v| (0..=100).contains(&v)))
         .collect();
     let scroll_time_mss: Vec<Option<i64>> = events
         .iter()
@@ -402,7 +388,7 @@ fn jsonl_to_parquet(events: Vec<CollectorEvent>) -> Result<Vec<u8>> {
         .collect();
     let dwell_visible_pcts: Vec<Option<i64>> = events
         .iter()
-        .map(|e| e.dwell_visible_pct.filter(|&v| v >= 0 && v <= 100))
+        .map(|e| e.dwell_visible_pct.filter(|&v| (0..=100).contains(&v)))
         .collect();
     let viewport_widths: Vec<Option<i64>> = events
         .iter()
@@ -426,10 +412,8 @@ fn jsonl_to_parquet(events: Vec<CollectorEvent>) -> Result<Vec<u8>> {
         .collect();
     let is_valids: Vec<Option<bool>> = events.iter().map(|e| e.is_valid).collect();
     let is_verifieds: Vec<Option<bool>> = events.iter().map(|e| e.is_verified).collect();
-    let validation_reasons: Vec<Option<String>> = events
-        .iter()
-        .map(|e| e.validation_reason.clone())
-        .collect();
+    let validation_reasons: Vec<Option<String>> =
+        events.iter().map(|e| e.validation_reason.clone()).collect();
     let enriched_ats: Vec<Option<i64>> = events
         .iter()
         .map(|e| e.enriched_at.map(|dt| dt.timestamp_millis()))
@@ -461,28 +445,39 @@ fn jsonl_to_parquet(events: Vec<CollectorEvent>) -> Result<Vec<u8>> {
         Field::new("value", DataType::Utf8, false),
     ];
     let map_data_type = DataType::Map(
-        Arc::new(Field::new("entries", DataType::Struct(map_fields), false)),
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(map_fields.into()),
+            false,
+        )),
         false,
     );
 
     let params_array = MapArray::new(
-        Arc::new(Field::new("entries", DataType::Struct(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("value", DataType::Utf8, false),
-        ]), false)),
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", DataType::Utf8, false),
+                ]
+                .into(),
+            ),
+            false,
+        )),
         OffsetBuffer::new(params_offsets.into()),
-        Arc::new(arrow::array::StructArray::new(
-            DataType::Struct(vec![
+        arrow::array::StructArray::new(
+            vec![
                 Field::new("key", DataType::Utf8, false),
                 Field::new("value", DataType::Utf8, false),
-            ])
+            ]
             .into(),
             vec![
                 Arc::new(StringArray::from(all_params_keys)),
                 Arc::new(StringArray::from(all_params_values)),
             ],
             None,
-        )),
+        ),
         None,
         false,
     );
@@ -618,10 +613,8 @@ fn parsed_events_to_parquet(events: Vec<raw_log_parser::Event>) -> Result<Vec<u8
     let user_ids: Vec<Option<String>> = events.iter().map(|e| e.user_id.clone()).collect();
     let cookie_ids: Vec<Option<String>> = events.iter().map(|e| e.cookie_id.clone()).collect();
     let referrers: Vec<Option<String>> = events.iter().map(|e| e.referer.clone()).collect();
-    let referrer_networks: Vec<Option<String>> = events
-        .iter()
-        .map(|e| e.referrer_network.clone())
-        .collect();
+    let referrer_networks: Vec<Option<String>> =
+        events.iter().map(|e| e.referrer_network.clone()).collect();
 
     // All other fields are None for raw events (not enriched yet)
     let networks: Vec<Option<String>> = vec![None; n];
@@ -674,28 +667,39 @@ fn parsed_events_to_parquet(events: Vec<raw_log_parser::Event>) -> Result<Vec<u8
         Field::new("value", DataType::Utf8, false),
     ];
     let map_data_type = DataType::Map(
-        Arc::new(Field::new("entries", DataType::Struct(map_fields), false)),
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(map_fields.into()),
+            false,
+        )),
         false,
     );
 
     let params_array = MapArray::new(
-        Arc::new(Field::new("entries", DataType::Struct(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("value", DataType::Utf8, false),
-        ]), false)),
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", DataType::Utf8, false),
+                ]
+                .into(),
+            ),
+            false,
+        )),
         OffsetBuffer::new(params_offsets.into()),
-        Arc::new(arrow::array::StructArray::new(
-            DataType::Struct(vec![
+        arrow::array::StructArray::new(
+            vec![
                 Field::new("key", DataType::Utf8, false),
                 Field::new("value", DataType::Utf8, false),
-            ])
+            ]
             .into(),
             vec![
                 Arc::new(StringArray::from(all_params_keys)),
                 Arc::new(StringArray::from(all_params_values)),
             ],
             None,
-        )),
+        ),
         None,
         false,
     );
@@ -830,7 +834,7 @@ async fn process_file(state: &FlusherState, path: &PathBuf) -> Result<AddedToBat
         if let Ok(event) = serde_json::from_str::<CollectorEvent>(&line) {
             events_by_type
                 .entry(event.event_type.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(event);
         } else {
             warn!("Skipping invalid JSON line in {}", filename);
@@ -954,10 +958,7 @@ async fn process_raw_log_file(state: &FlusherState, path: &PathBuf) -> Result<Ad
         match raw_log_parser::RawLogParser::parse_line(&line) {
             Ok(event) => {
                 let event_type = event.event_type.as_str().to_string();
-                events_by_type
-                    .entry(event_type)
-                    .or_insert_with(Vec::new)
-                    .push(event);
+                events_by_type.entry(event_type).or_default().push(event);
                 parsed_count += 1;
             }
             Err(e) => {
@@ -971,7 +972,11 @@ async fn process_raw_log_file(state: &FlusherState, path: &PathBuf) -> Result<Ad
     }
 
     if error_count > 10 {
-        warn!("... and {} more parse errors in {}", error_count - 10, filename);
+        warn!(
+            "... and {} more parse errors in {}",
+            error_count - 10,
+            filename
+        );
     }
 
     if events_by_type.is_empty() {
@@ -1062,7 +1067,7 @@ async fn flush_batch(state: &FlusherState, reason: &str) -> Result<()> {
     let mut upload_errors = Vec::new();
 
     // Upload all entries to S3
-    for (partition_key, entries) in &entries {
+    for entries in entries.values() {
         for entry in entries {
             match state.s3.upload(&entry.key, entry.data.clone()).await {
                 Ok(()) => {
@@ -1077,13 +1082,16 @@ async fn flush_batch(state: &FlusherState, reason: &str) -> Result<()> {
     }
 
     // Delete source files for successful uploads
-    for (partition_key, entries) in &entries {
+    for entries in entries.values() {
         for entry in entries {
             // Only delete if upload succeeded (not in errors list)
             let had_error = upload_errors.iter().any(|(e, _)| e.key == entry.key);
             if !had_error {
                 if let Err(e) = tokio::fs::remove_file(&entry.source_file).await {
-                    warn!("Failed to remove source file {:?}: {}", entry.source_file, e);
+                    warn!(
+                        "Failed to remove source file {:?}: {}",
+                        entry.source_file, e
+                    );
                 } else {
                     debug!("Removed source file: {:?}", entry.source_file);
                 }
@@ -1148,8 +1156,8 @@ async fn handle_file(state: Arc<FlusherState>, path: PathBuf) {
     }
 
     // Determine file type and process accordingly
-    let is_raw_log = filename.starts_with("raw-") &&
-        (filename.ends_with(".jsonl") || filename.ends_with(".jsonl.ready"));
+    let is_raw_log = filename.starts_with("raw-")
+        && (filename.ends_with(".jsonl") || filename.ends_with(".jsonl.ready"));
     let is_enriched_log = filename.ends_with(".jsonl.gz");
 
     if !is_raw_log && !is_enriched_log {
@@ -1353,11 +1361,12 @@ async fn main() -> Result<()> {
     info!("TRACE flusher running");
 
     // Wait for shutdown signal
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("Received shutdown signal");
         }
-        _ = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?.recv() => {
+        _ = sigterm.recv() => {
             info!("Received TERM signal");
         }
     }
@@ -1420,34 +1429,36 @@ mod tests {
         }
     }
 
+    /// Minimal CollectorEvent for tests. ts/url/type are the only required
+    /// schema fields; every other field is Option and defaults to None when
+    /// absent from the JSON, so tests override just what they assert on.
+    fn base_event(ts: &str, url: &str) -> CollectorEvent {
+        serde_json::from_str(&format!(
+            r#"{{"ts":"{ts}","url":"{url}","type":"unknown"}}"#
+        ))
+        .unwrap()
+    }
+
     #[test]
     fn test_jsonl_to_parquet_conversion() {
         let events = vec![
             CollectorEvent {
-                ts: DateTime::parse_from_rfc3339("2026-05-08T14:30:00Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
                 ip: Some("1.2.3.4".to_string()),
                 ua: Some("Mozilla/5.0".to_string()),
-                url: "https://example.com?utm_source=test".to_string(),
                 params: vec![("utm_source".to_string(), "test".to_string())]
                     .into_iter()
                     .collect(),
                 event_type: "pageview".to_string(),
                 session_id: Some("sess-abc-123".to_string()),
                 user_id: Some("user-xyz-789".to_string()),
+                ..base_event(
+                    "2026-05-08T14:30:00Z",
+                    "https://example.com?utm_source=test",
+                )
             },
             CollectorEvent {
-                ts: DateTime::parse_from_rfc3339("2026-05-08T14:31:00Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-                ip: None,
-                ua: None,
-                url: "https://example.com/page2".to_string(),
-                params: HashMap::new(),
                 event_type: "click".to_string(),
-                session_id: None,
-                user_id: None,
+                ..base_event("2026-05-08T14:31:00Z", "https://example.com/page2")
             },
         ];
 
@@ -1479,8 +1490,11 @@ mod tests {
         );
     }
 
+    /// Captured uploads: (key, payload) pairs
+    type UploadLog = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+
     struct MockS3Upload {
-        uploads: std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>,
+        uploads: UploadLog,
     }
 
     impl MockS3Upload {
@@ -1650,42 +1664,41 @@ mod tests {
         params.insert("tb_headline".to_string(), "Click Here".to_string());
 
         let events = vec![CollectorEvent {
-            ts: DateTime::parse_from_rfc3339("2026-05-08T14:30:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
             ip: Some("1.2.3.4".to_string()),
             ua: Some("Mozilla/5.0".to_string()),
-            url: "https://example.com".to_string(),
             params,
             event_type: "click".to_string(),
             session_id: Some("sess-123".to_string()),
             user_id: Some("user-456".to_string()),
+            ..base_event("2026-05-08T14:30:00Z", "https://example.com")
         }];
 
         let result = jsonl_to_parquet(events);
-        assert!(result.is_ok(), "Parquet conversion with params failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Parquet conversion with params failed: {:?}",
+            result.err()
+        );
 
         let parquet_data = result.unwrap();
-        assert!(!parquet_data.is_empty(), "Parquet data with params should not be empty");
+        assert!(
+            !parquet_data.is_empty(),
+            "Parquet data with params should not be empty"
+        );
     }
 
     #[test]
     fn test_jsonl_to_parquet_empty_params() {
         let events = vec![CollectorEvent {
-            ts: DateTime::parse_from_rfc3339("2026-05-08T14:30:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-            ip: Some("1.2.3.4".to_string()),
-            ua: Some("Mozilla/5.0".to_string()),
-            url: "https://example.com".to_string(),
-            params: HashMap::new(),
             event_type: "pageview".to_string(),
-            session_id: None,
-            user_id: None,
+            ..base_event("2026-05-08T14:30:00Z", "https://example.com")
         }];
 
         let result = jsonl_to_parquet(events);
-        assert!(result.is_ok(), "Parquet conversion with empty params failed");
+        assert!(
+            result.is_ok(),
+            "Parquet conversion with empty params failed"
+        );
     }
 
     #[test]
@@ -1712,8 +1725,8 @@ mod tests {
         assert!(key.ends_with(".parquet"));
 
         // Verify UUID format in filename (36 chars for UUID + .parquet extension)
-        let filename = key.split('/').last().unwrap();
-        assert!(filename.len() == 41); // 36 for UUID + 5 for ".parquet"
+        let filename = key.split('/').next_back().unwrap();
+        assert!(filename.len() == 44); // 36 for UUID + 8 for ".parquet"
     }
 
     #[test]
@@ -1883,10 +1896,17 @@ mod tests {
         }];
 
         let result = parsed_events_to_parquet(events);
-        assert!(result.is_ok(), "Parquet conversion with heartbeat failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Parquet conversion with heartbeat failed: {:?}",
+            result.err()
+        );
 
         let parquet_data = result.unwrap();
-        assert!(!parquet_data.is_empty(), "Parquet data with heartbeat should not be empty");
+        assert!(
+            !parquet_data.is_empty(),
+            "Parquet data with heartbeat should not be empty"
+        );
     }
 
     #[test]
@@ -1910,9 +1930,128 @@ mod tests {
         }];
 
         let result = parsed_events_to_parquet(events);
-        assert!(result.is_ok(), "Parquet conversion with referrer network failed");
+        assert!(
+            result.is_ok(),
+            "Parquet conversion with referrer network failed"
+        );
 
         let parquet_data = result.unwrap();
         assert!(!parquet_data.is_empty());
+    }
+
+    /// Read a nullable UTF8 column back out of in-memory Parquet produced by
+    /// the converters, so tests can assert on column content rather than
+    /// just on successful conversion.
+    fn read_string_column(parquet_data: &[u8], column: &str) -> Vec<Option<String>> {
+        use arrow::array::{Array, StringArray};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), parquet_data).unwrap();
+
+        let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(file.path()).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut values = Vec::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let array = batch
+                .column_by_name(column)
+                .unwrap_or_else(|| panic!("column {} missing from Parquet schema", column));
+            let strings = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap_or_else(|| panic!("column {} is not Utf8", column));
+            for i in 0..strings.len() {
+                values.push(if strings.is_null(i) {
+                    None
+                } else {
+                    Some(strings.value(i).to_string())
+                });
+            }
+        }
+        values
+    }
+
+    /// The enriched-events path must persist referrer into the V002 column
+    /// documented in iceberg_backward_compatibility.md.
+    #[test]
+    fn test_jsonl_to_parquet_referrer_column() {
+        let events = vec![
+            CollectorEvent {
+                referrer: Some("https://taboola.com/story".to_string()),
+                event_type: "pageview".to_string(),
+                ..base_event("2026-05-08T14:30:00Z", "https://example.com")
+            },
+            CollectorEvent {
+                event_type: "pageview".to_string(),
+                ..base_event("2026-05-08T14:31:00Z", "https://example.com/page2")
+            },
+        ];
+
+        let parquet_data = jsonl_to_parquet(events).unwrap();
+        let referrers = read_string_column(&parquet_data, "referrer");
+
+        assert_eq!(
+            referrers,
+            vec![Some("https://taboola.com/story".to_string()), None,]
+        );
+    }
+
+    /// The raw-log path (document.referrer from the tag, or the collector's
+    /// Referer header, resolved by the raw log parser) must land in the same
+    /// referrer column.
+    #[test]
+    fn test_parsed_events_to_parquet_referrer_column() {
+        use raw_log_parser::{Event, EventType};
+
+        let events = vec![
+            Event {
+                ts: DateTime::parse_from_rfc3339("2026-05-08T14:30:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                ip: Some("1.2.3.4".to_string()),
+                ua: Some("Mozilla/5.0".to_string()),
+                url: "https://example.com".to_string(),
+                event_type: EventType::Pageview,
+                params: HashMap::new(),
+                session_id: Some("sess-123".to_string()),
+                user_id: None,
+                cookie_id: None,
+                referer: Some("https://www.google.com/search?q=test".to_string()),
+                referrer_network: Some("google".to_string()),
+            },
+            Event {
+                ts: DateTime::parse_from_rfc3339("2026-05-08T14:31:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                ip: None,
+                ua: None,
+                url: "https://example.com/page2".to_string(),
+                event_type: EventType::Click,
+                params: HashMap::new(),
+                session_id: None,
+                user_id: None,
+                cookie_id: None,
+                referer: None,
+                referrer_network: None,
+            },
+        ];
+
+        let parquet_data = parsed_events_to_parquet(events).unwrap();
+
+        assert_eq!(
+            read_string_column(&parquet_data, "referrer"),
+            vec![
+                Some("https://www.google.com/search?q=test".to_string()),
+                None,
+            ]
+        );
+        assert_eq!(
+            read_string_column(&parquet_data, "referrer_network"),
+            vec![Some("google".to_string()), None,]
+        );
     }
 }

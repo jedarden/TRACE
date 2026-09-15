@@ -59,6 +59,8 @@ pub enum EventType {
     Heartbeat,
     /// Outbound link click
     Click,
+    /// Scroll depth threshold reached
+    Scroll,
     /// Unknown event type
     Unknown,
 }
@@ -70,6 +72,7 @@ impl EventType {
             "pageview" | "load" | "pv" => EventType::Pageview,
             "dwell" | "heartbeat" => EventType::Heartbeat,
             "click" => EventType::Click,
+            "scroll" => EventType::Scroll,
             _ => EventType::Unknown,
         }
     }
@@ -80,6 +83,7 @@ impl EventType {
             EventType::Pageview => "pageview",
             EventType::Heartbeat => "heartbeat",
             EventType::Click => "click",
+            EventType::Scroll => "scroll",
             EventType::Unknown => "unknown",
         }
     }
@@ -115,6 +119,16 @@ pub struct Event {
 /// Parser for raw collector log lines
 pub struct RawLogParser;
 
+/// Components extracted from a request: event type, params, and the
+/// session, user, and cookie IDs
+type ParsedRequest = (
+    EventType,
+    HashMap<String, String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 impl RawLogParser {
     /// Parse a single JSON line into an Event
     pub fn parse_line(line: &str) -> Result<Event> {
@@ -122,7 +136,7 @@ impl RawLogParser {
             serde_json::from_str(line).context("Failed to parse RawRequest JSON")?;
 
         // Parse timestamp
-        let ts = DateTime::<Utc>::parse_from_rfc3339(&raw.ts)
+        let ts = DateTime::parse_from_rfc3339(&raw.ts)
             .context("Failed to parse timestamp")?
             .with_timezone(&Utc);
 
@@ -147,16 +161,25 @@ impl RawLogParser {
 
         // Determine event type and extract data based on method
         let (event_type, params, session_id, user_id, cookie_id) = match raw.method.as_str() {
-            "POST" => Self::parse_post_request(&raw.body, &raw.path)?,
-            "GET" => Self::parse_get_request(&raw.query_params, &raw.path)?,
+            "POST" => Self::parse_post_request(&raw.body)?,
+            "GET" => Self::parse_get_request(&raw.query_params)?,
             _ => (EventType::Unknown, HashMap::new(), None, None, None),
         };
 
         // Build URL from path and params
         let url = Self::build_url(&raw.path, &params);
 
-        // Extract referer
-        let referer = raw.headers.referer;
+        // Extract referer. The tag's document.referrer (sent in the POST body
+        // or the GET query string) is the actual traffic source and takes
+        // precedence; the HTTP Referer header is the fallback for requests
+        // without a tag payload (e.g. bare pixel hits). An empty payload
+        // value (direct traffic / stripped referrer policy) is treated as
+        // absent so it does not shadow the header.
+        let referer = params
+            .get("referrer")
+            .filter(|r| !r.is_empty())
+            .cloned()
+            .or(raw.headers.referer);
 
         // Detect referrer network from referer URL
         let referrer_network = referer
@@ -179,10 +202,7 @@ impl RawLogParser {
     }
 
     /// Parse POST request body to extract event type and params
-    fn parse_post_request(
-        body: &Option<String>,
-        path: &str,
-    ) -> Result<(EventType, HashMap<String, String>, Option<String>, Option<String>, Option<String>)> {
+    fn parse_post_request(body: &Option<String>) -> Result<ParsedRequest> {
         let Some(body_str) = body else {
             return Ok((EventType::Unknown, HashMap::new(), None, None, None));
         };
@@ -197,9 +217,18 @@ impl RawLogParser {
                 .unwrap_or(EventType::Unknown);
 
             // Extract IDs
-            let session_id = json_data.get("sid").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let user_id = json_data.get("uid").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let cookie_id = json_data.get("cid").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let session_id = json_data
+                .get("sid")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let user_id = json_data
+                .get("uid")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let cookie_id = json_data
+                .get("cid")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
             // Extract all other fields as params
             let mut params = HashMap::new();
@@ -233,10 +262,7 @@ impl RawLogParser {
     }
 
     /// Parse GET request query params to extract event type and params
-    fn parse_get_request(
-        query_params: &Option<String>,
-        path: &str,
-    ) -> Result<(EventType, HashMap<String, String>, Option<String>, Option<String>, Option<String>)> {
+    fn parse_get_request(query_params: &Option<String>) -> Result<ParsedRequest> {
         let params = Self::parse_query_string(query_params.as_deref().unwrap_or(""))?;
 
         // Determine event type from "type" param
@@ -262,8 +288,9 @@ impl RawLogParser {
                 continue;
             };
 
-            let decoded_key = urlencoding::decode(key).unwrap_or_else(|_| key.to_string());
-            let decoded_value = urlencoding::decode(value).unwrap_or_else(|_| value.to_string());
+            let decoded_key = urlencoding::decode(key).unwrap_or_else(|_| key.to_string().into());
+            let decoded_value =
+                urlencoding::decode(value).unwrap_or_else(|_| value.to_string().into());
 
             params.insert(decoded_key.to_string(), decoded_value.to_string());
         }
@@ -279,13 +306,7 @@ impl RawLogParser {
 
         let query_string: Vec<String> = params
             .iter()
-            .map(|(k, v)| {
-                format!(
-                    "{}={}",
-                    urlencoding::encode(k),
-                    urlencoding::encode(v)
-                )
-            })
+            .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
             .collect();
 
         format!("{}?{}", path, query_string.join("&"))
@@ -345,7 +366,10 @@ mod tests {
         assert_eq!(event.ua, Some("Mozilla/5.0".to_string()));
         assert_eq!(event.session_id, Some("sess-123".to_string()));
         assert_eq!(event.user_id, Some("user-456".to_string()));
-        assert_eq!(event.params.get("url"), Some(&"https://example.com".to_string()));
+        assert_eq!(
+            event.params.get("url"),
+            Some(&"https://example.com".to_string())
+        );
         assert_eq!(event.referer, Some("https://google.com".to_string()));
         assert_eq!(event.referrer_network, Some("google".to_string()));
     }
@@ -385,7 +409,10 @@ mod tests {
         let event = RawLogParser::parse_line(json).unwrap();
 
         assert_eq!(event.event_type, EventType::Click);
-        assert_eq!(event.params.get("link_url"), Some(&"https://example.com".to_string()));
+        assert_eq!(
+            event.params.get("link_url"),
+            Some(&"https://example.com".to_string())
+        );
         assert_eq!(event.params.get("outbound"), Some(&"true".to_string()));
     }
 
@@ -448,6 +475,90 @@ mod tests {
         assert_eq!(event.referrer_network, Some("taboola".to_string()));
     }
 
+    /// The tag sends document.referrer in the POST body. For beacon POSTs the
+    /// browser sets the Referer header to the page itself, so the payload
+    /// value (the real traffic source) must win.
+    #[test]
+    fn test_parse_post_body_referrer_takes_precedence_over_header() {
+        let json = r#"{
+            "ts": "2026-05-08T14:30:00Z",
+            "method": "POST",
+            "path": "/e",
+            "headers": {
+                "user_agent": "Mozilla/5.0",
+                "referer": "https://example.com/article"
+            },
+            "body": "{\"type\":\"pageview\",\"sid\":\"sess-123\",\"referrer\":\"https://taboola.com/story\"}"
+        }"#;
+
+        let event = RawLogParser::parse_line(json).unwrap();
+
+        assert_eq!(event.referer, Some("https://taboola.com/story".to_string()));
+        assert_eq!(event.referrer_network, Some("taboola".to_string()));
+    }
+
+    /// Pixel GETs carry document.referrer as a query parameter.
+    #[test]
+    fn test_parse_get_query_referrer() {
+        let json = r#"{
+            "ts": "2026-05-08T14:30:00Z",
+            "method": "GET",
+            "path": "/p",
+            "headers": {},
+            "query_params": "url=https%3A%2F%2Fexample.com&type=pageview&referrer=https%3A%2F%2Fwww.google.com%2Fsearch%3Fq%3Dtest",
+            "body": null
+        }"#;
+
+        let event = RawLogParser::parse_line(json).unwrap();
+
+        assert_eq!(
+            event.referer,
+            Some("https://www.google.com/search?q=test".to_string())
+        );
+        assert_eq!(event.referrer_network, Some("google".to_string()));
+    }
+
+    /// An empty payload referrer (direct traffic, or a referrer policy that
+    /// stripped it) must not shadow the HTTP Referer header.
+    #[test]
+    fn test_parse_empty_payload_referrer_falls_back_to_header() {
+        let json = r#"{
+            "ts": "2026-05-08T14:30:00Z",
+            "method": "POST",
+            "path": "/e",
+            "headers": {
+                "referer": "https://outbrain.com/example"
+            },
+            "body": "{\"type\":\"pageview\",\"referrer\":\"\"}"
+        }"#;
+
+        let event = RawLogParser::parse_line(json).unwrap();
+
+        assert_eq!(
+            event.referer,
+            Some("https://outbrain.com/example".to_string())
+        );
+        assert_eq!(event.referrer_network, Some("outbrain".to_string()));
+    }
+
+    #[test]
+    fn test_parse_no_referrer_anywhere() {
+        let json = r#"{
+            "ts": "2026-05-08T14:30:00Z",
+            "method": "POST",
+            "path": "/e",
+            "headers": {
+                "user_agent": "Mozilla/5.0"
+            },
+            "body": "{\"type\":\"pageview\"}"
+        }"#;
+
+        let event = RawLogParser::parse_line(json).unwrap();
+
+        assert_eq!(event.referer, None);
+        assert_eq!(event.referrer_network, None);
+    }
+
     #[test]
     fn test_event_type_from_str() {
         assert_eq!(EventType::from_str("pageview"), EventType::Pageview);
@@ -473,10 +584,7 @@ mod tests {
         let query = "url=https%3A%2F%2Fexample.com&title=Test%20Page";
         let params = RawLogParser::parse_query_string(query).unwrap();
 
-        assert_eq!(
-            params.get("url"),
-            Some(&"https://example.com".to_string())
-        );
+        assert_eq!(params.get("url"), Some(&"https://example.com".to_string()));
         assert_eq!(params.get("title"), Some(&"Test Page".to_string()));
     }
 
