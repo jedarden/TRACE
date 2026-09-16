@@ -631,7 +631,22 @@ fn parsed_events_to_parquet(events: Vec<raw_log_parser::Event>) -> Result<Vec<u8
     let device_types: Vec<Option<String>> = vec![None; n];
     let device_oss: Vec<Option<String>> = vec![None; n];
     let device_browsers: Vec<Option<String>> = vec![None; n];
-    let scroll_depth_pcts: Vec<Option<i64>> = vec![None; n];
+
+    // Scroll depth is not enriched-only: both tags send it on scroll events
+    // as the `scroll_depth` param. Promote it into the typed column the
+    // analytics views read, with the same 0-100 bounds as the enriched path.
+    let scroll_depth_pcts: Vec<Option<i64>> = events
+        .iter()
+        .map(|e| {
+            if e.event_type != raw_log_parser::EventType::Scroll {
+                return None;
+            }
+            e.params
+                .get("scroll_depth")
+                .and_then(|v| v.parse::<i64>().ok())
+                .filter(|&v| (0..=100).contains(&v))
+        })
+        .collect();
     let scroll_time_mss: Vec<Option<i64>> = vec![None; n];
     let dwell_time_mss: Vec<Option<i64>> = vec![None; n];
     let dwell_visible_pcts: Vec<Option<i64>> = vec![None; n];
@@ -1907,6 +1922,154 @@ mod tests {
             !parquet_data.is_empty(),
             "Parquet data with heartbeat should not be empty"
         );
+    }
+
+    /// Scroll events parsed from raw collector logs must land in Parquet with
+    /// their type intact, their `scroll_depth` param promoted into the typed
+    /// scroll_depth_pct column, and the raw payload fields (including
+    /// max_scroll_depth) preserved in params. Other event types keep
+    /// scroll_depth_pct null.
+    #[test]
+    fn test_parsed_events_to_parquet_preserves_scroll() {
+        use arrow::array::{Array, Int64Array, MapArray, StringArray};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
+        use raw_log_parser::{Event, EventType};
+
+        let mk_event = |event_type: EventType, params: HashMap<String, String>| Event {
+            ts: DateTime::parse_from_rfc3339("2026-05-08T14:32:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            ip: None,
+            ua: Some("Mozilla/5.0".to_string()),
+            url: "https://example.com/article".to_string(),
+            event_type,
+            params,
+            session_id: Some("sess-123".to_string()),
+            user_id: None,
+            cookie_id: None,
+            referer: None,
+            referrer_network: None,
+        };
+
+        let events = vec![
+            mk_event(
+                EventType::Scroll,
+                vec![
+                    ("scroll_depth".to_string(), "75".to_string()),
+                    ("max_scroll_depth".to_string(), "78".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            mk_event(EventType::Pageview, HashMap::new()),
+        ];
+
+        let parquet_data = parsed_events_to_parquet(events).unwrap();
+
+        // Read the batch back through a real Parquet reader (File is a
+        // ChunkReader; tempfile is already a dev-dependency)
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scroll.parquet");
+        std::fs::write(&path, &parquet_data).unwrap();
+        let mut reader =
+            ParquetRecordBatchReader::try_new(std::fs::File::open(&path).unwrap(), 1024).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 2, "both events must land in Parquet");
+
+        let types = batch
+            .column_by_name("type")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(types.value(0), "scroll", "scroll type must be preserved");
+        assert_eq!(types.value(1), "pageview");
+
+        let depths = batch
+            .column_by_name("scroll_depth_pct")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(depths.value(0), 75, "scroll_depth must reach the column");
+        assert!(
+            depths.is_null(1),
+            "non-scroll events must not claim a scroll depth"
+        );
+
+        // Raw payload fields survive verbatim in params (HashMap order is
+        // nondeterministic, so look them up rather than assuming positions)
+        let params = batch
+            .column_by_name("params")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        let row0 = params.value(0);
+        let keys = row0
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let values = row0
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mut got = HashMap::new();
+        for i in 0..keys.len() {
+            got.insert(keys.value(i), values.value(i).to_string());
+        }
+        assert_eq!(got.get("scroll_depth"), Some(&"75".to_string()));
+        assert_eq!(got.get("max_scroll_depth"), Some(&"78".to_string()));
+    }
+
+    /// Depths outside 0-100 or non-numeric are dropped to null, matching the
+    /// enriched path's validation — never clamped and never a parse panic.
+    #[test]
+    fn test_parsed_events_to_parquet_scroll_depth_bounds() {
+        use arrow::array::{Array, Int64Array};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
+        use raw_log_parser::{Event, EventType};
+
+        let mk_scroll = |depth: &str| Event {
+            ts: DateTime::parse_from_rfc3339("2026-05-08T14:32:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            ip: None,
+            ua: None,
+            url: "https://example.com".to_string(),
+            event_type: EventType::Scroll,
+            params: vec![("scroll_depth".to_string(), depth.to_string())]
+                .into_iter()
+                .collect(),
+            session_id: None,
+            user_id: None,
+            cookie_id: None,
+            referer: None,
+            referrer_network: None,
+        };
+
+        let events = vec![mk_scroll("150"), mk_scroll("abc"), mk_scroll("100")];
+
+        let parquet_data = parsed_events_to_parquet(events).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scroll-bounds.parquet");
+        std::fs::write(&path, &parquet_data).unwrap();
+        let mut reader =
+            ParquetRecordBatchReader::try_new(std::fs::File::open(&path).unwrap(), 1024).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+
+        let depths = batch
+            .column_by_name("scroll_depth_pct")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(depths.is_null(0), "depth above 100 must be dropped");
+        assert!(depths.is_null(1), "non-numeric depth must be dropped");
+        assert_eq!(depths.value(2), 100, "boundary depth 100 must be kept");
     }
 
     #[test]

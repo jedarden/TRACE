@@ -662,6 +662,7 @@ mod tests {
         assert_eq!(EventType::from_str("dwell"), EventType::Heartbeat);
         assert_eq!(EventType::from_str("heartbeat"), EventType::Heartbeat);
         assert_eq!(EventType::from_str("click"), EventType::Click);
+        assert_eq!(EventType::from_str("scroll"), EventType::Scroll);
         assert_eq!(EventType::from_str("conversion"), EventType::Conversion);
         assert_eq!(EventType::from_str("purchase"), EventType::Purchase);
         assert_eq!(EventType::from_str("signup"), EventType::Signup);

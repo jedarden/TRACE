@@ -426,6 +426,30 @@ mod tests {
         assert_eq!(raw.body.as_deref(), Some(body));
     }
 
+    /// The JS tag POSTs scroll events to /e as JSON. Collection is
+    /// log-first and type-agnostic: the body must be stored verbatim so
+    /// the flusher's parser (not the collector) derives type = scroll.
+    #[tokio::test]
+    async fn test_scroll_event_post_body_is_logged() {
+        let (state, dir) = test_state();
+
+        let body = r#"{"type":"scroll","url":"https://example.com/article","ts":"2026-05-08T14:32:00.000Z","sid":"sess-123","pv":"pv-1","scroll_depth":75,"max_scroll_depth":78}"#;
+        collect_post(
+            State(state.clone()),
+            Uri::from_static("/e"),
+            HeaderMap::new(),
+            body.to_string(),
+        )
+        .await;
+
+        state.log_writer.lock().await.flush().unwrap();
+        let raw = read_logged_request(&dir);
+
+        assert_eq!(raw.method, "POST");
+        assert_eq!(raw.path, "/e");
+        assert_eq!(raw.body.as_deref(), Some(body));
+    }
+
     /// Regular endpoints keep their recorded shape: the path is the URL
     /// path alone (no doubled prefix) and the query string is separate.
     #[tokio::test]

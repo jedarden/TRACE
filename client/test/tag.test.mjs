@@ -5,7 +5,7 @@
  * evaluates the tag source inside it, drives scroll positions through
  * the mocked window, and inspects the payloads handed to sendBeacon.
  *
- * Run: npm test  (from client/) or: node --test test/tag.test.mjs
+ * Run: npm test  (from client/) — node --test discovers test/*.test.mjs
  */
 
 import { test } from 'node:test';
