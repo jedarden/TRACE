@@ -1078,6 +1078,78 @@ mod tests {
     }
 
     #[test]
+    fn test_assets_parquet_schema_matches_iceberg_ddl() {
+        use bytes::Bytes;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        // The trace.assets DDL (analytics/schemas/assets_iceberg.sql) declares
+        // asset_id/network/type/content as STRING NOT NULL and first_seen/
+        // last_seen as TIMESTAMP NOT NULL, PARTITIONED BY (network, type).
+        // Those identity and observation columns are the syncer's half of the
+        // table; the DDL's performance aggregates are computed downstream from
+        // ad_events. The write/read roundtrip cannot catch a column drifting
+        // from the DDL (both sides share one hand-written schema), so pin the
+        // written Parquet schema to the DDL here.
+        let store = create_test_store();
+        let now = Utc::now().trunc_subsecs(3);
+        let parquet_data = store
+            .assets_to_parquet(vec![AssetRecord {
+                asset_id: "taboola:headline:Test Headline".to_string(),
+                network: "taboola".to_string(),
+                asset_type: "headline".to_string(),
+                content: "Test Headline".to_string(),
+                creative_id: None,
+                campaign_id: None,
+                campaign_name: None,
+                item_id: None,
+                first_seen: now,
+                last_seen: now,
+                synced_at: now,
+            }])
+            .unwrap();
+
+        let schema = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(parquet_data))
+            .unwrap()
+            .schema()
+            .clone();
+
+        let column = |name: &str| {
+            schema
+                .field_with_name(name)
+                .unwrap_or_else(|e| panic!("column {} missing from assets parquet: {}", name, e))
+        };
+
+        // Identity and partition columns, in DDL declaration order
+        let strings = ["asset_id", "network", "type", "content"];
+        for name in strings {
+            let field = column(name);
+            assert_eq!(field.data_type(), &arrow::datatypes::DataType::Utf8);
+            assert!(
+                !field.is_nullable(),
+                "{} must be NOT NULL per the DDL",
+                name
+            );
+        }
+
+        // Observation timestamps
+        for name in ["first_seen", "last_seen"] {
+            let field = column(name);
+            assert_eq!(
+                field.data_type(),
+                &arrow::datatypes::DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Millisecond,
+                    None
+                )
+            );
+            assert!(
+                !field.is_nullable(),
+                "{} must be NOT NULL per the DDL",
+                name
+            );
+        }
+    }
+
+    #[test]
     fn test_assets_parquet_roundtrip() {
         let store = create_test_store();
 
