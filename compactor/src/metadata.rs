@@ -8,11 +8,10 @@
 //! Reference: https://iceberg.apache.org/spec/
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::collections::HashMap;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 /// Iceberg table format version
@@ -20,6 +19,7 @@ pub const ICEBERG_SPEC_VERSION: i32 = 1;
 
 /// Iceberg table metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct IcebergTableMetadata {
     pub format_version: i32,
     pub table_uuid: String,
@@ -41,6 +41,7 @@ pub struct IcebergTableMetadata {
 
 /// Iceberg schema definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct Schema {
     pub schema_id: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -52,10 +53,12 @@ pub struct Schema {
 
 /// Nested field in schema
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct NestedField {
     pub id: i32,
     pub name: String,
     pub required: bool,
+    #[serde(rename = "type")]
     pub field_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
@@ -63,6 +66,7 @@ pub struct NestedField {
 
 /// Partition specification
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct PartitionSpec {
     pub spec_id: i32,
     pub fields: Vec<PartitionField>,
@@ -70,6 +74,7 @@ pub struct PartitionSpec {
 
 /// Partition field
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct PartitionField {
     pub source_id: i32,
     pub field_id: i32,
@@ -79,6 +84,7 @@ pub struct PartitionField {
 
 /// Snapshot
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct Snapshot {
     pub snapshot_id: i64,
     pub parent_snapshot_id: Option<i64>,
@@ -99,6 +105,7 @@ pub struct SnapshotSummary {
 
 /// Snapshot log entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct SnapshotLogEntry {
     pub snapshot_id: i64,
     pub timestamp_ms: i64,
@@ -106,6 +113,7 @@ pub struct SnapshotLogEntry {
 
 /// Metadata log entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct MetadataLogEntry {
     pub timestamp_ms: i64,
     pub metadata_file: String,
@@ -113,6 +121,7 @@ pub struct MetadataLogEntry {
 
 /// Manifest file content
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct ManifestFile {
     pub manifest_path: String,
     pub manifest_length: i64,
@@ -135,6 +144,7 @@ pub struct ManifestFile {
 
 /// Partition field summary
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct PartitionFieldSummary {
     pub contains_null: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -147,6 +157,7 @@ pub struct PartitionFieldSummary {
 
 /// Data file entry in manifest
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct DataFile {
     pub content: String,
     pub file_path: String,
@@ -225,10 +236,23 @@ impl IcebergMetadataBuilder {
     }
 
     /// Create a new metadata builder for sessions table
+    ///
+    /// The sessions table is partitioned by DAYS(started_at) — see
+    /// analytics/schemas/sessions_iceberg.sql. The partition spec must name
+    /// the `started_at` field (source_id 3), NOT field 1 like ad_events:
+    /// query engines read this spec to prune partitions on started_at
+    /// predicates, so a spec pointing at session_id would silently disable
+    /// pruning (or worse, mis-prune).
     pub fn new_sessions(table_uuid: String, location: String) -> Self {
         let schema = Self::sessions_schema();
-        let partition_spec = Self::daily_partition_spec();
-        let properties = Self::default_properties();
+        let partition_spec = Self::sessions_partition_spec();
+        let mut properties = Self::default_properties();
+        // Sessions are far smaller than events — 256MB targets per the DDL
+        // ('write.target-file-size-bytes' in sessions_iceberg.sql).
+        properties.insert(
+            "write.target-file-size-bytes".to_string(),
+            "268435456".to_string(),
+        );
 
         Self {
             table_uuid,
@@ -258,8 +282,14 @@ impl IcebergMetadataBuilder {
         let mut props = HashMap::new();
         props.insert("write.format.default".to_string(), "parquet".to_string());
         props.insert("write.compression-codec".to_string(), "zstd".to_string());
-        props.insert("write.target-file-size-bytes".to_string(), "536870912".to_string());
-        props.insert("history.expire.min-snapshots-to-keep".to_string(), "10".to_string());
+        props.insert(
+            "write.target-file-size-bytes".to_string(),
+            "536870912".to_string(),
+        );
+        props.insert(
+            "history.expire.min-snapshots-to-keep".to_string(),
+            "10".to_string(),
+        );
         props
     }
 
@@ -330,7 +360,9 @@ impl IcebergMetadataBuilder {
                     name: "network".to_string(),
                     required: false,
                     field_type: "string".to_string(),
-                    doc: Some("Ad network: taboola, outbrain, mgid, revcontent, unknown".to_string()),
+                    doc: Some(
+                        "Ad network: taboola, outbrain, mgid, revcontent, unknown".to_string(),
+                    ),
                 },
                 NestedField {
                     id: 10,
@@ -387,6 +419,14 @@ impl IcebergMetadataBuilder {
     }
 
     /// Schema for sessions table
+    ///
+    /// Mirrors analytics/schemas/sessions_iceberg.sql column for column, in
+    /// DDL order — the materialized Parquet files carry all 24 columns, and
+    /// this compaction job is what writes the table's Iceberg metadata, so a
+    /// narrower schema here would hide the tail columns from engines reading
+    /// the table through that metadata. Field ids follow DDL order, which
+    /// keeps started_at at id 3 (the partition spec's source_id) and
+    /// session_id at id 1 (the identifier field).
     fn sessions_schema() -> Schema {
         Schema {
             schema_id: 0,
@@ -450,38 +490,115 @@ impl IcebergMetadataBuilder {
                 },
                 NestedField {
                     id: 9,
+                    name: "event_count".to_string(),
+                    required: false,
+                    field_type: "int".to_string(),
+                    doc: Some("Total events in the session".to_string()),
+                },
+                NestedField {
+                    id: 10,
                     name: "entry_url".to_string(),
                     required: false,
                     field_type: "string".to_string(),
                     doc: Some("Entry page URL".to_string()),
                 },
                 NestedField {
-                    id: 10,
+                    id: 11,
                     name: "exit_url".to_string(),
                     required: false,
                     field_type: "string".to_string(),
                     doc: Some("Exit page URL".to_string()),
                 },
                 NestedField {
-                    id: 11,
+                    id: 12,
                     name: "network".to_string(),
                     required: false,
                     field_type: "string".to_string(),
                     doc: Some("Attributed ad network".to_string()),
                 },
                 NestedField {
-                    id: 12,
+                    id: 13,
                     name: "campaign_id".to_string(),
                     required: false,
                     field_type: "string".to_string(),
                     doc: Some("Attributed campaign ID".to_string()),
                 },
                 NestedField {
-                    id: 13,
+                    id: 14,
+                    name: "campaign_name".to_string(),
+                    required: false,
+                    field_type: "string".to_string(),
+                    doc: Some("Attributed campaign name".to_string()),
+                },
+                NestedField {
+                    id: 15,
+                    name: "creative_id".to_string(),
+                    required: false,
+                    field_type: "string".to_string(),
+                    doc: Some("Attributed creative identifier".to_string()),
+                },
+                NestedField {
+                    id: 16,
+                    name: "headline".to_string(),
+                    required: false,
+                    field_type: "string".to_string(),
+                    doc: Some("Attributed ad headline".to_string()),
+                },
+                NestedField {
+                    id: 17,
                     name: "converted".to_string(),
                     required: false,
                     field_type: "boolean".to_string(),
                     doc: Some("Whether session converted".to_string()),
+                },
+                NestedField {
+                    id: 18,
+                    name: "conversion_value".to_string(),
+                    required: false,
+                    field_type: "double".to_string(),
+                    doc: Some("Revenue attributed to the conversion".to_string()),
+                },
+                NestedField {
+                    id: 19,
+                    name: "device_type".to_string(),
+                    required: false,
+                    field_type: "string".to_string(),
+                    doc: Some("Device type (from first event)".to_string()),
+                },
+                NestedField {
+                    id: 20,
+                    name: "device_os".to_string(),
+                    required: false,
+                    field_type: "string".to_string(),
+                    doc: Some("Device OS (from first event)".to_string()),
+                },
+                NestedField {
+                    id: 21,
+                    name: "referrer".to_string(),
+                    required: false,
+                    field_type: "string".to_string(),
+                    doc: Some("Referrer (from first event)".to_string()),
+                },
+                NestedField {
+                    id: 22,
+                    name: "duration_seconds".to_string(),
+                    required: false,
+                    field_type: "int".to_string(),
+                    doc: Some("Session duration in seconds".to_string()),
+                },
+                NestedField {
+                    id: 23,
+                    name: "bounce".to_string(),
+                    required: false,
+                    field_type: "boolean".to_string(),
+                    doc: Some("Whether the session was a single-event bounce".to_string()),
+                },
+                NestedField {
+                    id: 24,
+                    name: "depth".to_string(),
+                    required: false,
+                    field_type: "int".to_string(),
+                    doc: Some("Distinct URLs visited".to_string()),
                 },
             ],
             identifier_field_ids: Some(vec![1]),
@@ -577,6 +694,21 @@ impl IcebergMetadataBuilder {
                 source_id: 1, // ts field
                 field_id: 1000,
                 name: "ts_day".to_string(),
+                transform: "day".to_string(),
+            }],
+        }
+    }
+
+    /// Daily partition spec for the sessions table (by day of started_at).
+    /// source_id 3 is `started_at` in sessions_schema() — partitioning the
+    /// sessions table on any other field breaks DAYS(started_at) pruning.
+    fn sessions_partition_spec() -> PartitionSpec {
+        PartitionSpec {
+            spec_id: 0,
+            fields: vec![PartitionField {
+                source_id: 3, // started_at field
+                field_id: 1000,
+                name: "started_at_day".to_string(),
                 transform: "day".to_string(),
             }],
         }
@@ -687,15 +819,29 @@ impl IcebergMetadataBuilder {
     }
 }
 
+/// Partition field name used in Iceberg partition data for a table.
+///
+/// Must match the partition spec field name in the table metadata:
+/// query engines match manifest partition entries against the spec to
+/// prune, so a mismatch silently disables partition pruning.
+pub fn partition_field_for_table(table_name: &str) -> &str {
+    match table_name {
+        "trace.sessions" => "started_at_day",
+        // ad_events and any unrecognized table follow the daily ts spec
+        _ => "ts_day",
+    }
+}
+
 /// Create data file entry for Iceberg manifest
 pub fn create_data_file(
     file_path: String,
+    partition_field: &str,
     partition_value: String,
     record_count: i64,
     file_size: i64,
 ) -> DataFile {
     let mut partition = HashMap::new();
-    partition.insert("ts_day".to_string(), partition_value);
+    partition.insert(partition_field.to_string(), partition_value);
 
     DataFile {
         content: "data".to_string(),
@@ -747,6 +893,18 @@ pub fn generate_manifest_list(manifest_paths: Vec<String>) -> Result<Vec<u8>> {
     Ok(json.into_bytes())
 }
 
+/// One output file to register in a table's Iceberg metadata
+#[derive(Debug, Clone)]
+pub struct CompactedDataFile {
+    /// Path relative to the table's data prefix (e.g.
+    /// "data/started_at_day=2026-09-14/compacted-00000.parquet")
+    pub path: String,
+    /// File size in bytes
+    pub size_bytes: usize,
+    /// Row count
+    pub record_count: i64,
+}
+
 /// Generate Iceberg metadata files for a compaction job
 ///
 /// This function creates or updates Iceberg table metadata after compaction:
@@ -756,53 +914,79 @@ pub fn generate_manifest_list(manifest_paths: Vec<String>) -> Result<Vec<u8>> {
 /// 4. Generates manifest list
 /// 5. Updates table metadata with new snapshot
 /// 6. Uploads all metadata to S3
+///
+/// Key conventions (matching how the rest of the compactor addresses S3):
+/// - `data_prefix` is the table's path *relative to the S3 key prefix*
+///   (e.g. "iceberg/sessions") — manifest/metadata keys are derived from it.
+/// - `table_location` is the table's absolute `s3://` URI (e.g.
+///   "s3://bucket/trace-events/iceberg/sessions") — used for data file paths
+///   recorded inside the manifests.
+/// - `data_files` are relative to `data_prefix` (e.g.
+///   "data/started_at_day=2026-09-14/compacted-00000.parquet").
+/// - `partition_value` is the bare partition value (e.g. "2026-09-14"); the
+///   partition field name follows the table's partition spec.
 pub async fn generate_iceberg_metadata(
     s3: std::sync::Arc<dyn crate::S3Ops>,
     table_name: &str,
     table_location: &str,
+    data_prefix: &str,
     partition_value: &str,
-    data_files: Vec<String>,
-    file_sizes: Vec<usize>,
-    record_counts: Vec<i64>,
+    data_files: Vec<CompactedDataFile>,
 ) -> Result<()> {
     if data_files.is_empty() {
         warn!("No data files provided for Iceberg metadata generation");
         return Ok(());
     }
 
-    let metadata_prefix = format!("{}/metadata", table_location.trim_end_matches('/'));
+    let data_prefix = data_prefix.trim_end_matches('/');
+    let metadata_prefix = format!("{}/metadata", data_prefix);
     let metadata_key = format!("{}/v1.metadata.json", metadata_prefix);
 
     // Load or create table metadata
-    let metadata = load_or_create_metadata(s3.clone(), &metadata_key, table_name, table_location).await?;
+    let metadata =
+        load_or_create_metadata(s3.clone(), &metadata_key, table_name, table_location).await?;
+
+    // Partition field name must match the table's partition spec so engines
+    // can prune (ts_day for ad_events, started_at_day for sessions).
+    let partition_field = partition_field_for_table(table_name);
 
     // Create data file entries
     let data_file_entries: Vec<DataFile> = data_files
         .iter()
-        .zip(file_sizes.iter())
-        .zip(record_counts.iter())
-        .map(|((path, size), records)| {
+        .map(|f| {
             create_data_file(
-                format!("{}/{}", table_location.trim_end_matches('/'), path),
+                format!("{}/{}", table_location.trim_end_matches('/'), f.path),
+                partition_field,
                 partition_value.to_string(),
-                *records,
-                *size as i64,
+                f.record_count,
+                f.size_bytes as i64,
             )
         })
         .collect();
 
     // Generate manifest file
-    let manifest_path = format!("{}/manifest-{:05}.avro", metadata_prefix, Utc::now().timestamp_millis());
+    let manifest_path = format!(
+        "{}/manifest-{:05}.avro",
+        metadata_prefix,
+        Utc::now().timestamp_millis()
+    );
     let manifest_content = generate_manifest_content(&data_file_entries)?;
-    s3.put_object(&manifest_path, manifest_content).await
+    s3.put_object(&manifest_path, manifest_content)
+        .await
         .context("Failed to upload manifest file")?;
 
     info!("Uploaded manifest: {}", manifest_path);
 
     // Generate manifest list
-    let manifest_list_path = format!("{}/snap-{:05}-{}.avro", metadata_prefix, Utc::now().timestamp_millis(), Uuid::new_v4());
+    let manifest_list_path = format!(
+        "{}/snap-{:05}-{}.avro",
+        metadata_prefix,
+        Utc::now().timestamp_millis(),
+        Uuid::new_v4()
+    );
     let manifest_list_content = generate_manifest_list(vec![manifest_path.clone()])?;
-    s3.put_object(&manifest_list_path, manifest_list_content).await
+    s3.put_object(&manifest_list_path, manifest_list_content)
+        .await
         .context("Failed to upload manifest list")?;
 
     info!("Uploaded manifest list: {}", manifest_list_path);
@@ -834,16 +1018,13 @@ pub async fn generate_iceberg_metadata(
     let mut summary = HashMap::new();
     summary.insert("partition".to_string(), partition_value.to_string());
 
-    let updated_metadata = builder.add_snapshot(
-        metadata,
-        manifest_list_path,
-        data_file_entries,
-        summary,
-    )?;
+    let updated_metadata =
+        builder.add_snapshot(metadata, manifest_list_path, data_file_entries, summary)?;
 
     // Serialize and upload updated metadata
     let updated_metadata_json = builder.serialize_metadata_update(&updated_metadata)?;
-    s3.put_object(&metadata_key, updated_metadata_json).await
+    s3.put_object(&metadata_key, updated_metadata_json)
+        .await
         .context("Failed to upload updated metadata")?;
 
     info!("Updated table metadata: {}", metadata_key);
@@ -861,10 +1042,9 @@ async fn load_or_create_metadata(
     // Try to load existing metadata
     match s3.get_object(metadata_key).await {
         Ok(data) => {
-            let json_str = String::from_utf8(data)
-                .context("Metadata is not valid UTF-8")?;
-            let metadata: IcebergTableMetadata = serde_json::from_str(&json_str)
-                .context("Failed to parse existing metadata")?;
+            let json_str = String::from_utf8(data).context("Metadata is not valid UTF-8")?;
+            let metadata: IcebergTableMetadata =
+                serde_json::from_str(&json_str).context("Failed to parse existing metadata")?;
             info!("Loaded existing metadata for {}", table_name);
             Ok(metadata)
         }
@@ -907,8 +1087,7 @@ fn generate_manifest_content(data_files: &[DataFile]) -> Result<Vec<u8>> {
         "data-files": data_files
     });
 
-    let json = serde_json::to_string_pretty(&manifest)
-        .context("Failed to serialize manifest")?;
+    let json = serde_json::to_string_pretty(&manifest).context("Failed to serialize manifest")?;
 
     Ok(json.into_bytes())
 }
@@ -927,7 +1106,7 @@ mod tests {
 
         assert_eq!(schema.fields.len(), 16);
         assert_eq!(schema.fields[0].name, "ts");
-        assert_eq!(schema.fields[0].required, true);
+        assert!(schema.fields[0].required);
         assert_eq!(schema.fields[0].field_type, "timestamptz");
     }
 
@@ -939,9 +1118,107 @@ mod tests {
         );
         let schema = builder.schema;
 
-        assert_eq!(schema.fields.len(), 13);
-        assert_eq!(schema.fields[0].name, "session_id");
+        // Full DDL column set, in sessions_iceberg.sql order — the
+        // materialized Parquet carries all 24 columns
+        let names: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "session_id",
+                "user_id",
+                "started_at",
+                "ended_at",
+                "pageviews",
+                "clicks",
+                "scrolls",
+                "dwells",
+                "event_count",
+                "entry_url",
+                "exit_url",
+                "network",
+                "campaign_id",
+                "campaign_name",
+                "creative_id",
+                "headline",
+                "converted",
+                "conversion_value",
+                "device_type",
+                "device_os",
+                "referrer",
+                "duration_seconds",
+                "bounce",
+                "depth",
+            ]
+        );
         assert_eq!(schema.identifier_field_ids, Some(vec![1]));
+
+        // started_at must be field 3 — the partition spec below points at it
+        assert_eq!(schema.fields[2].name, "started_at");
+        assert_eq!(schema.fields[2].field_type, "timestamptz");
+
+        // Spot-check the non-string types against the DDL
+        assert_eq!(schema.fields[16].field_type, "boolean"); // converted
+        assert_eq!(schema.fields[17].field_type, "double"); // conversion_value
+        assert_eq!(schema.fields[22].field_type, "boolean"); // bounce
+        assert_eq!(schema.fields[23].field_type, "int"); // depth
+    }
+
+    /// Partition pruning on started_at depends on the sessions table
+    /// metadata carrying a `day` transform over the `started_at` field.
+    /// A spec pointing at any other field (e.g. reusing the ad_events
+    /// ts_day spec with source_id 1, which is session_id here) silently
+    /// breaks pruning — engines would either skip pruning or mis-prune.
+    #[test]
+    fn test_sessions_partition_spec_prunes_on_started_at() {
+        let builder = IcebergMetadataBuilder::new_sessions(
+            "test-uuid".to_string(),
+            "s3://bucket/iceberg/sessions".to_string(),
+        );
+        let spec = &builder.partition_spec;
+
+        assert_eq!(spec.fields.len(), 1);
+        let field = &spec.fields[0];
+        assert_eq!(field.name, "started_at_day");
+        assert_eq!(field.transform, "day");
+        assert_eq!(field.source_id, 3); // started_at, NOT session_id (1)
+
+        // The spec must resolve to a timestamptz source field
+        let source = schema_field(&builder.schema, field.source_id);
+        assert_eq!(source, Some("started_at"));
+    }
+
+    /// The ad_events table must keep its ts_day spec (source_id 1 = ts).
+    #[test]
+    fn test_ad_events_partition_spec_unchanged() {
+        let builder = IcebergMetadataBuilder::new_ad_events(
+            "test-uuid".to_string(),
+            "s3://bucket/iceberg/ad_events".to_string(),
+        );
+        let field = &builder.partition_spec.fields[0];
+        assert_eq!(field.name, "ts_day");
+        assert_eq!(field.transform, "day");
+        assert_eq!(field.source_id, 1);
+        assert_eq!(schema_field(&builder.schema, 1), Some("ts"));
+    }
+
+    /// Manifest partition entries must use the table's own partition field
+    /// name so they match the spec during pruning.
+    #[test]
+    fn test_partition_field_for_table() {
+        assert_eq!(
+            partition_field_for_table("trace.sessions"),
+            "started_at_day"
+        );
+        assert_eq!(partition_field_for_table("trace.ad_events"), "ts_day");
+        assert_eq!(partition_field_for_table("unknown.table"), "ts_day");
+    }
+
+    fn schema_field(schema: &Schema, id: i32) -> Option<&str> {
+        schema
+            .fields
+            .iter()
+            .find(|f| f.id == id)
+            .map(|f| f.name.as_str())
     }
 
     #[test]
@@ -989,6 +1266,7 @@ mod tests {
                 vec![create_data_file(
                     "s3://bucket/iceberg/ad_events/data/ts_day=2026-05-08/part-00000.parquet"
                         .to_string(),
+                    "ts_day",
                     "2026-05-08".to_string(),
                     1000,
                     1024,
@@ -1007,6 +1285,7 @@ mod tests {
     fn test_create_data_file() {
         let data_file = create_data_file(
             "s3://bucket/iceberg/ad_events/data/ts_day=2026-05-08/part-00000.parquet".to_string(),
+            "ts_day",
             "2026-05-08".to_string(),
             1000,
             1024,
@@ -1020,6 +1299,26 @@ mod tests {
             data_file.partition.fields.get("ts_day"),
             Some(&"2026-05-08".to_string())
         );
+    }
+
+    /// Sessions data files must carry started_at_day partition entries —
+    /// a ts_day entry would never match the sessions partition spec.
+    #[test]
+    fn test_create_sessions_data_file_uses_started_at_day() {
+        let data_file = create_data_file(
+            "s3://bucket/iceberg/sessions/data/started_at_day=2026-09-14/part-00000.parquet"
+                .to_string(),
+            partition_field_for_table("trace.sessions"),
+            "2026-09-14".to_string(),
+            42,
+            2048,
+        );
+
+        assert_eq!(
+            data_file.partition.fields.get("started_at_day"),
+            Some(&"2026-09-14".to_string())
+        );
+        assert!(!data_file.partition.fields.contains_key("ts_day"));
     }
 
     #[test]

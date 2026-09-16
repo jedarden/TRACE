@@ -7,6 +7,7 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::{config::Region, Client};
 use aws_smithy_types::byte_stream::ByteStream;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
+use futures::StreamExt;
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::file::properties::WriterProperties;
@@ -14,16 +15,16 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::prelude::*;
-use futures::StreamExt;
 
-use arrow::array::Array;
-use arrow::datatypes::DataType;
-
-/// Parse date from partition path (dt=YYYY-MM-DD)
+/// Parse the date from a partition directory name or a path carrying one.
+/// Every daily partition in this pipeline holds a `YYYY-MM-DD` value after
+/// `=`: `dt=` (raw hourly events), `ts_day=` (trace.ad_events) and
+/// `started_at_day=` (trace.sessions).
 #[allow(dead_code)]
 fn parse_date_from_partition(path: &str) -> Option<NaiveDate> {
-    let date_part = path.strip_prefix("dt=")?;
-    NaiveDate::parse_from_str(date_part, "%Y-%m-%d").ok()
+    let value = path.split('=').nth(1)?;
+    let value = value.split('/').next()?;
+    NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()
 }
 
 /// S3 configuration
@@ -181,10 +182,12 @@ impl S3Ops for S3Client {
             self.client
                 .delete_objects()
                 .bucket(&self.config.bucket)
-                .delete(aws_sdk_s3::types::Delete::builder()
-                    .set_objects(Some(delete_ids))
-                    .build()
-                    .context("Invalid delete request")?)
+                .delete(
+                    aws_sdk_s3::types::Delete::builder()
+                        .set_objects(Some(delete_ids))
+                        .build()
+                        .context("Invalid delete request")?,
+                )
                 .send()
                 .await
                 .context("S3 delete failed")?;
@@ -214,12 +217,13 @@ impl Default for CompactorConfig {
     }
 }
 
-/// Merge multiple Parquet files into one
+/// Merge multiple Parquet files into one, returning the merged bytes and
+/// the total row count (used for Iceberg manifest row counts)
 pub async fn merge_parquet_files(
     s3: Arc<dyn S3Ops>,
     keys: Vec<String>,
     target_row_group_size: usize,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, i64)> {
     use arrow::array::RecordBatch;
     use arrow::datatypes::Schema;
 
@@ -254,11 +258,12 @@ pub async fn merge_parquet_files(
     }
 
     if all_batches.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
 
     // Combine all batches
     let combined = combine_batches(all_batches)?;
+    let total_rows = combined.num_rows() as i64;
 
     // Write merged Parquet
     let mut buffer = Vec::new();
@@ -270,114 +275,43 @@ pub async fn merge_parquet_files(
     writer.write(&combined)?;
     writer.close()?;
 
-    Ok(buffer)
+    Ok((buffer, total_rows))
 }
 
 /// Combine multiple record batches into one
-fn combine_batches(batches: Vec<arrow::record_batch::RecordBatch>) -> Result<arrow::record_batch::RecordBatch> {
-    use arrow::array::{StringArray, TimestampMillisecondArray};
+///
+/// Schema-driven concatenation: works for any table's files (the events
+/// 6-column layout and the 23-column sessions layout alike), as long as all
+/// inputs share a schema — which holds because compaction groups files by
+/// table partition.
+fn combine_batches(
+    batches: Vec<arrow::record_batch::RecordBatch>,
+) -> Result<arrow::record_batch::RecordBatch> {
+    use arrow::compute::concat_batches;
 
     if batches.is_empty() {
         anyhow::bail!("No batches to combine");
     }
 
     let schema = batches[0].schema();
-    let num_columns = schema.fields().len();
 
-    let mut columns: Vec<Box<dyn arrow::array::ArrayBuilder>> = Vec::new();
-
-    for col_idx in 0..num_columns {
-        let field = schema.field(col_idx);
-        let data_type = field.data_type();
-
-        match data_type {
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None) => {
-                let mut builder = arrow::array::TimestampMillisecondBuilder::new();
-                for batch in &batches {
-                    let col = batch
-                        .column(col_idx)
-                        .as_any()
-                        .downcast_ref::<TimestampMillisecondArray>()
-                        .ok_or_else(|| anyhow::anyhow!("Column {} is not Timestamp", col_idx))?;
-                    for val in col.iter() {
-                        if let Some(v) = val {
-                            builder.append_value(v);
-                        } else {
-                            builder.append_null();
-                        }
-                    }
-                }
-                columns.push(Box::new(builder));
-            }
-            DataType::Utf8 => {
-                let builder = arrow::array::StringBuilder::new();
-                columns.push(Box::new(builder));
-            }
-            DataType::Null => {
-                // For nullable columns, use String builder
-                let builder = arrow::array::StringBuilder::new();
-                columns.push(Box::new(builder));
-            }
-            _ => {
-                anyhow::bail!("Unsupported data type: {:?}", data_type);
-            }
+    for (idx, batch) in batches.iter().enumerate() {
+        if batch.schema() != schema {
+            anyhow::bail!(
+                "Batch {} schema does not match the first batch ({} columns vs {})",
+                idx,
+                batch.num_columns(),
+                schema.fields().len()
+            );
         }
     }
 
-    // Actually combine the data
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-
-    let mut ts_data = Vec::with_capacity(total_rows);
-    let mut ip_data = Vec::with_capacity(total_rows);
-    let mut ua_data = Vec::with_capacity(total_rows);
-    let mut url_data = Vec::with_capacity(total_rows);
-    let mut params_data = Vec::with_capacity(total_rows);
-    let mut type_data = Vec::with_capacity(total_rows);
-
-    for batch in &batches {
-        let ts_col = batch.column(0).as_any().downcast_ref::<TimestampMillisecondArray>();
-        let ip_col = batch.column(1).as_any().downcast_ref::<StringArray>();
-        let ua_col = batch.column(2).as_any().downcast_ref::<StringArray>();
-        let url_col = batch.column(3).as_any().downcast_ref::<StringArray>();
-        let params_col = batch.column(4).as_any().downcast_ref::<StringArray>();
-        let type_col = batch.column(5).as_any().downcast_ref::<StringArray>();
-
-        if let (Some(ts), Some(ip), Some(ua), Some(url), Some(params), Some(ty)) =
-            (ts_col, ip_col, ua_col, url_col, params_col, type_col)
-        {
-            for i in 0..batch.num_rows() {
-                ts_data.push(ts.value(i));
-                ip_data.push(ip.is_valid(i).then(|| ip.value(i).to_string()));
-                ua_data.push(ua.is_valid(i).then(|| ua.value(i).to_string()));
-                url_data.push(url.value(i).to_string());
-                params_data.push(params.value(i).to_string());
-                type_data.push(ty.value(i).to_string());
-            }
-        }
-    }
-
-    let combined_schema = schema.as_ref().clone();
-    let combined_batch = arrow::record_batch::RecordBatch::try_new(
-        Arc::new(combined_schema),
-        vec![
-            Arc::new(TimestampMillisecondArray::from(ts_data)),
-            Arc::new(StringArray::from(ip_data)),
-            Arc::new(StringArray::from(ua_data)),
-            Arc::new(StringArray::from(url_data)),
-            Arc::new(StringArray::from(params_data)),
-            Arc::new(StringArray::from(type_data)),
-        ],
-    )?;
-
-    Ok(combined_batch)
+    let combined = concat_batches(&schema, &batches)?;
+    Ok(combined)
 }
 
 /// Compact a single day's hourly files into daily partitions
-async fn compact_day(
-    s3: Arc<dyn S3Ops>,
-    date: NaiveDate,
-    config: &CompactorConfig,
-) -> Result<()> {
+async fn compact_day(s3: Arc<dyn S3Ops>, date: NaiveDate, config: &CompactorConfig) -> Result<()> {
     let date_str = date.format("%Y-%m-%d").to_string();
     info!("Compacting data for {}", date_str);
 
@@ -401,10 +335,14 @@ async fn compact_day(
         return Ok(());
     }
 
-    info!("Merging {} hourly files for {}", hourly_files.len(), date_str);
+    info!(
+        "Merging {} hourly files for {}",
+        hourly_files.len(),
+        date_str
+    );
 
     // Merge all files
-    let merged_data = merge_parquet_files(
+    let (merged_data, _row_count) = merge_parquet_files(
         s3.clone(),
         hourly_files.clone(),
         config.target_row_group_size,
@@ -488,12 +426,9 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let s3_bucket =
-        std::env::var("TRACE_S3_BUCKET").expect("TRACE_S3_BUCKET must be set");
-    let s3_region =
-        std::env::var("TRACE_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
-    let s3_prefix =
-        std::env::var("TRACE_S3_PREFIX").unwrap_or_else(|_| "trace-events".to_string());
+    let s3_bucket = std::env::var("TRACE_S3_BUCKET").expect("TRACE_S3_BUCKET must be set");
+    let s3_region = std::env::var("TRACE_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+    let s3_prefix = std::env::var("TRACE_S3_PREFIX").unwrap_or_else(|_| "trace-events".to_string());
 
     // Check if we should run Iceberg compaction
     // Set ICEBERG_COMPACTION=true to enable Iceberg table compaction
@@ -524,9 +459,51 @@ async fn main() -> Result<()> {
     let s3: Arc<dyn S3Ops> = Arc::new(s3_client);
 
     if iceberg_mode {
+        // Warehouse root for table locations and Iceberg metadata keys.
+        // Data prefixes are relative to the key prefix, so the default
+        // warehouse sits under it.
+        let warehouse = std::env::var("ICEBERG_WAREHOUSE").unwrap_or_else(|_| {
+            format!(
+                "s3://{}/{}/iceberg",
+                s3_config.bucket,
+                s3_config.key_prefix.trim_end_matches('/')
+            )
+        });
+
+        // Optional table filter (comma-separated, short or fully-qualified
+        // names — e.g. "sessions" or "trace.ad_events,trace.sessions")
+        let tables = match std::env::var("ICEBERG_TABLES") {
+            Ok(list) => {
+                let wanted: Vec<String> = list
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let selected: Vec<iceberg::IcebergTableSpec> = iceberg::default_tables()
+                    .into_iter()
+                    .filter(|t| {
+                        let short = t.table_name.rsplit('.').next().unwrap_or(&t.table_name);
+                        wanted.iter().any(|w| *w == t.table_name || *w == short)
+                    })
+                    .collect();
+                if selected.is_empty() {
+                    warn!(
+                        "ICEBERG_TABLES='{}' matched no known table, compacting all",
+                        list
+                    );
+                    iceberg::default_tables()
+                } else {
+                    selected
+                }
+            }
+            Err(_) => iceberg::default_tables(),
+        };
+
         // Run Iceberg compaction
         let iceberg_config = iceberg::IcebergCompactorConfig {
             lookback_days,
+            warehouse,
+            tables,
             ..Default::default()
         };
 
@@ -560,9 +537,7 @@ async fn main() -> Result<()> {
             "TRACE compactor running (next run in {} seconds)",
             interval_seconds
         );
-        let mut schedule = tokio::time::interval(std::time::Duration::from_secs(
-            interval_seconds,
-        ));
+        let mut schedule = tokio::time::interval(std::time::Duration::from_secs(interval_seconds));
         // The first tick is immediate; the initial compaction above already
         // handled startup, so wait for the configured interval before looping.
         schedule.tick().await;
@@ -608,15 +583,43 @@ mod tests {
 
     #[test]
     fn test_parse_date_from_partition() {
+        let date = |y: i32, m: u32, d: u32| NaiveDate::from_ymd_opt(y, m, d).unwrap();
+
+        // Raw hourly events partition
         assert_eq!(
             parse_date_from_partition("dt=2026-05-08"),
-            Some(NaiveDate::from_ymd_opt(2026, 5, 8).unwrap())
+            Some(date(2026, 5, 8))
         );
         assert_eq!(
             parse_date_from_partition("dt=2026-01-01"),
-            Some(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap())
+            Some(date(2026, 1, 1))
         );
-        assert_eq!(parse_date_from_partition("dt=invalid"), None);
+
+        // Iceberg partitions use per-table field names, both daily
+        assert_eq!(
+            parse_date_from_partition("ts_day=2026-05-08"),
+            Some(date(2026, 5, 8))
+        );
+        assert_eq!(
+            parse_date_from_partition("started_at_day=2026-09-14"),
+            Some(date(2026, 9, 14))
+        );
+
+        // Paths: a full object key or a trailing partition separator both work
+        assert_eq!(
+            parse_date_from_partition(
+                "iceberg/sessions/data/started_at_day=2026-09-14/part.parquet"
+            ),
+            Some(date(2026, 9, 14))
+        );
+        assert_eq!(
+            parse_date_from_partition("events/dt=2026-05-08/hour=14"),
+            Some(date(2026, 5, 8))
+        );
+
+        // Malformed values and paths without a partition
+        assert_eq!(parse_date_from_partition("started_at_day=invalid"), None);
+        assert_eq!(parse_date_from_partition("ts_day=2026-13-40"), None);
         assert_eq!(parse_date_from_partition("events/"), None);
     }
 
@@ -702,7 +705,9 @@ mod tests {
         assert_eq!(keys.len(), 2);
 
         // Test delete
-        s3.delete_objects(vec!["test/key".to_string()]).await.unwrap();
+        s3.delete_objects(vec!["test/key".to_string()])
+            .await
+            .unwrap();
         let keys_after = s3.list_objects("test/").await.unwrap();
         assert_eq!(keys_after.len(), 1);
     }
