@@ -15,7 +15,10 @@ clap = { version = "4.5", features = ["derive"] }
 parquet = "53.0"
 arrow = "53.0"
 regex = "1.11"
-reqwest = { version = "0.12", features = ["json"] }
+# default-features = false drops native-tls: openssl-sys has no system
+# openssl on some build hosts (NixOS), rustls is pure Rust — same fix the
+# analytics crate applies to rust-s3
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.40", features = ["full"] }

@@ -1,6 +1,6 @@
-use anyhow::{Context, Result};
-use duckdb::{Connection, params};
 use crate::config::Config;
+use anyhow::{Context, Result};
+use duckdb::{params, Connection};
 
 pub struct DuckDBClient {
     conn: Connection,
@@ -11,10 +11,7 @@ impl DuckDBClient {
         let conn = Connection::open_in_memory()?;
 
         // Install and load required extensions
-        let mut extensions = vec![
-            "INSTALL httpfs;",
-            "LOAD httpfs;"
-        ];
+        let mut extensions = vec!["INSTALL httpfs;", "LOAD httpfs;"];
 
         // Load Iceberg extension if catalog is configured
         if config.iceberg_catalog_uri.is_some() {
@@ -26,42 +23,23 @@ impl DuckDBClient {
             .context("Failed to load DuckDB extensions")?;
 
         // Configure S3 credentials if provided
-        if let (Some(access_key), Some(secret_key)) = (&config.s3_access_key_id, &config.s3_secret_access_key) {
+        if let (Some(access_key), Some(secret_key)) =
+            (&config.s3_access_key_id, &config.s3_secret_access_key)
+        {
             let endpoint = config.s3_endpoint.as_deref().unwrap_or("s3.amazonaws.com");
-            conn.execute(
-                "SET s3_endpoint=?;",
-                params![endpoint]
-            )?;
-            conn.execute(
-                "SET s3_access_key_id=?;",
-                params![access_key]
-            )?;
-            conn.execute(
-                "SET s3_secret_access_key=?;",
-                params![secret_key]
-            )?;
+            conn.execute("SET s3_endpoint=?;", params![endpoint])?;
+            conn.execute("SET s3_access_key_id=?;", params![access_key])?;
+            conn.execute("SET s3_secret_access_key=?;", params![secret_key])?;
         }
 
-        conn.execute(
-            "SET s3_region=?;",
-            params![&config.s3_region]
-        )?;
+        conn.execute("SET s3_region=?;", params![&config.s3_region])?;
 
-        conn.execute(
-            "SET s3_use_ssl=true;",
-            params![]
-        )?;
+        conn.execute("SET s3_use_ssl=true;", params![])?;
 
         // Set memory limits for large queries
-        conn.execute(
-            "SET memory_limit='2GB';",
-            params![]
-        )?;
+        conn.execute("SET memory_limit='2GB';", params![])?;
 
-        conn.execute(
-            "SET threads=4;",
-            params![]
-        )?;
+        conn.execute("SET threads=4;", params![])?;
 
         let mut client = Self { conn };
 
@@ -87,14 +65,16 @@ impl DuckDBClient {
     pub fn execute_query(&self, sql: &str) -> Result<QueryResult> {
         let mut stmt = self.conn.prepare(sql)?;
         let columns: Vec<String> = stmt.column_names().into_iter().map(String::from).collect();
-        let rows = stmt.query_map([], |row| {
-            let mut values = Vec::new();
-            for i in 0..row.as_ref().column_count() {
-                let value: Option<String> = row.get(i)?;
-                values.push(value.unwrap_or_else(|| "NULL".to_string()));
-            }
-            Ok(values)
-        })?.collect::<Result<Vec<_>, _>>()?;
+        let rows = stmt
+            .query_map([], |row| {
+                let mut values = Vec::new();
+                for i in 0..row.as_ref().column_count() {
+                    let value: Option<String> = row.get(i)?;
+                    values.push(value.unwrap_or_else(|| "NULL".to_string()));
+                }
+                Ok(values)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(QueryResult { columns, rows })
     }
@@ -120,9 +100,13 @@ impl DuckDBClient {
     /// Setup views for Iceberg tables
     /// Requires Iceberg extension and catalog URI to be configured
     pub fn setup_iceberg_views(&self, config: &Config) -> Result<()> {
-        let catalog_uri = config.iceberg_catalog_uri.as_ref()
+        let catalog_uri = config
+            .iceberg_catalog_uri
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Iceberg catalog URI not configured"))?;
-        let warehouse = config.iceberg_warehouse.as_ref()
+        let warehouse = config
+            .iceberg_warehouse
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Iceberg warehouse not configured"))?;
 
         // Build the catalog connection string
@@ -136,7 +120,8 @@ impl DuckDBClient {
              SELECT * FROM iceberg_scan('{}', {});",
             ad_events_path, catalog_option
         );
-        self.conn.execute(&ad_events_sql, params![])
+        self.conn
+            .execute(&ad_events_sql, params![])
             .context("Failed to create view for Iceberg ad_events table")?;
 
         // Create view for campaigns dimension table
@@ -146,7 +131,8 @@ impl DuckDBClient {
              SELECT * FROM iceberg_scan('{}', {});",
             campaigns_path, catalog_option
         );
-        self.conn.execute(&campaigns_sql, params![])
+        self.conn
+            .execute(&campaigns_sql, params![])
             .context("Failed to create view for Iceberg campaigns table")?;
 
         // Create view for creatives dimension table
@@ -156,8 +142,22 @@ impl DuckDBClient {
              SELECT * FROM iceberg_scan('{}', {});",
             creatives_path, catalog_option
         );
-        self.conn.execute(&creatives_sql, params![])
+        self.conn
+            .execute(&creatives_sql, params![])
             .context("Failed to create view for Iceberg creatives table")?;
+
+        // Create view for assets dimension table (headlines, images, and
+        // landing pages exploded from synced creatives — schema in
+        // analytics/schemas/assets_iceberg.sql)
+        let assets_path = format!("{}/assets", warehouse);
+        let assets_sql = format!(
+            "CREATE OR REPLACE VIEW iceberg_assets AS \
+             SELECT * FROM iceberg_scan('{}', {});",
+            assets_path, catalog_option
+        );
+        self.conn
+            .execute(&assets_sql, params![])
+            .context("Failed to create view for Iceberg assets table")?;
 
         Ok(())
     }
@@ -170,7 +170,8 @@ impl DuckDBClient {
              SELECT * FROM read_parquet('{}/events/**/*.parquet');",
             s3_path
         );
-        self.conn.execute(&view_sql, params![])
+        self.conn
+            .execute(&view_sql, params![])
             .context("Failed to create view for Parquet events")?;
 
         let compacted_sql = format!(
@@ -178,7 +179,8 @@ impl DuckDBClient {
              SELECT * FROM read_parquet('{}/events-compacted/**/*.parquet');",
             s3_path
         );
-        self.conn.execute(&compacted_sql, params![])
+        self.conn
+            .execute(&compacted_sql, params![])
             .context("Failed to create view for compacted Parquet events")?;
 
         Ok(())
@@ -232,6 +234,24 @@ impl DuckDBClient {
             )
         }
     }
+
+    /// Get the SQL fragment for querying the assets dimension table
+    /// (headlines, images, and landing pages synced from the ad network
+    /// APIs, partitioned by network and type)
+    pub fn assets_table_sql(&self, config: &Config) -> String {
+        if config.is_iceberg_enabled() {
+            "iceberg_assets".to_string()
+        } else {
+            // For Parquet mode, read the syncer's asset dimension files
+            // directly. Each file carries network/type as columns, so no
+            // hive_partitioning is needed (it would duplicate them)
+            let assets_path = format!("s3://{}/{}/assets", config.s3_bucket, config.s3_prefix);
+            format!(
+                "(SELECT * FROM read_parquet('{}/**/*.parquet'))",
+                assets_path
+            )
+        }
+    }
 }
 
 pub struct QueryResult {
@@ -252,7 +272,11 @@ impl QueryResult {
                 if j > 0 {
                     json.push(',');
                 }
-                json.push_str(&format!("\"{}\":{}", self.columns[j], escape_json_value(value)));
+                json.push_str(&format!(
+                    "\"{}\":{}",
+                    self.columns[j],
+                    escape_json_value(value)
+                ));
             }
             json.push('}');
         }
@@ -270,7 +294,12 @@ impl QueryResult {
 
         // Data rows
         for row in &self.rows {
-            csv.push_str(&row.iter().map(|v| escape_csv_value(v)).collect::<Vec<_>>().join(","));
+            csv.push_str(
+                &row.iter()
+                    .map(|v| escape_csv_value(v))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
             csv.push('\n');
         }
 
@@ -356,9 +385,7 @@ mod tests {
     fn test_query_result_to_json_single_row() {
         let result = QueryResult {
             columns: vec!["col1".to_string(), "col2".to_string()],
-            rows: vec![
-                vec!["value1".to_string(), "value2".to_string()],
-            ],
+            rows: vec![vec!["value1".to_string(), "value2".to_string()]],
         };
         let json = result.to_json();
         assert!(json.contains("\"col1\":\"value1\""));
@@ -392,9 +419,7 @@ mod tests {
     fn test_query_result_to_csv_with_special_chars() {
         let result = QueryResult {
             columns: vec!["col1".to_string()],
-            rows: vec![
-                vec!["value,with,commas".to_string()],
-            ],
+            rows: vec![vec!["value,with,commas".to_string()]],
         };
         let csv = result.to_csv();
         assert_eq!(csv, "col1\n\"value,with,commas\"\n");

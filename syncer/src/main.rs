@@ -1,4 +1,5 @@
 mod api_client;
+mod assets;
 mod creative;
 mod hierarchy;
 mod registry;
@@ -9,10 +10,11 @@ use anyhow::Result;
 use clap::Parser;
 use std::time::Duration;
 use tokio::time::interval;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use api_client::{ApiClient, ApiSyncResult, HierarchySyncResult, MetricsSyncResult};
+use assets::AssetRegistry;
 use registry::{CreativeRegistry, HierarchyRegistry, MetricsRegistry};
 use s3_store::{HierarchyStore, S3CreativeStore};
 
@@ -81,6 +83,13 @@ async fn main() -> Result<()> {
     let mut registry = CreativeRegistry::new(store.clone());
     let mut metrics_registry = MetricsRegistry::new(store.clone());
     let mut hierarchy_registry = HierarchyRegistry::new(store.clone());
+    let mut asset_registry = AssetRegistry::new(store.clone());
+
+    // Load previously synced assets so first_seen history survives restarts
+    match asset_registry.load().await {
+        Ok(count) => info!("Loaded {} existing assets from previous syncs", count),
+        Err(e) => warn!("Could not load existing assets (starting empty): {}", e),
+    }
 
     // Determine sync mode
     let sync_creatives = args.mode == "creatives" || args.mode == "both";
@@ -159,7 +168,7 @@ async fn main() -> Result<()> {
     if args.once {
         // Run once and exit
         if sync_creatives {
-            run_sync(&mut registry, &mut clients).await?;
+            run_sync(&mut registry, &mut asset_registry, &mut clients).await?;
         }
         if sync_metrics {
             run_metrics_sync(&mut metrics_registry, &mut clients, start_date, end_date).await?;
@@ -174,11 +183,10 @@ async fn main() -> Result<()> {
 
         loop {
             if sync_creatives {
-                run_sync(&mut registry, &mut clients).await?;
+                run_sync(&mut registry, &mut asset_registry, &mut clients).await?;
             }
             if sync_metrics {
-                run_metrics_sync(&mut metrics_registry, &mut clients, start_date, end_date)
-                    .await?;
+                run_metrics_sync(&mut metrics_registry, &mut clients, start_date, end_date).await?;
             }
             if sync_hierarchy {
                 run_hierarchy_sync(&mut hierarchy_registry, &mut clients).await?;
@@ -192,6 +200,7 @@ async fn main() -> Result<()> {
 
 async fn run_sync(
     registry: &mut CreativeRegistry,
+    asset_registry: &mut AssetRegistry,
     clients: &mut [Box<dyn ApiClient>],
 ) -> Result<()> {
     info!("Starting creative sync...");
@@ -211,6 +220,17 @@ async fn run_sync(
                 );
                 total_fetched += creatives.len();
 
+                // Explode creatives into the asset dimension before ownership
+                // of each creative moves into the creative registry
+                let new_assets = asset_registry.sync_from_creatives(creatives.clone()).await;
+                if new_assets > 0 {
+                    info!(
+                        "Asset dimension: {} new assets from {}",
+                        new_assets,
+                        client.network_name()
+                    );
+                }
+
                 // Add to registry
                 for creative in creatives {
                     registry.add_creative(creative).await?;
@@ -227,9 +247,16 @@ async fn run_sync(
     info!("Persisting registry to S3...");
     registry.persist().await?;
 
+    // Persist the asset dimension, partitioned by (network, type). No-op
+    // when empty: store_assets writes one file per non-empty partition.
+    info!("Persisting asset dimension to S3...");
+    asset_registry.persist().await?;
+
     info!(
-        "Sync complete: {} creatives fetched, {} errors",
-        total_fetched, total_errors
+        "Sync complete: {} creatives fetched, {} assets in dimension, {} errors",
+        total_fetched,
+        asset_registry.len(),
+        total_errors
     );
 
     Ok(())
@@ -241,7 +268,10 @@ async fn run_metrics_sync(
     start_date: chrono::NaiveDate,
     end_date: chrono::NaiveDate,
 ) -> Result<()> {
-    info!("Starting metrics sync from {} to {}...", start_date, end_date);
+    info!(
+        "Starting metrics sync from {} to {}...",
+        start_date, end_date
+    );
 
     let mut total_fetched = 0;
     let mut total_errors = 0;
@@ -264,7 +294,11 @@ async fn run_metrics_sync(
                 }
             }
             Err(e) => {
-                error!("Failed to fetch metrics from {}: {}", client.network_name(), e);
+                error!(
+                    "Failed to fetch metrics from {}: {}",
+                    client.network_name(),
+                    e
+                );
                 total_errors += 1;
             }
         }
@@ -310,7 +344,11 @@ async fn run_hierarchy_sync(
                 }
             }
             Err(e) => {
-                error!("Failed to fetch hierarchy from {}: {}", client.network_name(), e);
+                error!(
+                    "Failed to fetch hierarchy from {}: {}",
+                    client.network_name(),
+                    e
+                );
                 total_errors += 1;
             }
         }
@@ -322,4 +360,76 @@ async fn run_hierarchy_sync(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use s3_store::{AssetStore, MockCreativeStore};
+
+    /// In-memory asset store capturing what run_sync persists
+    ///
+    /// Clone shares the backing buffer, so a clone observes the same
+    /// persisted rows — the test relies on this to snapshot after run_sync.
+    #[derive(Clone)]
+    struct MemoryAssetStore {
+        assets: std::sync::Arc<tokio::sync::RwLock<Vec<assets::AssetRecord>>>,
+    }
+
+    impl MemoryAssetStore {
+        fn new() -> Self {
+            Self {
+                assets: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            }
+        }
+
+        async fn snapshot(&self) -> Vec<assets::AssetRecord> {
+            self.assets.read().await.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AssetStore for MemoryAssetStore {
+        async fn store_assets(&self, assets: Vec<assets::AssetRecord>) -> anyhow::Result<()> {
+            *self.assets.write().await = assets;
+            Ok(())
+        }
+
+        async fn load_assets(&self) -> anyhow::Result<Vec<assets::AssetRecord>> {
+            Ok(self.assets.read().await.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_sync_feeds_and_persists_asset_dimension() {
+        let mut creative_registry = CreativeRegistry::new(MockCreativeStore::new());
+        let asset_store = MemoryAssetStore::new();
+        let mut asset_registry = AssetRegistry::new(asset_store.clone());
+        let mut clients: Vec<Box<dyn ApiClient>> = vec![Box::new(api_client::DemoClient::new())];
+
+        run_sync(&mut creative_registry, &mut asset_registry, &mut clients)
+            .await
+            .unwrap();
+
+        // Demo creatives carry headline + image + landing page, so the
+        // dimension must have been fed — this is the wiring that turns a
+        // creative sync into an assets table
+        assert!(
+            !asset_registry.is_empty(),
+            "run_sync must populate the asset dimension from synced creatives"
+        );
+
+        let persisted = asset_store.snapshot().await;
+        assert!(
+            !persisted.is_empty(),
+            "run_sync must persist the asset dimension"
+        );
+        assert_eq!(persisted.len(), asset_registry.len());
+
+        // Every documented asset type is represented
+        let types: Vec<&str> = persisted.iter().map(|a| a.asset_type.as_str()).collect();
+        assert!(types.contains(&assets::TYPE_HEADLINE));
+        assert!(types.contains(&assets::TYPE_IMAGE));
+        assert!(types.contains(&assets::TYPE_LANDING_PAGE));
+    }
 }

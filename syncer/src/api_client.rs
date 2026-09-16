@@ -39,7 +39,11 @@ pub trait ApiClient: Send + Sync {
     async fn fetch_creatives(&mut self) -> Result<ApiSyncResult>;
 
     /// Fetch performance metrics for a date range
-    async fn fetch_metrics(&mut self, start_date: NaiveDate, end_date: NaiveDate) -> Result<MetricsSyncResult>;
+    async fn fetch_metrics(
+        &mut self,
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+    ) -> Result<MetricsSyncResult>;
 
     /// Fetch account hierarchy from the API
     async fn fetch_hierarchy(&mut self) -> Result<HierarchySyncResult>;
@@ -150,7 +154,11 @@ impl ApiClient for TaboolaClient {
         })
     }
 
-    async fn fetch_metrics(&mut self, start_date: NaiveDate, end_date: NaiveDate) -> Result<MetricsSyncResult> {
+    async fn fetch_metrics(
+        &mut self,
+        _start_date: NaiveDate,
+        _end_date: NaiveDate,
+    ) -> Result<MetricsSyncResult> {
         // Placeholder implementation - Taboola API metrics endpoint would be called here
         // For now, return empty metrics
         Ok(MetricsSyncResult {
@@ -164,7 +172,10 @@ impl ApiClient for TaboolaClient {
 
         let hierarchy = AccountHierarchy {
             network: "taboola".to_string(),
-            account_id: self.account_id.clone().unwrap_or_else(|| "default".to_string()),
+            account_id: self
+                .account_id
+                .clone()
+                .unwrap_or_else(|| "default".to_string()),
             account_name: None,
             campaigns: campaigns
                 .into_iter()
@@ -177,7 +188,7 @@ impl ApiClient for TaboolaClient {
                         .items
                         .into_iter()
                         .map(|item| crate::hierarchy::CreativeHierarchy {
-                            creative_id: item.id,
+                            creative_id: item.id.clone(),
                             headline: item.title,
                             image_url: item.thumbnail_url,
                             landing_page_url: item.url,
@@ -290,7 +301,11 @@ impl ApiClient for OutbrainClient {
         })
     }
 
-    async fn fetch_metrics(&mut self, _start_date: NaiveDate, _end_date: NaiveDate) -> Result<MetricsSyncResult> {
+    async fn fetch_metrics(
+        &mut self,
+        _start_date: NaiveDate,
+        _end_date: NaiveDate,
+    ) -> Result<MetricsSyncResult> {
         // Placeholder implementation - Outbrain API metrics endpoint would be called here
         Ok(MetricsSyncResult {
             metrics: vec![],
@@ -316,7 +331,7 @@ impl ApiClient for OutbrainClient {
                         .links
                         .into_iter()
                         .map(|link| crate::hierarchy::CreativeHierarchy {
-                            creative_id: link.id,
+                            creative_id: link.id.clone(),
                             headline: link.metadata.as_ref().and_then(|m| m.title.clone()),
                             image_url: link.image_url,
                             landing_page_url: link.url,
@@ -428,7 +443,11 @@ impl ApiClient for MgidClient {
         })
     }
 
-    async fn fetch_metrics(&mut self, _start_date: NaiveDate, _end_date: NaiveDate) -> Result<MetricsSyncResult> {
+    async fn fetch_metrics(
+        &mut self,
+        _start_date: NaiveDate,
+        _end_date: NaiveDate,
+    ) -> Result<MetricsSyncResult> {
         // Placeholder implementation - MGID API metrics endpoint would be called here
         Ok(MetricsSyncResult {
             metrics: vec![],
@@ -454,7 +473,7 @@ impl ApiClient for MgidClient {
                         .teasers
                         .into_iter()
                         .map(|teaser| crate::hierarchy::CreativeHierarchy {
-                            creative_id: teaser.id,
+                            creative_id: teaser.id.clone(),
                             headline: teaser.title,
                             image_url: teaser.image,
                             landing_page_url: teaser.url,
@@ -569,7 +588,11 @@ impl ApiClient for RevcontentClient {
         })
     }
 
-    async fn fetch_metrics(&mut self, _start_date: NaiveDate, _end_date: NaiveDate) -> Result<MetricsSyncResult> {
+    async fn fetch_metrics(
+        &mut self,
+        _start_date: NaiveDate,
+        _end_date: NaiveDate,
+    ) -> Result<MetricsSyncResult> {
         // Placeholder implementation - Revcontent API metrics endpoint would be called here
         Ok(MetricsSyncResult {
             metrics: vec![],
@@ -595,7 +618,7 @@ impl ApiClient for RevcontentClient {
                         .widgets
                         .into_iter()
                         .map(|widget| crate::hierarchy::CreativeHierarchy {
-                            creative_id: widget.id,
+                            creative_id: widget.id.clone(),
                             headline: widget.title,
                             image_url: widget.thumbnail,
                             landing_page_url: widget.url,
@@ -691,7 +714,11 @@ impl ApiClient for DemoClient {
         })
     }
 
-    async fn fetch_metrics(&mut self, _start_date: NaiveDate, _end_date: NaiveDate) -> Result<MetricsSyncResult> {
+    async fn fetch_metrics(
+        &mut self,
+        _start_date: NaiveDate,
+        _end_date: NaiveDate,
+    ) -> Result<MetricsSyncResult> {
         Ok(MetricsSyncResult {
             metrics: vec![],
             next_page_token: None,
@@ -707,7 +734,10 @@ impl ApiClient for DemoClient {
                 .generate_demo_creatives()
                 .into_iter()
                 .map(|c| {
-                    let campaign_id = c.campaign_id.clone().unwrap_or_else(|| "unknown".to_string());
+                    let campaign_id = c
+                        .campaign_id
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
                     let campaign_name = c.campaign_name.clone();
                     crate::hierarchy::CampaignHierarchy {
                         campaign_id,

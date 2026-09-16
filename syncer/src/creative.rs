@@ -65,7 +65,7 @@ pub struct PerformanceMetrics {
     pub conversions: Option<i64>,
 
     /// Click-through rate (calculated, in basis points: 10000 = 100%)
-    pub_ctr_bps: Option<i32>,
+    pub ctr_bps: Option<i32>,
 
     /// Cost per click in microcurrency
     pub cpc_micros: Option<i64>,
@@ -232,15 +232,27 @@ mod tests {
 
     #[test]
     fn test_calculate_cpc_micros() {
-        assert_eq!(PerformanceMetrics::calculate_cpc_micros(1000000, 100), Some(10000)); // $0.01
-        assert_eq!(PerformanceMetrics::calculate_cpc_micros(500000, 50), Some(10000)); // $0.01
+        assert_eq!(
+            PerformanceMetrics::calculate_cpc_micros(1000000, 100),
+            Some(10000)
+        ); // $0.01
+        assert_eq!(
+            PerformanceMetrics::calculate_cpc_micros(500000, 50),
+            Some(10000)
+        ); // $0.01
         assert_eq!(PerformanceMetrics::calculate_cpc_micros(1000000, 0), None); // No clicks
     }
 
     #[test]
     fn test_calculate_cpm_micros() {
-        assert_eq!(PerformanceMetrics::calculate_cpm_micros(1000000, 1000), Some(1000000)); // $1.00
-        assert_eq!(PerformanceMetrics::calculate_cpm_micros(500000, 500), Some(1000000)); // $1.00
+        assert_eq!(
+            PerformanceMetrics::calculate_cpm_micros(1000000, 1000),
+            Some(1000000)
+        ); // $1.00
+        assert_eq!(
+            PerformanceMetrics::calculate_cpm_micros(500000, 500),
+            Some(1000000)
+        ); // $1.00
         assert_eq!(PerformanceMetrics::calculate_cpm_micros(1000000, 0), None); // No impressions
     }
 
@@ -288,8 +300,8 @@ mod tests {
             Some("Test Campaign".to_string()),
             Some("creative456".to_string()),
             chrono::NaiveDate::from_ymd_opt(2026, 5, 8).unwrap(),
-            1000,   // impressions
-            50,     // clicks
+            1000,    // impressions
+            50,      // clicks
             1000000, // $1.00 in microdollars
             Some(5), // conversions
             Utc::now(),

@@ -1,7 +1,7 @@
+use crate::config::Config;
+use crate::duckdb::DuckDBClient;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use crate::duckdb::DuckDBClient;
-use crate::config::Config;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
@@ -85,6 +85,14 @@ pub fn list_reports() -> Vec<Report> {
             supports_iceberg: true,
         },
         Report {
+            name: "asset_performance".to_string(),
+            description: "Per-asset performance: assets dimension joined to ad events".to_string(),
+            category: ReportCategory::Asset,
+            sql_template: include_str!("../queries/asset_performance.sql").to_string(),
+            default_params: HashMap::new(),
+            supports_iceberg: true,
+        },
+        Report {
             name: "network_comparison".to_string(),
             description: "Compare performance across ad networks".to_string(),
             category: ReportCategory::Network,
@@ -158,7 +166,9 @@ pub fn list_reports() -> Vec<Report> {
         },
         Report {
             name: "attribution_first_touch".to_string(),
-            description: "First-touch attribution: credits initial acquisition source for conversions".to_string(),
+            description:
+                "First-touch attribution: credits initial acquisition source for conversions"
+                    .to_string(),
             category: ReportCategory::Journey,
             sql_template: include_str!("../queries/attribution_first_touch.sql").to_string(),
             default_params: HashMap::new(),
@@ -166,7 +176,8 @@ pub fn list_reports() -> Vec<Report> {
         },
         Report {
             name: "attribution_last_touch".to_string(),
-            description: "Last-touch attribution: credits final touchpoint before conversion".to_string(),
+            description: "Last-touch attribution: credits final touchpoint before conversion"
+                .to_string(),
             category: ReportCategory::Journey,
             sql_template: include_str!("../queries/attribution_last_touch.sql").to_string(),
             default_params: HashMap::new(),
@@ -174,7 +185,8 @@ pub fn list_reports() -> Vec<Report> {
         },
         Report {
             name: "attribution_linear".to_string(),
-            description: "Linear attribution: distributes credit equally across all touchpoints".to_string(),
+            description: "Linear attribution: distributes credit equally across all touchpoints"
+                .to_string(),
             category: ReportCategory::Journey,
             sql_template: include_str!("../queries/attribution_linear.sql").to_string(),
             default_params: HashMap::new(),
@@ -182,7 +194,8 @@ pub fn list_reports() -> Vec<Report> {
         },
         Report {
             name: "session_reconstruction".to_string(),
-            description: "Reconstruct sessions from events using gap-based sessionization".to_string(),
+            description: "Reconstruct sessions from events using gap-based sessionization"
+                .to_string(),
             category: ReportCategory::Journey,
             sql_template: include_str!("../queries/session_reconstruction.sql").to_string(),
             default_params: HashMap::new(),
@@ -256,9 +269,7 @@ pub fn list_reports() -> Vec<Report> {
 }
 
 pub fn get_report(name: &str) -> Option<Report> {
-    list_reports()
-        .into_iter()
-        .find(|r| r.name == name)
+    list_reports().into_iter().find(|r| r.name == name)
 }
 
 /// Get reports configured for daily scheduled execution
@@ -282,6 +293,9 @@ pub fn render_template_with_client(
     // Replace table references with appropriate Iceberg or Parquet views
     let events_table = db.events_table_sql(config);
     sql = sql.replace("{{events_table}}", &events_table);
+
+    let assets_table = db.assets_table_sql(config);
+    sql = sql.replace("{{assets_table}}", &assets_table);
 
     // Replace date parameters
     if let Some(start) = &params.start_date {
@@ -378,7 +392,8 @@ mod tests {
 
     #[test]
     fn test_render_template_basic() {
-        let template = "SELECT * FROM '{{s3_path}}' WHERE ts >= '{{start_date}}' AND ts < '{{end_date}}'";
+        let template =
+            "SELECT * FROM '{{s3_path}}' WHERE ts >= '{{start_date}}' AND ts < '{{end_date}}'";
         let params = ReportParams {
             s3_path: Some("s3://my-bucket/events".to_string()),
             start_date: Some("2026-01-01".to_string()),
@@ -416,7 +431,10 @@ mod tests {
         assert!(matches!(top_headlines.category, ReportCategory::Asset));
 
         let network_comparison = get_report("network_comparison").unwrap();
-        assert!(matches!(network_comparison.category, ReportCategory::Network));
+        assert!(matches!(
+            network_comparison.category,
+            ReportCategory::Network
+        ));
 
         let trending = get_report("trending_campaigns").unwrap();
         assert!(matches!(trending.category, ReportCategory::Time));

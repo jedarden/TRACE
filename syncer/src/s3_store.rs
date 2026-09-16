@@ -4,9 +4,10 @@ use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::{config::Region, Client};
 use aws_smithy_types::byte_stream::ByteStream;
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
 use parquet::arrow::arrow_writer::ArrowWriter;
 
+use crate::assets::AssetRecord;
 use crate::creative::{CreativeMetadata, PerformanceMetrics};
 use crate::hierarchy::AccountHierarchy;
 
@@ -34,6 +35,20 @@ pub trait MetricsStore: Send + Sync {
     ) -> anyhow::Result<Vec<PerformanceMetrics>>;
 }
 
+/// Trait for asset dimension storage
+///
+/// Assets are persisted partitioned by (network, type) — the layout
+/// documented for the trace.assets Iceberg table in
+/// analytics/schemas/assets_iceberg.sql.
+#[async_trait]
+pub trait AssetStore: Send + Sync {
+    /// Store asset dimension rows, one Parquet file per (network, type) partition
+    async fn store_assets(&self, assets: Vec<AssetRecord>) -> anyhow::Result<()>;
+
+    /// Load all asset dimension rows across every partition
+    async fn load_assets(&self) -> anyhow::Result<Vec<AssetRecord>>;
+}
+
 /// Trait for hierarchy storage
 #[async_trait]
 pub trait HierarchyStore: Send + Sync {
@@ -41,13 +56,18 @@ pub trait HierarchyStore: Send + Sync {
     async fn store_hierarchy(&self, hierarchy: &AccountHierarchy) -> anyhow::Result<()>;
 
     /// Load account hierarchy for a specific network and account
-    async fn load_hierarchy(&self, network: &str, account_id: &str) -> anyhow::Result<Option<AccountHierarchy>>;
+    async fn load_hierarchy(
+        &self,
+        network: &str,
+        account_id: &str,
+    ) -> anyhow::Result<Option<AccountHierarchy>>;
 
     /// List all available hierarchies
     async fn list_hierarchies(&self) -> anyhow::Result<Vec<(String, String)>>;
 }
 
 /// S3-backed creative store
+#[derive(Clone)]
 pub struct S3CreativeStore {
     client: Client,
     bucket: String,
@@ -84,14 +104,29 @@ impl S3CreativeStore {
 
     /// Get the S3 key for hierarchy data
     fn hierarchy_key(&self, network: &str, account_id: &str) -> String {
-        format!("{}/hierarchy/{}-{}.json", self.key_prefix, network, account_id)
+        format!(
+            "{}/hierarchy/{}-{}.json",
+            self.key_prefix, network, account_id
+        )
+    }
+
+    /// Get the S3 key for an assets partition (Hive-style, matching the
+    /// documented trace.assets layout: network=<network>/type=<type>/)
+    fn assets_partition_key(&self, network: &str, asset_type: &str) -> String {
+        format!(
+            "{}/assets/network={}/type={}/assets.parquet",
+            self.key_prefix, network, asset_type
+        )
+    }
+
+    /// Get the S3 prefix covering every assets partition
+    fn assets_prefix(&self) -> String {
+        format!("{}/assets/", self.key_prefix)
     }
 
     /// Convert performance metrics to Parquet format
     fn metrics_to_parquet(&self, metrics: Vec<PerformanceMetrics>) -> anyhow::Result<Vec<u8>> {
-        use arrow::array::{
-            Int64Array, LongArray, NullArray, StringArray, TimestampMillisecondArray,
-        };
+        use arrow::array::{Int32Array, Int64Array, StringArray, TimestampMillisecondArray};
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
         use std::sync::Arc;
@@ -145,12 +180,12 @@ impl S3CreativeStore {
                 Arc::new(StringArray::from(campaign_ids)),
                 Arc::new(StringArray::from(campaign_names)),
                 Arc::new(StringArray::from(creative_ids)),
-                Arc::new(LongArray::from(dates)),
+                Arc::new(Int32Array::from(dates)),
                 Arc::new(Int64Array::from(impressions)),
                 Arc::new(Int64Array::from(clicks)),
                 Arc::new(Int64Array::from(spend_micros)),
                 Arc::new(Int64Array::from(conversions)),
-                Arc::new(Int64Array::from(ctr_bps.map(|v| v as i64))),
+                Arc::new(Int32Array::from(ctr_bps)),
                 Arc::new(Int64Array::from(cpc_micros)),
                 Arc::new(Int64Array::from(cpm_micros)),
                 Arc::new(TimestampMillisecondArray::from(synced_at)),
@@ -453,6 +488,196 @@ impl S3CreativeStore {
 
         Ok(creatives)
     }
+
+    /// Convert asset dimension rows to Parquet format
+    fn assets_to_parquet(&self, assets: Vec<AssetRecord>) -> anyhow::Result<Vec<u8>> {
+        use arrow::array::{StringArray, TimestampMillisecondArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let asset_ids: Vec<String> = assets.iter().map(|a| a.asset_id.clone()).collect();
+        let networks: Vec<String> = assets.iter().map(|a| a.network.clone()).collect();
+        let asset_types: Vec<String> = assets.iter().map(|a| a.asset_type.clone()).collect();
+        let contents: Vec<String> = assets.iter().map(|a| a.content.clone()).collect();
+        let creative_ids: Vec<Option<String>> =
+            assets.iter().map(|a| a.creative_id.clone()).collect();
+        let campaign_ids: Vec<Option<String>> =
+            assets.iter().map(|a| a.campaign_id.clone()).collect();
+        let campaign_names: Vec<Option<String>> =
+            assets.iter().map(|a| a.campaign_name.clone()).collect();
+        let item_ids: Vec<Option<String>> = assets.iter().map(|a| a.item_id.clone()).collect();
+        let first_seen: Vec<i64> = assets
+            .iter()
+            .map(|a| a.first_seen.timestamp_millis())
+            .collect();
+        let last_seen: Vec<i64> = assets
+            .iter()
+            .map(|a| a.last_seen.timestamp_millis())
+            .collect();
+        let synced_at: Vec<i64> = assets
+            .iter()
+            .map(|a| a.synced_at.timestamp_millis())
+            .collect();
+
+        let schema = Schema::new(vec![
+            Field::new("asset_id", DataType::Utf8, false),
+            Field::new("network", DataType::Utf8, false),
+            Field::new("type", DataType::Utf8, false),
+            Field::new("content", DataType::Utf8, false),
+            Field::new("creative_id", DataType::Utf8, true),
+            Field::new("campaign_id", DataType::Utf8, true),
+            Field::new("campaign_name", DataType::Utf8, true),
+            Field::new("item_id", DataType::Utf8, true),
+            Field::new(
+                "first_seen",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new(
+                "last_seen",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new(
+                "synced_at",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                false,
+            ),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(asset_ids)),
+                Arc::new(StringArray::from(networks)),
+                Arc::new(StringArray::from(asset_types)),
+                Arc::new(StringArray::from(contents)),
+                Arc::new(StringArray::from(creative_ids)),
+                Arc::new(StringArray::from(campaign_ids)),
+                Arc::new(StringArray::from(campaign_names)),
+                Arc::new(StringArray::from(item_ids)),
+                Arc::new(TimestampMillisecondArray::from(first_seen)),
+                Arc::new(TimestampMillisecondArray::from(last_seen)),
+                Arc::new(TimestampMillisecondArray::from(synced_at)),
+            ],
+        )?;
+
+        let mut buffer = Vec::new();
+        let props = parquet::file::properties::WriterProperties::builder().build();
+        let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), Some(props))?;
+
+        writer.write(&batch)?;
+        writer.close()?;
+
+        Ok(buffer)
+    }
+
+    /// Convert Parquet data to asset dimension rows
+    fn parquet_to_assets(&self, data: &[u8]) -> anyhow::Result<Vec<AssetRecord>> {
+        use arrow::array::{Array, StringArray, TimestampMillisecondArray};
+        use bytes::Bytes;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let bytes = Bytes::from(data.to_vec());
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)?.build()?;
+
+        let mut assets = Vec::new();
+
+        for batch in reader {
+            let batch = batch?;
+
+            let asset_ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast asset_id column"))?;
+
+            let networks = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast network column"))?;
+
+            let asset_types = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast type column"))?;
+
+            let contents = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast content column"))?;
+
+            let creative_ids = batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast creative_id column"))?;
+
+            let campaign_ids = batch
+                .column(5)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast campaign_id column"))?;
+
+            let campaign_names = batch
+                .column(6)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast campaign_name column"))?;
+
+            let item_ids = batch
+                .column(7)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast item_id column"))?;
+
+            let first_seen = batch
+                .column(8)
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast first_seen column"))?;
+
+            let last_seen = batch
+                .column(9)
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast last_seen column"))?;
+
+            let synced_at = batch
+                .column(10)
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to cast synced_at column"))?;
+
+            for i in 0..batch.num_rows() {
+                assets.push(AssetRecord {
+                    asset_id: asset_ids.value(i).to_string(),
+                    network: networks.value(i).to_string(),
+                    asset_type: asset_types.value(i).to_string(),
+                    content: contents.value(i).to_string(),
+                    creative_id: creative_ids
+                        .is_valid(i)
+                        .then(|| creative_ids.value(i).to_string()),
+                    campaign_id: campaign_ids
+                        .is_valid(i)
+                        .then(|| campaign_ids.value(i).to_string()),
+                    campaign_name: campaign_names
+                        .is_valid(i)
+                        .then(|| campaign_names.value(i).to_string()),
+                    item_id: item_ids.is_valid(i).then(|| item_ids.value(i).to_string()),
+                    first_seen: DateTime::from_timestamp_millis(first_seen.value(i)).unwrap(),
+                    last_seen: DateTime::from_timestamp_millis(last_seen.value(i)).unwrap(),
+                    synced_at: DateTime::from_timestamp_millis(synced_at.value(i)).unwrap(),
+                });
+            }
+        }
+
+        Ok(assets)
+    }
 }
 
 #[async_trait]
@@ -568,6 +793,91 @@ impl MetricsStore for S3CreativeStore {
 }
 
 #[async_trait]
+impl AssetStore for S3CreativeStore {
+    async fn store_assets(&self, assets: Vec<AssetRecord>) -> anyhow::Result<()> {
+        // One Parquet file per (network, type) partition
+        let mut by_partition: std::collections::HashMap<(String, String), Vec<AssetRecord>> =
+            std::collections::HashMap::new();
+
+        for asset in assets {
+            by_partition
+                .entry((asset.network.clone(), asset.asset_type.clone()))
+                .or_default()
+                .push(asset);
+        }
+
+        for ((network, asset_type), partition_assets) in by_partition {
+            let parquet_data = self.assets_to_parquet(partition_assets)?;
+            let key = self.assets_partition_key(&network, &asset_type);
+
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .body(ByteStream::from(parquet_data))
+                .send()
+                .await?;
+
+            tracing::info!("Stored assets partition to s3://{}/{}", self.bucket, key);
+        }
+
+        Ok(())
+    }
+
+    async fn load_assets(&self) -> anyhow::Result<Vec<AssetRecord>> {
+        let prefix = self.assets_prefix();
+
+        let response = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(&prefix)
+            .send()
+            .await?;
+
+        let mut assets = Vec::new();
+
+        if let Some(objects) = response.contents {
+            for obj in objects {
+                let Some(key) = obj.key() else {
+                    continue;
+                };
+                if !key.ends_with(".parquet") {
+                    continue;
+                }
+
+                match self
+                    .client
+                    .get_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .send()
+                    .await
+                {
+                    Ok(response) => {
+                        let data = response.body.collect().await?.into_bytes().to_vec();
+                        assets.extend(self.parquet_to_assets(&data)?);
+                    }
+                    Err(e) => {
+                        // A partition file appearing or disappearing mid-list is
+                        // not fatal - load what is readable
+                        tracing::warn!("Failed to load assets partition {}: {}", key, e);
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            "Loaded {} assets from s3://{}/{}",
+            assets.len(),
+            self.bucket,
+            prefix
+        );
+        Ok(assets)
+    }
+}
+
+#[async_trait]
 impl HierarchyStore for S3CreativeStore {
     async fn store_hierarchy(&self, hierarchy: &AccountHierarchy) -> anyhow::Result<()> {
         let json_data = serde_json::to_vec_pretty(hierarchy)?;
@@ -581,11 +891,20 @@ impl HierarchyStore for S3CreativeStore {
             .send()
             .await?;
 
-        tracing::info!("Stored hierarchy for {}:{} to s3://{}", hierarchy.network, hierarchy.account_id, key);
+        tracing::info!(
+            "Stored hierarchy for {}:{} to s3://{}",
+            hierarchy.network,
+            hierarchy.account_id,
+            key
+        );
         Ok(())
     }
 
-    async fn load_hierarchy(&self, network: &str, account_id: &str) -> anyhow::Result<Option<AccountHierarchy>> {
+    async fn load_hierarchy(
+        &self,
+        network: &str,
+        account_id: &str,
+    ) -> anyhow::Result<Option<AccountHierarchy>> {
         let key = self.hierarchy_key(network, account_id);
 
         match self
@@ -599,7 +918,12 @@ impl HierarchyStore for S3CreativeStore {
             Ok(response) => {
                 let data = response.body.collect().await?.into_bytes().to_vec();
                 let hierarchy = serde_json::from_slice(&data)?;
-                tracing::info!("Loaded hierarchy for {}:{} from s3://{}", network, account_id, key);
+                tracing::info!(
+                    "Loaded hierarchy for {}:{} from s3://{}",
+                    network,
+                    account_id,
+                    key
+                );
                 Ok(Some(hierarchy))
             }
             Err(e) => {
@@ -637,7 +961,11 @@ impl HierarchyStore for S3CreativeStore {
             }
         }
 
-        tracing::info!("Found {} hierarchies in s3://{}", hierarchies.len(), self.bucket);
+        tracing::info!(
+            "Found {} hierarchies in s3://{}",
+            hierarchies.len(),
+            self.bucket
+        );
         Ok(hierarchies)
     }
 }
@@ -672,6 +1000,7 @@ impl CreativeStore for MockCreativeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{SubsecRound, Utc};
 
     /// Helper function to create a test store without requiring AWS credentials
     /// The S3 client is created with a dummy config for testing parquet conversion only
@@ -733,5 +1062,62 @@ mod tests {
         assert_eq!(restored[0].network, original[0].network);
         assert_eq!(restored[0].campaign_id, original[0].campaign_id);
         assert_eq!(restored[0].headline, original[0].headline);
+    }
+
+    #[test]
+    fn test_assets_partition_key_layout() {
+        let store = create_test_store();
+
+        // Hive-style layout matching the documented trace.assets
+        // partitioning: network=<network>/type=<type>/
+        assert_eq!(
+            store.assets_partition_key("taboola", "headline"),
+            "test-prefix/assets/network=taboola/type=headline/assets.parquet"
+        );
+        assert_eq!(store.assets_prefix(), "test-prefix/assets/");
+    }
+
+    #[test]
+    fn test_assets_parquet_roundtrip() {
+        let store = create_test_store();
+
+        // The Parquet schema stores timestamps at millisecond precision,
+        // so the fixture must not carry sub-millisecond nanoseconds the
+        // roundtrip is expected to preserve
+        let synced_at = Utc::now().trunc_subsecs(3);
+        let original = vec![
+            AssetRecord {
+                asset_id: "taboola:headline:Test Headline".to_string(),
+                network: "taboola".to_string(),
+                asset_type: "headline".to_string(),
+                content: "Test Headline".to_string(),
+                creative_id: Some("cr456".to_string()),
+                campaign_id: Some("camp123".to_string()),
+                campaign_name: Some("Test Campaign".to_string()),
+                item_id: Some("item789".to_string()),
+                first_seen: synced_at,
+                last_seen: synced_at,
+                synced_at,
+            },
+            AssetRecord {
+                asset_id: "mgid:image:https://example.com/img.jpg".to_string(),
+                network: "mgid".to_string(),
+                asset_type: "image".to_string(),
+                content: "https://example.com/img.jpg".to_string(),
+                creative_id: None,
+                campaign_id: None,
+                campaign_name: None,
+                item_id: None,
+                first_seen: synced_at,
+                last_seen: synced_at,
+                synced_at,
+            },
+        ];
+
+        let parquet_data = store.assets_to_parquet(original.clone()).unwrap();
+        assert!(!parquet_data.is_empty());
+        let restored = store.parquet_to_assets(&parquet_data).unwrap();
+
+        assert_eq!(restored, original);
     }
 }
