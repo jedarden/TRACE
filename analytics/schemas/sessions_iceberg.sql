@@ -4,20 +4,64 @@
 -- This file defines the Iceberg table schema for sessionized user sessions.
 -- Sessions are derived from raw events and represent user journeys.
 --
+-- Table:         trace.sessions
+-- Partitioning:  DAYS(started_at) -> physical dirs started_at_day=YYYY-MM-DD
+--                (see docs/analytics/iceberg_partition_pruning.md)
+-- Column source: Phase 7 session stitcher output
+--                (analytics/src/session_stitcher.rs, session_reconstruction_sql())
+--
+-- The DDL below is the canonical schema definition. Trino and DuckDB each use
+-- their own syntax, so the per-engine forms follow; column names, types and
+-- the day(started_at) partition transform are the same in all of them.
+--
 -- Usage with Trino:
---   1. Configure Iceberg catalog in etc/catalog/iceberg.properties
---   2. Execute: source /path/to/sessions_iceberg.sql
+--   1. Configure an Iceberg catalog (e.g. etc/catalog/iceberg.properties)
+--   2. Trino syntax differs from the statements below. Equivalent:
+--        CREATE SCHEMA IF NOT EXISTS iceberg.trace;
+--        CREATE TABLE iceberg.trace.sessions (
+--            session_id VARCHAR NOT NULL,
+--            ...        -- STRING -> VARCHAR, INT -> INTEGER
+--        )
+--        WITH (
+--            format            = 'PARQUET',
+--            compression_codec = 'ZSTD',
+--            partitioning      = ARRAY['day(started_at)'],
+--            location          = 's3://my-trace-bucket/iceberg/sessions'
+--        );
+--   3. The 'write.*', 'commit.retry.*' and 'history.expire.*' keys in the
+--      TBLPROPERTIES block below are Iceberg engine properties, not Trino
+--      table properties. Under Trino, set format/compression/target file
+--      size via the WITH clause above (or catalog config), and snapshot
+--      retention via ALTER TABLE ... EXECUTE expire_snapshots(...).
+--   4. The helper views at the bottom execute as-is.
 --
 -- Usage with DuckDB:
 --   INSTALL iceberg;
 --   LOAD iceberg;
---   -- Then execute the CREATE TABLE statements below
+--   -- Reads (no catalog needed, read-only):
+--   --   SELECT * FROM iceberg_scan('s3://my-trace-bucket/iceberg/sessions');
+--   -- Writes require an attached Iceberg REST catalog (path-based
+--   -- iceberg_scan is read-only) and DuckDB's own dialect:
+--   --   ATTACH '<rest-catalog-uri>' AS rest_cat (TYPE ICEBERG);
+--   --   CREATE TABLE rest_cat.trace.sessions (...)
+--   --     PARTITIONED BY (day(started_at))
+--   --     WITH ('write.compression-codec' = 'zstd', ...);
+--   -- The helper views below are plain SQL and run unchanged in DuckDB once
+--   -- trace.sessions exists as a table (or a view over iceberg_scan).
 -- ============================================================================
 
 -- ----------------------------------------------------------------------------
 -- Primary Sessions Table
 -- ----------------------------------------------------------------------------
 -- Aggregated session data with first-touch attribution
+--
+-- Column set mirrors the Phase 7 session stitcher output
+-- (analytics/src/session_stitcher.rs, session_reconstruction_sql()):
+--   start_ts -> started_at, end_ts -> ended_at,
+--   landing_page -> entry_url, exit_page -> exit_url,
+--   unique_pages -> depth, is_bounce -> bounce,
+--   source -> network, campaign -> campaign_id,
+--   event_count kept verbatim and decomposed into the per-type counts below.
 
 CREATE TABLE IF NOT EXISTS trace.sessions (
     -- Primary identifiers
@@ -33,6 +77,7 @@ CREATE TABLE IF NOT EXISTS trace.sessions (
     clicks INT,
     scrolls INT,
     dwells INT,
+    event_count INT,  -- Total events in the session (sum of the four counts)
 
     -- Entry and exit pages
     entry_url STRING,
@@ -57,7 +102,7 @@ CREATE TABLE IF NOT EXISTS trace.sessions (
     -- Session quality metrics
     duration_seconds INT,
     bounce BOOLEAN,
-    depth INT
+    depth INT  -- Distinct URLs visited (stitcher's unique_pages)
 
 )
 PARTITIONED BY DAYS(started_at)
@@ -66,8 +111,10 @@ LOCATED AT 's3://my-trace-bucket/iceberg/sessions';
 -- ----------------------------------------------------------------------------
 -- Table Properties
 -- ----------------------------------------------------------------------------
+-- Iceberg engine-level properties (honored by Spark/Athena engines; see the
+-- file header for the Trino and DuckDB equivalents).
 
-ALTER TABLE trace.sessions SET TPROPERTIES (
+ALTER TABLE trace.sessions SET TBLPROPERTIES (
     'write.format.default' = 'parquet',
     'write.compression-codec' = 'zstd',
     'write.target-file-size-bytes' = '268435456',  -- 256MB files (sessions are smaller than events)
@@ -197,6 +244,14 @@ ORDER BY 2, 3;
 -- 3. Or use this SQL to aggregate from events table:
 --
 -- INSERT INTO trace.sessions
+-- WITH ranked AS (
+--     SELECT *,
+--         ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY ts) AS rn,
+--         COUNT(*) OVER (PARTITION BY session_id) AS n_events
+--     FROM trace.ad_events
+--     WHERE session_id IS NOT NULL
+--       AND ts >= CURRENT_DATE - INTERVAL '7' DAY
+-- )
 -- SELECT
 --     session_id,
 --     user_id,
@@ -206,21 +261,27 @@ ORDER BY 2, 3;
 --     COUNT(*) FILTER (WHERE type = 'click') AS clicks,
 --     COUNT(*) FILTER (WHERE type = 'scroll') AS scrolls,
 --     COUNT(*) FILTER (WHERE type = 'dwell') AS dwells,
---     MIN(url) FILTER (WHERE row_number = 1) AS entry_url,
---     MAX(url) FILTER (WHERE row_number = last) AS exit_url,
+--     COUNT(*) AS event_count,
+--     MIN(url) FILTER (WHERE rn = 1) AS entry_url,
+--     MAX(url) FILTER (WHERE rn = n_events) AS exit_url,
 --     -- First-touch attribution
 --     MIN(network) AS network,
 --     MIN(campaign_id) AS campaign_id,
+--     MIN(campaign_name) AS campaign_name,
+--     MIN(creative_id) AS creative_id,
 --     MIN(headline) AS headline,
 --     -- Conversion (define your conversion events)
 --     MAX(CASE WHEN type = 'conversion' THEN TRUE ELSE FALSE END) AS converted,
+--     MAX(conversion_value) AS conversion_value,
+--     -- Device info (use rn = 1 in place of MIN for strictly first-event values)
+--     MIN(device_type) AS device_type,
+--     MIN(device_os) AS device_os,
+--     MIN(referrer) AS referrer,
 --     -- Session metrics
---     EXTRACT(EPOCH FROM (MAX(ts) - MIN(ts)))::INT AS duration_seconds,
+--     CAST(DATE_DIFF('second', MIN(ts), MAX(ts)) AS INT) AS duration_seconds,
 --     COUNT(*) = 1 AS bounce,
 --     COUNT(DISTINCT url) AS depth
--- FROM trace.ad_events
--- WHERE session_id IS NOT NULL
---   AND ts >= CURRENT_DATE - INTERVAL '7' DAY
+-- FROM ranked
 -- GROUP BY session_id, user_id;
 --
 -- ============================================================================
