@@ -14,7 +14,7 @@ pub struct Report {
     pub supports_iceberg: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ReportCategory {
     #[serde(rename = "metrics")]
     Metrics,

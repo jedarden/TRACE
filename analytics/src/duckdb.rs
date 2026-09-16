@@ -77,6 +77,13 @@ impl DuckDBClient {
         Ok(client)
     }
 
+    /// Direct access to the underlying connection for modules that run their
+    /// own SQL against the same configured engine (e.g. session
+    /// materialization), instead of going through the report layer.
+    pub fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
     pub fn execute_query(&self, sql: &str) -> Result<QueryResult> {
         let mut stmt = self.conn.prepare(sql)?;
         let columns: Vec<String> = stmt.column_names().into_iter().map(String::from).collect();

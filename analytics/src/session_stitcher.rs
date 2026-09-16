@@ -260,7 +260,7 @@ ORDER BY session_start;
         let conversion_filter = if let Some(ct) = conversion_type {
             format!("AND type = '{}'", ct)
         } else {
-            "AND (type = 'conversion' OR type = 'purchase' OR type = 'signup')"
+            "AND (type = 'conversion' OR type = 'purchase' OR type = 'signup')".to_string()
         };
 
         format!(

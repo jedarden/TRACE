@@ -3,10 +3,11 @@ mod duckdb;
 mod queries;
 mod reporter;
 mod s3;
+mod session_materializer;
 mod session_stitcher;
 mod web;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -71,6 +72,18 @@ enum Commands {
         /// Host to bind to
         #[arg(short, long, default_value = "0.0.0.0")]
         host: String,
+    },
+    /// Materialize stitched sessions into the trace.sessions Iceberg table
+    /// (one Parquet file per UTC day under iceberg/sessions/data/)
+    MaterializeSessions {
+        /// Day to materialize (YYYY-MM-DD, UTC). Defaults to yesterday UTC —
+        /// the most recent complete day of events
+        #[arg(long)]
+        date: Option<String>,
+        /// Events source glob override (default: the crate-wide
+        /// s3://<bucket>/<prefix>/events/**/*.parquet)
+        #[arg(long)]
+        events_glob: Option<String>,
     },
 }
 
@@ -167,6 +180,44 @@ async fn main() -> Result<()> {
             if let Err(e) = web::run_server(config, &host, port).await {
                 error!("Web server failed: {}", e);
                 std::process::exit(1);
+            }
+        }
+        Commands::MaterializeSessions {
+            date,
+            events_glob,
+        } => {
+            let config = config::Config::from_env()?;
+
+            let day = match &date {
+                Some(d) => Some(chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+                    .with_context(|| format!("Invalid --date '{}': expected YYYY-MM-DD", d))?),
+                None => None,
+            };
+
+            let db = duckdb::DuckDBClient::new(&config)?;
+            let s3 = s3::S3Client::new(&config)?;
+
+            match session_materializer::materialize_sessions(
+                db.connection(),
+                &s3,
+                &config,
+                day,
+                events_glob.as_deref(),
+            )
+            .await
+            {
+                Ok(result) => {
+                    info!(
+                        "trace.sessions materialization complete: {} rows for {} -> {}",
+                        result.row_count,
+                        result.day.format("%Y-%m-%d"),
+                        result.object_key
+                    );
+                }
+                Err(e) => {
+                    error!("Session materialization failed: {}", e);
+                    std::process::exit(1);
+                }
             }
         }
     }
