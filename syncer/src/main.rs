@@ -365,6 +365,7 @@ async fn run_hierarchy_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::creative::CreativeMetadata;
     use s3_store::{AssetStore, MockCreativeStore};
 
     /// In-memory asset store capturing what run_sync persists
@@ -400,6 +401,129 @@ mod tests {
         }
     }
 
+    /// In-memory asset store capturing the partitioned Parquet objects
+    ///
+    /// Serializes exactly the way S3CreativeStore does — through
+    /// `assets_partition_files` — so tests assert the real
+    /// network=<network>/type=<type>/ object layout; only the S3 upload is
+    /// stubbed out.
+    #[derive(Clone)]
+    struct PartitionedCaptureStore {
+        objects: std::sync::Arc<tokio::sync::RwLock<Vec<(String, Vec<u8>)>>>,
+    }
+
+    impl PartitionedCaptureStore {
+        fn new() -> Self {
+            Self {
+                objects: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            }
+        }
+
+        async fn objects(&self) -> Vec<(String, Vec<u8>)> {
+            self.objects.read().await.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AssetStore for PartitionedCaptureStore {
+        async fn store_assets(&self, assets: Vec<assets::AssetRecord>) -> anyhow::Result<()> {
+            *self.objects.write().await = s3_store::assets_partition_files("trace-events", assets)?;
+            Ok(())
+        }
+
+        async fn load_assets(&self) -> anyhow::Result<Vec<assets::AssetRecord>> {
+            let objects = self.objects.read().await;
+            let mut assets = Vec::new();
+            for (_, data) in objects.iter() {
+                assets.extend(s3_store::parquet_to_assets(data)?);
+            }
+            Ok(assets)
+        }
+    }
+
+    /// Stub API client returning canned creatives for its network, or a
+    /// fetch failure when built with [`StubClient::failing`] — drives
+    /// run_sync deterministically without network access.
+    struct StubClient {
+        network: String,
+        creatives: Vec<CreativeMetadata>,
+        fail_fetch: bool,
+    }
+
+    impl StubClient {
+        fn new(network: &str, creatives: Vec<CreativeMetadata>) -> Self {
+            Self {
+                network: network.to_string(),
+                creatives,
+                fail_fetch: false,
+            }
+        }
+
+        fn failing(network: &str) -> Self {
+            Self {
+                network: network.to_string(),
+                creatives: vec![],
+                fail_fetch: true,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ApiClient for StubClient {
+        async fn fetch_creatives(&mut self) -> Result<ApiSyncResult> {
+            if self.fail_fetch {
+                return Err(anyhow::anyhow!("{} API unavailable", self.network));
+            }
+            Ok(ApiSyncResult {
+                creatives: self.creatives.clone(),
+                next_page_token: None,
+            })
+        }
+
+        async fn fetch_metrics(
+            &mut self,
+            _start_date: chrono::NaiveDate,
+            _end_date: chrono::NaiveDate,
+        ) -> Result<MetricsSyncResult> {
+            Ok(MetricsSyncResult {
+                metrics: vec![],
+                next_page_token: None,
+            })
+        }
+
+        async fn fetch_hierarchy(&mut self) -> Result<HierarchySyncResult> {
+            Ok(HierarchySyncResult {
+                hierarchies: vec![],
+                next_page_token: None,
+            })
+        }
+
+        fn network_name(&self) -> &str {
+            &self.network
+        }
+    }
+
+    /// A creative fixture with the full metadata a network API returns
+    fn creative(
+        network: &str,
+        creative_id: &str,
+        headline: Option<&str>,
+        image: Option<&str>,
+        landing_page: Option<&str>,
+    ) -> CreativeMetadata {
+        CreativeMetadata {
+            network: network.to_string(),
+            campaign_id: Some(format!("camp-{creative_id}")),
+            campaign_name: Some(format!("Campaign {creative_id}")),
+            creative_id: Some(creative_id.to_string()),
+            headline: headline.map(|s| s.to_string()),
+            image_url: image.map(|s| s.to_string()),
+            landing_page_url: landing_page.map(|s| s.to_string()),
+            item_id: Some(format!("item-{creative_id}")),
+            synced_at: chrono::Utc::now(),
+        }
+    }
+
     #[tokio::test]
     async fn test_run_sync_feeds_and_persists_asset_dimension() {
         let mut creative_registry = CreativeRegistry::new(MockCreativeStore::new());
@@ -431,5 +555,166 @@ mod tests {
         assert!(types.contains(&assets::TYPE_HEADLINE));
         assert!(types.contains(&assets::TYPE_IMAGE));
         assert!(types.contains(&assets::TYPE_LANDING_PAGE));
+    }
+
+    /// The full fetch -> explode -> partitioned write path: stubbed network
+    /// clients feed run_sync, and the sync run produces real Parquet objects
+    /// under the network=<network>/type=<type>/ layout.
+    #[tokio::test]
+    async fn test_run_sync_writes_partitioned_parquet_end_to_end() {
+        let mut creative_registry = CreativeRegistry::new(MockCreativeStore::new());
+        let asset_store = PartitionedCaptureStore::new();
+        let mut asset_registry = AssetRegistry::new(asset_store.clone());
+
+        let mut clients: Vec<Box<dyn ApiClient>> = vec![
+            Box::new(StubClient::new(
+                "taboola",
+                vec![
+                    creative(
+                        "taboola",
+                        "t-1",
+                        Some("Taboola Headline"),
+                        Some("https://img/taboola.jpg"),
+                        Some("https://land/taboola"),
+                    ),
+                    creative(
+                        "taboola",
+                        "t-2",
+                        Some("Second Headline"),
+                        // Same image as t-1: dedups to one image asset
+                        Some("https://img/taboola.jpg"),
+                        None,
+                    ),
+                ],
+            )),
+            Box::new(StubClient::new(
+                "mgid",
+                vec![creative(
+                    "mgid",
+                    "m-1",
+                    Some("MGID Headline"),
+                    Some("https://img/mgid.jpg"),
+                    Some("https://land/mgid"),
+                )],
+            )),
+        ];
+
+        run_sync(&mut creative_registry, &mut asset_registry, &mut clients)
+            .await
+            .unwrap();
+
+        // One Parquet object per (network, type) partition, Hive-style
+        let objects = asset_store.objects().await;
+        let mut keys: Vec<&str> = objects.iter().map(|(k, _)| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "trace-events/assets/network=mgid/type=headline/assets.parquet",
+                "trace-events/assets/network=mgid/type=image/assets.parquet",
+                "trace-events/assets/network=mgid/type=landing_page/assets.parquet",
+                "trace-events/assets/network=taboola/type=headline/assets.parquet",
+                "trace-events/assets/network=taboola/type=image/assets.parquet",
+                "trace-events/assets/network=taboola/type=landing_page/assets.parquet",
+            ]
+        );
+
+        // The taboola headline partition holds both headlines (Parquet row
+        // order follows registry map iteration, so compare sorted)
+        let taboola_headlines = objects
+            .iter()
+            .find(|(k, _)| k.contains("network=taboola/type=headline"))
+            .map(|(_, data)| s3_store::parquet_to_assets(data).unwrap())
+            .unwrap();
+        assert_eq!(taboola_headlines.len(), 2);
+        let mut contents: Vec<&str> = taboola_headlines
+            .iter()
+            .map(|a| a.content.as_str())
+            .collect();
+        contents.sort_unstable();
+        assert_eq!(contents, vec!["Second Headline", "Taboola Headline"]);
+
+        // Join keys survive the roundtrip into Parquet
+        let mgid_headlines = objects
+            .iter()
+            .find(|(k, _)| k.contains("network=mgid/type=headline"))
+            .map(|(_, data)| s3_store::parquet_to_assets(data).unwrap())
+            .unwrap();
+        assert_eq!(mgid_headlines.len(), 1);
+        let mgid_headline = &mgid_headlines[0];
+        assert_eq!(mgid_headline.asset_id, "mgid:headline:MGID Headline");
+        assert_eq!(mgid_headline.creative_id.as_deref(), Some("m-1"));
+        assert_eq!(mgid_headline.campaign_id.as_deref(), Some("camp-m-1"));
+        assert_eq!(mgid_headline.campaign_name.as_deref(), Some("Campaign m-1"));
+        assert_eq!(mgid_headline.item_id.as_deref(), Some("item-m-1"));
+
+        // The shared image deduped to one row
+        let taboola_images = objects
+            .iter()
+            .find(|(k, _)| k.contains("network=taboola/type=image"))
+            .map(|(_, data)| s3_store::parquet_to_assets(data).unwrap())
+            .unwrap();
+        assert_eq!(taboola_images.len(), 1);
+
+        // A fresh registry reloads every row across all six partitions —
+        // the first_seen-survival path depends on reading back what a
+        // sync run wrote
+        let mut reloaded = AssetRegistry::new(asset_store);
+        assert_eq!(reloaded.load().await.unwrap(), 7);
+    }
+
+    /// A creative-fetch failure on one network is logged and that network
+    /// is skipped — the rest of the run completes.
+    #[tokio::test]
+    async fn test_run_sync_skips_failing_network_and_syncs_the_rest() {
+        let mut creative_registry = CreativeRegistry::new(MockCreativeStore::new());
+        let asset_store = PartitionedCaptureStore::new();
+        let mut asset_registry = AssetRegistry::new(asset_store.clone());
+
+        // The failing client comes FIRST: if run_sync aborted on a fetch
+        // failure, taboola behind it would never be synced
+        let mut clients: Vec<Box<dyn ApiClient>> = vec![
+            Box::new(StubClient::failing("outbrain")),
+            Box::new(StubClient::new(
+                "taboola",
+                vec![creative(
+                    "taboola",
+                    "t-1",
+                    Some("Taboola Headline"),
+                    Some("https://img/taboola.jpg"),
+                    Some("https://land/taboola"),
+                )],
+            )),
+        ];
+
+        run_sync(&mut creative_registry, &mut asset_registry, &mut clients)
+            .await
+            .expect("a per-network fetch failure must not abort the run");
+
+        // The healthy network's creatives and assets made it through
+        assert_eq!(
+            creative_registry
+                .get_network_creatives("taboola")
+                .await
+                .len(),
+            1
+        );
+        assert!(creative_registry
+            .get_network_creatives("outbrain")
+            .await
+            .is_empty());
+
+        let keys: Vec<String> = asset_store
+            .objects()
+            .await
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect();
+        assert_eq!(keys.len(), 3, "taboola writes its three partitions");
+        assert!(
+            keys.iter().all(|k| k.contains("network=taboola/")),
+            "the failed network contributes no partitions: {keys:?}"
+        );
+        assert!(!asset_registry.is_empty());
     }
 }

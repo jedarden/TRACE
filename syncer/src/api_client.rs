@@ -804,4 +804,211 @@ mod tests {
         let revcontent = RevcontentClient::new("test".to_string());
         assert_eq!(revcontent.network_name(), "revcontent");
     }
+
+    // --- Creative-metadata fetching against a mocked HTTP API ---
+    //
+    // Each real client is pointed at a local mock server speaking that
+    // network's documented response shape, so the request path, auth
+    // header, and creative deserialization are all exercised end to end.
+
+    #[tokio::test]
+    async fn test_taboola_fetch_creatives_parses_campaigns_response() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/backstage/api/1.0/me/campaigns/")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "include".into(),
+                "active".into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"results": [{"id": "camp-1", "name": "Summer Push", "items": [
+                    {"id": "item-9", "name": "Item Nine",
+                     "thumbnail_url": "https://img.taboola/img.jpg",
+                     "url": "https://advertiser/landing", "title": "Nine Tricks"}
+                ]}]}"#,
+            )
+            .create_async()
+            .await;
+
+        let mut client = TaboolaClient {
+            api_key: "key-123".to_string(),
+            base_url: server.url(),
+            account_id: None,
+        };
+        let result = client.fetch_creatives().await.unwrap();
+        mock.assert_async().await;
+
+        assert_eq!(result.creatives.len(), 1);
+        let creative = &result.creatives[0];
+        assert_eq!(creative.network, "taboola");
+        assert_eq!(creative.campaign_id.as_deref(), Some("camp-1"));
+        assert_eq!(creative.campaign_name.as_deref(), Some("Summer Push"));
+        assert_eq!(creative.creative_id.as_deref(), Some("item-9"));
+        assert_eq!(creative.headline.as_deref(), Some("Nine Tricks"));
+        assert_eq!(
+            creative.image_url.as_deref(),
+            Some("https://img.taboola/img.jpg")
+        );
+        assert_eq!(
+            creative.landing_page_url.as_deref(),
+            Some("https://advertiser/landing")
+        );
+        assert_eq!(creative.item_id.as_deref(), Some("item-9"));
+    }
+
+    #[tokio::test]
+    async fn test_taboola_fetch_creatives_api_error_is_an_err() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", mockito::Matcher::Any)
+            .match_query(mockito::Matcher::Any)
+            .with_status(401)
+            .with_body(r#"{"message": "bad credentials"}"#)
+            .create_async()
+            .await;
+
+        let mut client = TaboolaClient {
+            api_key: "wrong-key".to_string(),
+            base_url: server.url(),
+            account_id: None,
+        };
+
+        let err = client.fetch_creatives().await.unwrap_err();
+        assert!(err.to_string().contains("Taboola API error"));
+        assert!(
+            err.to_string().contains("401"),
+            "expected the mocked 401, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_outbrain_fetch_creatives_parses_amplify_response() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/amplify/v0.1/users/me/campaigns")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "status".into(),
+                "ACTIVE".into(),
+            ))
+            .match_header("OB-TOKEN", "key-123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[{"id": "ob-camp", "name": "OB Campaign", "links": [
+                    {"id": "ob-link-1", "url": "https://advertiser/ob",
+                     "imageUrl": "https://img.outbrain/img.jpg",
+                     "metadata": {"title": "OB Headline"}}
+                ]}]"#,
+            )
+            .create_async()
+            .await;
+
+        let mut client = OutbrainClient {
+            api_key: "key-123".to_string(),
+            base_url: server.url(),
+        };
+        let result = client.fetch_creatives().await.unwrap();
+        mock.assert_async().await;
+
+        assert_eq!(result.creatives.len(), 1);
+        let creative = &result.creatives[0];
+        assert_eq!(creative.network, "outbrain");
+        assert_eq!(creative.campaign_id.as_deref(), Some("ob-camp"));
+        assert_eq!(creative.headline.as_deref(), Some("OB Headline"));
+        assert_eq!(
+            creative.image_url.as_deref(),
+            Some("https://img.outbrain/img.jpg")
+        );
+        assert_eq!(
+            creative.landing_page_url.as_deref(),
+            Some("https://advertiser/ob")
+        );
+        assert_eq!(creative.item_id.as_deref(), Some("ob-link-1"));
+    }
+
+    #[tokio::test]
+    async fn test_mgid_fetch_creatives_parses_teasers_response() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v1/campaigns")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "status".into(),
+                "active".into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data": [{"id": "mgid-camp", "name": "MGID Camp", "teasers": [
+                    {"id": "t-1", "title": "MGID Headline",
+                     "image": "https://img.mgid/img.jpg", "url": "https://advertiser/mgid"}
+                ]}]}"#,
+            )
+            .create_async()
+            .await;
+
+        let mut client = MgidClient {
+            api_key: "key-123".to_string(),
+            base_url: server.url(),
+        };
+        let result = client.fetch_creatives().await.unwrap();
+        mock.assert_async().await;
+
+        assert_eq!(result.creatives.len(), 1);
+        let creative = &result.creatives[0];
+        assert_eq!(creative.network, "mgid");
+        assert_eq!(creative.headline.as_deref(), Some("MGID Headline"));
+        assert_eq!(
+            creative.image_url.as_deref(),
+            Some("https://img.mgid/img.jpg")
+        );
+        assert_eq!(
+            creative.landing_page_url.as_deref(),
+            Some("https://advertiser/mgid")
+        );
+        assert_eq!(creative.item_id.as_deref(), Some("t-1"));
+    }
+
+    #[tokio::test]
+    async fn test_revcontent_fetch_creatives_parses_widgets_response() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v1/campaigns")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "status".into(),
+                "active".into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"campaigns": [{"id": "rc-camp", "name": "RC Camp", "widgets": [
+                    {"id": "w-1", "title": "RC Headline",
+                     "thumbnail": "https://img.rc/img.jpg", "url": "https://advertiser/rc"}
+                ]}]}"#,
+            )
+            .create_async()
+            .await;
+
+        let mut client = RevcontentClient {
+            api_key: "key-123".to_string(),
+            base_url: server.url(),
+        };
+        let result = client.fetch_creatives().await.unwrap();
+        mock.assert_async().await;
+
+        assert_eq!(result.creatives.len(), 1);
+        let creative = &result.creatives[0];
+        assert_eq!(creative.network, "revcontent");
+        assert_eq!(creative.headline.as_deref(), Some("RC Headline"));
+        assert_eq!(
+            creative.image_url.as_deref(),
+            Some("https://img.rc/img.jpg")
+        );
+        assert_eq!(
+            creative.landing_page_url.as_deref(),
+            Some("https://advertiser/rc")
+        );
+        assert_eq!(creative.item_id.as_deref(), Some("w-1"));
+    }
 }
