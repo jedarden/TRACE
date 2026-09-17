@@ -4,6 +4,10 @@
 
 Client-side tracking library for TRACE. Includes a JavaScript tag for comprehensive event tracking and a pixel tag for simple pageview tracking.
 
+The collector's ingestion contract — status codes, size limit, retry and
+idempotency semantics for these endpoints — is documented in
+[`../docs/notes/collector-api.md`](../docs/notes/collector-api.md).
+
 ---
 
 ## Quick Start

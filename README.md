@@ -50,7 +50,7 @@ TRACE is a lightweight, self-hosted event tracking system built for affiliate ma
 
 ## 💡 Design Principles
 
-- **📝 Log first, parse later** — The collector is a glorified access log. Raw requests are stored as-is. All parsing, normalization, and enrichment happens downstream in ETL
+- **📝 Log first, parse later** — The collector is a glorified access log. Raw requests are stored as-is. All parsing, normalization, and enrichment happens downstream in ETL. Full ingestion contract: [`docs/notes/collector-api.md`](docs/notes/collector-api.md)
 - **🗺️ Dynamic schema** — Query parameters are stored as `MAP<STRING, STRING>` in Parquet. No schema migrations when you add a new UTM or custom parameter
 - **👀 Observation only** — Nothing needs to be registered or configured before use. Assets, parameters, and campaigns are discovered from the data itself
 - **🔄 Reprocessable** — Raw event logs are the source of truth. If ETL logic improves, replay from the beginning
