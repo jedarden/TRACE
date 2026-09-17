@@ -265,6 +265,15 @@ pub fn list_reports() -> Vec<Report> {
             default_params: HashMap::new(),
             supports_iceberg: true,
         },
+        Report {
+            name: "impression_performance".to_string(),
+            description: "Impression volume, unique impressions, CTR, and viewability by campaign"
+                .to_string(),
+            category: ReportCategory::Daily,
+            sql_template: include_str!("../queries/impression_performance.sql").to_string(),
+            default_params: HashMap::new(),
+            supports_iceberg: true,
+        },
     ]
 }
 

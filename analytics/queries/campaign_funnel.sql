@@ -3,6 +3,8 @@ WITH funnel AS (
     SELECT
         params->>'utm_campaign' AS campaign,
         COUNT(*) FILTER (WHERE type = 'pageview') AS pageviews,
+        COUNT(*) FILTER (WHERE type = 'impression') AS impressions,
+        COUNT(DISTINCT params->>'imp_id') FILTER (WHERE type = 'impression') AS unique_impressions,
         COUNT(*) FILTER (WHERE type = 'click') AS clicks,
         COUNT(*) FILTER (WHERE type = 'scroll') AS scrolls,
         COUNT(*) FILTER (WHERE type = 'dwell') AS dwells
@@ -14,6 +16,8 @@ WITH funnel AS (
 SELECT
     campaign,
     pageviews,
+    impressions,
+    unique_impressions,
     clicks,
     ROUND(100.0 * clicks / NULLIF(pageviews, 0), 2) AS click_through_pct,
     scrolls,

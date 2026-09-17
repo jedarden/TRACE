@@ -33,6 +33,8 @@ WITH session_events AS (
         MAX(ts) AS session_end,
         -- Funnel stage events
         COUNT(*) FILTER (WHERE type = 'pageview') AS pageviews,
+        COUNT(*) FILTER (WHERE type = 'impression') AS impressions,
+        COUNT(DISTINCT params->>'imp_id') FILTER (WHERE type = 'impression') AS unique_impressions,
         COUNT(*) FILTER (WHERE type = 'click') AS clicks,
         COUNT(*) FILTER (WHERE type = 'scroll') AS scrolls,
         COUNT(*) FILTER (WHERE type = 'dwell') AS dwells,
@@ -56,6 +58,8 @@ funnel_stages AS (
         network,
         -- Stage 1: All sessions (landing)
         COUNT(*) AS sessions,
+        SUM(impressions) AS impressions,
+        SUM(unique_impressions) AS unique_impressions,
         -- Stage 2: Clicked (engaged)
         SUM(CASE WHEN clicks > 0 THEN 1 ELSE 0 END) AS clicked,
         -- Stage 3: Scrolled (content interaction)
@@ -75,6 +79,8 @@ SELECT
     campaign_id,
     network,
     sessions AS landing_sessions,
+    impressions,
+    unique_impressions,
     clicked AS click_sessions,
     scrolled AS scroll_sessions,
     engaged AS engaged_sessions,

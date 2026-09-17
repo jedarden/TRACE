@@ -14,6 +14,7 @@
 //! - `POST /e`      - JSON event body (JS tag)
 //! - `GET /p`       - query-string pixel (pageviews)
 //! - `GET/POST /c`  - conversion pixel / server-to-server postback
+//! - `GET/POST /i`  - impression pixel / server-to-server postback
 //! - `GET/POST /collect` - combined endpoint
 //!
 //! The full HTTP contract (responses, size limit, malformed input, retry
@@ -194,6 +195,33 @@ async fn collect_conversion_post(
     StatusCode::NO_CONTENT
 }
 
+/// GET /i - Impression pixel. Query string carries the impression details
+/// (imp_id, creative/ad identifiers, viewability) plus IDs and any
+/// passthrough parameters. The flusher defaults hits on /i to
+/// type = 'impression', so the pixel works even without an explicit type
+/// parameter.
+async fn collect_impression_get(
+    State(state): State<CollectorState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> PixelResponse {
+    record_request(&state, "GET", &uri, &headers, None).await;
+    PixelResponse
+}
+
+/// POST /i - Impression postback for server-to-server calls (ad servers,
+/// email renderers). Body may be JSON or URL-encoded form data; both are
+/// stored raw and parsed downstream.
+async fn collect_impression_post(
+    State(state): State<CollectorState>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: String,
+) -> impl IntoResponse {
+    record_request(&state, "POST", &uri, &headers, Some(body)).await;
+    StatusCode::NO_CONTENT
+}
+
 /// Record a raw request to the log. The request target is kept verbatim:
 /// `path` stores the URL path and `query_params` the raw query string.
 async fn record_request(
@@ -233,6 +261,10 @@ fn build_app(state: CollectorState) -> axum::Router {
         .route(
             "/c",
             axum::routing::get(collect_conversion_get).post(collect_conversion_post),
+        )
+        .route(
+            "/i",
+            axum::routing::get(collect_impression_get).post(collect_impression_post),
         )
         .route(
             "/collect",
@@ -881,6 +913,80 @@ mod tests {
         let logged = read_all_logged_requests(&state, &dir).await;
         assert_eq!(logged.len(), 3, "one line per delivery, no dedupe");
         assert!(logged.iter().all(|r| r.body.as_deref() == Some(body)));
+    }
+
+    /// Impression ingestion: GET /i returns the pixel GIF and logs the raw
+    /// query string verbatim (imp_id and attribution params ride in the
+    /// query — the flusher defaults the event to type=impression via the
+    /// path, no explicit type needed).
+    #[tokio::test]
+    async fn contract_get_impression_pixel_returns_gif_and_logs_query_verbatim() {
+        let (state, dir) = test_state();
+
+        let query =
+            "imp_id=pv-1%3Acreative-7&creative_id=creative-7&sid=sess-42&utm_source=taboola&utm_campaign=c-77";
+        let res = send(&state, get(&format!("/i?{query}"))).await;
+
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/gif",
+            "impression pixel response must be image/gif"
+        );
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], PIXEL_GIF);
+
+        let logged = read_all_logged_requests(&state, &dir).await;
+        assert_eq!(logged.len(), 1);
+        assert_eq!(logged[0].method, "GET");
+        assert_eq!(logged[0].path, "/i");
+        assert_eq!(logged[0].query_params.as_deref(), Some(query));
+        assert_eq!(logged[0].body, None);
+    }
+
+    /// Impression ingestion: POST /i accepts a form-encoded ad-server
+    /// postback (or JSON) with 204 and stores the body verbatim for the
+    /// flusher to parse.
+    #[tokio::test]
+    async fn contract_post_impression_postback_returns_204_and_logs_body() {
+        let (state, dir) = test_state();
+
+        let body = "imp_id=imp-11&sid=sess-9&uid=user-9&creative_id=creative-4&utm_source=mgid&utm_campaign=c-12";
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/i")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let res = send(&state, req).await;
+
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let logged = read_all_logged_requests(&state, &dir).await;
+        assert_eq!(logged.len(), 1);
+        assert_eq!(logged[0].method, "POST");
+        assert_eq!(logged[0].path, "/i");
+        assert_eq!(logged[0].body.as_deref(), Some(body));
+    }
+
+    /// A bare GET /i with no query at all is still accepted — the flusher
+    /// types it as an impression with no params, like /c before it.
+    #[tokio::test]
+    async fn contract_get_impression_pixel_with_no_query_still_succeeds() {
+        let (state, dir) = test_state();
+
+        let res = send(&state, get("/i")).await;
+
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/gif"
+        );
+
+        let logged = read_all_logged_requests(&state, &dir).await;
+        assert_eq!(logged.len(), 1);
+        assert_eq!(logged[0].path, "/i");
+        assert_eq!(logged[0].query_params, None);
     }
 
     /// Client IP resolution: first hop of X-Forwarded-For, else X-Real-IP,

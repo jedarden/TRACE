@@ -8,6 +8,7 @@
  * - Click tracking on outbound links
  * - Scroll depth tracking (25/50/75/100% thresholds)
  * - Conversion tracking with revenue via TRACE.conversion()
+ * - Impression tracking with dedup via TRACE.impression()
  * - Sends POST to /e endpoint with JSON payload
  * - Async, non-blocking, <4KB minified
  *
@@ -335,8 +336,59 @@
     sendEvent('conversion', options);
   }
 
+  // Impression dedup guard: keys already sent this page view. One
+  // impression per key per page load — an ad re-render or observer re-fire
+  // for the same creative/slot must not count twice.
+  var sentImpressionKeys = {};
+
+  /**
+   * Track an ad impression event (a creative was displayed).
+   *
+   * The event type is always 'impression' — that is what the funnel and
+   * impression reports count (type = 'impression'). Distinct impressions
+   * are identified by imp_id:
+   *
+   *   TRACE.impression({ creative_id: 'creative-7', ad_slot: 'hero' });
+   *   TRACE.impression('creative-7');                    // creative_id shorthand
+   *   TRACE.impression({ imp_id: 'net-imp-9', in_view_ms: 2400 });
+   *
+   * imp_id is generated when not supplied (page-view scoped, derived from
+   * the creative/slot key) so the flusher can collapse duplicate sends of
+   * the same impression. Supply your own when the ad server provides one.
+   * Repeat calls for the same imp_id/creative/slot are dropped client-side.
+   *
+   * @param {object|string} [options] - Impression details, or just the creative ID
+   */
+  function trackImpression(options) {
+    if (typeof options === 'string') {
+      options = { creative_id: options };
+    }
+    options = options || {};
+
+    // Dedup key: caller's imp_id, else the creative/slot combination.
+    var key = options.imp_id ||
+      [options.creative_id, options.ad_slot]
+        .filter(Boolean)
+        .join(':') || 'impression';
+    if (sentImpressionKeys[key]) {
+      return;
+    }
+    sentImpressionKeys[key] = true;
+
+    // Keep the payload type stable: sendEvent merges data over the envelope,
+    // and a stray type key would reclassify the event.
+    delete options.type;
+
+    if (!options.imp_id) {
+      options.imp_id = pageViewId + ':' + key;
+    }
+
+    sendEvent('impression', options);
+  }
+
   // Public API
   window.TRACE = window.TRACE || {};
   window.TRACE.conversion = trackConversion;
+  window.TRACE.impression = trackImpression;
 
 })();

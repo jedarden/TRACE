@@ -6,7 +6,9 @@ body size limit, malformed-input behavior, and retry/idempotency semantics.
 The conformance tests live in `collector/src/main.rs` (`contract_*` tests in
 `mod tests`); every claim below that affects a client is pinned by one of
 them. Conversion-specific semantics (`/c` defaults, revenue handling) are in
-[`conversion-capture.md`](conversion-capture.md).
+[`conversion-capture.md`](conversion-capture.md); impression semantics
+(`/i` defaults, `imp_id` dedup) in
+[`impression-capture.md`](impression-capture.md).
 
 ---
 
@@ -29,17 +31,18 @@ UTF-8 text).
 | `/e` | POST | JS-tag events (pageview, scroll, heartbeat, click, …) | 204 |
 | `/p` | GET | Pageview pixel | 200 GIF |
 | `/c` | GET, POST | Conversion pixel / server-to-server postback | GET: 200 GIF; POST: 204 |
+| `/i` | GET, POST | Impression pixel / server-to-server postback | GET: 200 GIF; POST: 204 |
 | `/health` | GET | Liveness probe | 200, body `OK`, nothing logged |
 
 `/collect` exists so deployments need one URL for both ingestion paths; `/e`
 and `/p` are aliases whose only difference is the flusher's default event
 type when the request carries no explicit `type` (`/p` and `GET /collect`
 default to `pageview`, `/e` and `POST /collect` to `unknown`, `/c` to
-`conversion`).
+`conversion`, `/i` to `impression`).
 
 ## Request contract
 
-### JS-tag path — `POST /collect` (or `/e`, `/c`)
+### JS-tag path — `POST /collect` (or `/e`, `/c`, `/i`)
 
 - **Body**: any UTF-8 text up to the size limit. The tag sends a JSON
   object, labeled `application/json` by both its `sendBeacon` blob and its
@@ -68,7 +71,7 @@ default to `pageview`, `/e` and `POST /collect` to `unknown`, `/c` to
   absent. The socket address is never used — the collector assumes it sits
   behind a proxy and would otherwise record the proxy's IP.
 
-### Pixel path — `GET /collect` (or `/p`, `/c`)
+### Pixel path — `GET /collect` (or `/p`, `/c`, `/i`)
 
 - **Query string**: stored verbatim (still percent-encoded, undecoded).
   **No parameters are required** — a bare `GET /p` succeeds and is logged;
@@ -118,6 +121,7 @@ proxy.
 | Invalid JSON body | accepted `204`, stored verbatim | JSON parse fails → body tried as form encoding → event lands as its endpoint default type (usually `unknown`) with whatever params survive |
 | Unparseable-as-anything body | accepted `204`, stored verbatim | same as above; raw body remains in the log for replay |
 | Non-numeric `revenue` | accepted, stored verbatim | param dropped at parse time (protects the attribution SQL casts) |
+| Non-integer or negative `in_view_ms` | accepted, stored verbatim | param dropped at parse time (protects the impression report's `::BIGINT` casts) |
 | Empty body | accepted `204`, logged as `""` | endpoint default type, no params |
 | Empty query string | accepted `200` GIF | endpoint default type, no params |
 | Non-UTF-8 body | **rejected `400`**, discarded | — (never logged) |
@@ -152,12 +156,14 @@ There is none, by design, at any layer that matters to callers:
 - The collector is **append-only and at-least-once**: one log line per
   *accepted request*, so a client that retries a delivered event produces
   duplicate rows in `ad_events`. There is no event ID, dedupe key, or
-  upsert at ingestion, and no dedupe stage in the flusher or analytics
-  layer today.
+  upsert at ingestion. The one exception downstream: impression events
+  carrying an `imp_id` are deduplicated in the flusher, per raw log file —
+  see [`impression-capture.md`](impression-capture.md).
 - Consequences: ad-network postback retries and beacon replays inflate
   counts. Callers that cannot avoid retrying (S2S webhooks) should include
   a natural idempotency key as an ordinary parameter (`order_id`,
-  `transaction_id`) so later SQL can collapse duplicates if needed.
+  `transaction_id` — or `imp_id` for impressions) so later processing can
+  collapse duplicates.
 - The flip side of no-ingestion-state: the collector holds no per-client
   session and cannot create retry loops or ordering artifacts; a request's
   position in the log is its arrival order, nothing more.
@@ -197,5 +203,5 @@ They pin: 204/empty for POSTs, the exact GIF bytes and `image/gif` type for
 pixels, verbatim body/query recording, the filtered-header set, XFF
 first-hop IP resolution, content-type indifference, malformed-JSON
 acceptance, empty-body acceptance, 400 for non-UTF-8, the inclusive 2 MiB
-limit, 405/404 with no log side effects, `/health`, and one-line-per-
-delivery duplicate semantics.
+limit, 405/404 with no log side effects, `/health`, the `/i` impression
+pixel and postback, and one-line-per-delivery duplicate semantics.

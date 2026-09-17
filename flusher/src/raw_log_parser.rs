@@ -69,6 +69,9 @@ pub enum EventType {
     /// Signup event (a conversion flavor the attribution queries query
     /// alongside type = 'conversion')
     Signup,
+    /// Ad impression event (carries imp_id for dedup and viewability
+    /// metrics in params)
+    Impression,
     /// Unknown event type
     Unknown,
 }
@@ -84,6 +87,7 @@ impl EventType {
             "conversion" => EventType::Conversion,
             "purchase" => EventType::Purchase,
             "signup" => EventType::Signup,
+            "impression" | "imp" => EventType::Impression,
             _ => EventType::Unknown,
         }
     }
@@ -98,6 +102,7 @@ impl EventType {
             EventType::Conversion => "conversion",
             EventType::Purchase => "purchase",
             EventType::Signup => "signup",
+            EventType::Impression => "impression",
             EventType::Unknown => "unknown",
         }
     }
@@ -174,28 +179,20 @@ impl RawLogParser {
         let ua = raw.headers.user_agent;
 
         // Determine event type and extract data based on method. The
-        // conversion endpoint (/c) defaults hits to conversion events so a
-        // bare pixel or postback ping — where the caller often cannot add a
-        // type parameter — still lands as type = 'conversion' in ad_events.
-        // Bare hits on the other endpoints keep their original defaults
-        // (pageview for pixels, unknown for bodyless POSTs).
-        let is_conversion = Self::is_conversion_endpoint(&raw.path);
+        // conversion endpoint (/c) defaults hits to conversion events and
+        // the impression endpoint (/i) to impression events so a bare pixel
+        // or postback ping — where the caller often cannot add a type
+        // parameter — still lands as the right type in ad_events. Bare hits
+        // on the other endpoints keep their original defaults (pageview for
+        // pixels, unknown for bodyless POSTs).
+        let endpoint_default = Self::default_type_for_path(&raw.path);
         let (event_type, mut params, session_id, user_id, cookie_id) = match raw.method.as_str() {
-            "POST" => Self::parse_post_request(
-                &raw.body,
-                if is_conversion {
-                    EventType::Conversion
-                } else {
-                    EventType::Unknown
-                },
-            )?,
+            "POST" => {
+                Self::parse_post_request(&raw.body, endpoint_default.unwrap_or(EventType::Unknown))?
+            }
             "GET" => Self::parse_get_request(
                 &raw.query_params,
-                if is_conversion {
-                    EventType::Conversion
-                } else {
-                    EventType::Pageview
-                },
+                endpoint_default.unwrap_or(EventType::Pageview),
             )?,
             _ => (EventType::Unknown, HashMap::new(), None, None, None),
         };
@@ -205,8 +202,23 @@ impl RawLogParser {
         // than poison the conversion sums; everything else stays raw.
         Self::sanitize_revenue(&mut params);
 
-        // Build URL from path and params
-        let url = Self::build_url(&raw.path, &params);
+        // Same protection for the impression viewability metric: the
+        // impression reports cast (params->>'in_view_ms')::BIGINT, and
+        // view time cannot be negative.
+        Self::sanitize_in_view_ms(&mut params);
+
+        // The url column carries the request target exactly as the client
+        // sent it whenever a query string arrived: rebuilding it from the
+        // parsed params would drop blank keys, collapse repeated keys, and
+        // re-encode every value — losing the raw URL the collector logged.
+        // With no query string, POST payloads (JSON and form-encoded
+        // postbacks) still surface their params in the URL so postback hits
+        // stay readable; that synthesis is sorted and last-value-wins, never
+        // claimed to be raw.
+        let url = match raw.query_params.as_deref() {
+            Some(query) => format!("{}?{}", raw.path, query),
+            None => Self::build_url(&raw.path, &params),
+        };
 
         // Extract referer. The tag's document.referrer (sent in the POST body
         // or the GET query string) is the actual traffic source and takes
@@ -330,13 +342,19 @@ impl RawLogParser {
         Ok((event_type, params, session_id, user_id, cookie_id))
     }
 
-    /// True when the request path is the conversion endpoint (`/c`). Only
-    /// the first path segment is compared, so `/collect` is not matched —
-    /// its hits keep the ordinary pageview/unknown defaults.
-    fn is_conversion_endpoint(path: &str) -> bool {
+    /// The event type a bare hit on this path defaults to when the request
+    /// carries no explicit `type`: `/c` (conversion pixel/postback) and `/i`
+    /// (impression pixel/postback). Only the first path segment is compared,
+    /// so `/collect` is not matched — its hits keep the ordinary
+    /// pageview/unknown defaults.
+    fn default_type_for_path(path: &str) -> Option<EventType> {
         let without_query = path.split('?').next().unwrap_or(path);
         let first_segment = without_query.split('/').find(|s| !s.is_empty());
-        first_segment == Some("c")
+        match first_segment {
+            Some("c") => Some(EventType::Conversion),
+            Some("i") => Some(EventType::Impression),
+            _ => None,
+        }
     }
 
     /// Drop a `revenue` param that is not a finite number. The documented
@@ -352,14 +370,42 @@ impl RawLogParser {
         }
     }
 
+    /// Drop an `in_view_ms` param that is not a non-negative integer. The
+    /// impression reports cast `(params->>'in_view_ms')::BIGINT` for average
+    /// viewable time, so one malformed value would fail every one of them;
+    /// a view duration in milliseconds can never be negative.
+    fn sanitize_in_view_ms(params: &mut HashMap<String, String>) {
+        let valid = params
+            .get("in_view_ms")
+            .map(|v| v.parse::<i64>().map(|n| n >= 0).unwrap_or(false))
+            .unwrap_or(true);
+        if !valid {
+            params.remove("in_view_ms");
+        }
+    }
+
     /// Parse URL query string into HashMap
+    ///
+    /// Values are percent-decoded (`+` stays literal — this is percent
+    /// decoding, not form decoding, matching the tag's encodeURIComponent).
+    /// A pair with no `=` (a bare flag like `?installed`) maps to an empty
+    /// string, same as `installed=`: the params MAP has no way to represent a
+    /// valueless key, and keeping the key preserves its presence for
+    /// `params->>'installed'` readers. A key repeated in the query string
+    /// keeps its LAST value — MAP<STRING,STRING> storage requires unique
+    /// keys, and last-wins is the deterministic collapse (see
+    /// docs/notes/query-parameter-handling.md). The event URL carries the
+    /// raw query string verbatim, so nothing is lost for repeated or blank
+    /// keys.
     fn parse_query_string(query: &str) -> Result<HashMap<String, String>> {
         let mut params = HashMap::new();
 
         for pair in query.split('&') {
-            let Some((key, value)) = pair.split_once('=') else {
+            if pair.is_empty() {
                 continue;
-            };
+            }
+
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
 
             let decoded_key = urlencoding::decode(key).unwrap_or_else(|_| key.to_string().into());
             let decoded_value =
@@ -372,14 +418,29 @@ impl RawLogParser {
     }
 
     /// Build full URL from path and params
+    ///
+    /// Keys are emitted in sorted order: a HashMap iterates in arbitrary
+    /// order, so without the sort the same param set would produce a
+    /// different URL string on every replay of the same raw log. This
+    /// builder synthesizes a URL from parsed params (POST payloads); the
+    /// request-target path in parse_line preserves the raw query string
+    /// instead whenever one arrived.
     fn build_url(path: &str, params: &HashMap<String, String>) -> String {
         if params.is_empty() {
             return path.to_string();
         }
 
-        let query_string: Vec<String> = params
-            .iter()
-            .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+        let mut keys: Vec<&String> = params.keys().collect();
+        keys.sort();
+        let query_string: Vec<String> = keys
+            .into_iter()
+            .map(|k| {
+                format!(
+                    "{}={}",
+                    urlencoding::encode(k),
+                    urlencoding::encode(params[k].as_str())
+                )
+            })
             .collect();
 
         format!("{}?{}", path, query_string.join("&"))
@@ -416,6 +477,7 @@ impl RawLogParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
 
     #[test]
     fn test_parse_post_pageview() {
@@ -666,6 +728,9 @@ mod tests {
         assert_eq!(EventType::from_str("conversion"), EventType::Conversion);
         assert_eq!(EventType::from_str("purchase"), EventType::Purchase);
         assert_eq!(EventType::from_str("signup"), EventType::Signup);
+        assert_eq!(EventType::from_str("impression"), EventType::Impression);
+        assert_eq!(EventType::from_str("imp"), EventType::Impression);
+        assert_eq!(EventType::from_str("IMPRESSION"), EventType::Impression);
         assert_eq!(EventType::from_str("unknown"), EventType::Unknown);
     }
 
@@ -674,6 +739,7 @@ mod tests {
         assert_eq!(EventType::Conversion.as_str(), "conversion");
         assert_eq!(EventType::Purchase.as_str(), "purchase");
         assert_eq!(EventType::Signup.as_str(), "signup");
+        assert_eq!(EventType::Impression.as_str(), "impression");
     }
 
     /// The JS tag's conversion API POSTs type=conversion with the conversion
@@ -861,6 +927,166 @@ mod tests {
         }
     }
 
+    /// The JS tag's impression API POSTs type=impression with the dedup ID
+    /// and viewability metrics alongside. This is the event the funnel and
+    /// impression reports count (type = 'impression').
+    #[test]
+    fn test_parse_post_impression() {
+        let json = r#"{
+            "ts": "2026-05-08T14:45:00Z",
+            "method": "POST",
+            "path": "/e",
+            "headers": {
+                "user_agent": "Mozilla/5.0"
+            },
+            "body": "{\"type\":\"impression\",\"sid\":\"sess-123\",\"uid\":\"user-456\",\"imp_id\":\"pv-1:creative-7\",\"creative_id\":\"creative-7\",\"ad_slot\":\"hero\",\"in_view_ms\":2400,\"utm_source\":\"taboola\",\"utm_campaign\":\"camp-1\"}",
+            "client_ip": "1.2.3.4"
+        }"#;
+
+        let event = RawLogParser::parse_line(json).unwrap();
+
+        assert_eq!(event.event_type, EventType::Impression);
+        assert_eq!(event.session_id, Some("sess-123".to_string()));
+        assert_eq!(event.user_id, Some("user-456".to_string()));
+        assert_eq!(
+            event.params.get("imp_id"),
+            Some(&"pv-1:creative-7".to_string())
+        );
+        assert_eq!(
+            event.params.get("creative_id"),
+            Some(&"creative-7".to_string())
+        );
+        assert_eq!(event.params.get("ad_slot"), Some(&"hero".to_string()));
+        assert_eq!(event.params.get("in_view_ms"), Some(&"2400".to_string()));
+        assert_eq!(event.params.get("utm_source"), Some(&"taboola".to_string()));
+        assert_eq!(
+            event.params.get("utm_campaign"),
+            Some(&"camp-1".to_string())
+        );
+    }
+
+    /// A pixel GET can carry the impression explicitly via type=impression.
+    #[test]
+    fn test_parse_get_impression_pixel() {
+        let json = r#"{
+            "ts": "2026-05-08T14:45:00Z",
+            "method": "GET",
+            "path": "/p",
+            "headers": {},
+            "query_params": "type=impression&imp_id=imp-9&creative_id=creative-2&sid=sess-789",
+            "body": null
+        }"#;
+
+        let event = RawLogParser::parse_line(json).unwrap();
+
+        assert_eq!(event.event_type, EventType::Impression);
+        assert_eq!(event.session_id, Some("sess-789".to_string()));
+        assert_eq!(event.params.get("imp_id"), Some(&"imp-9".to_string()));
+        assert_eq!(
+            event.params.get("creative_id"),
+            Some(&"creative-2".to_string())
+        );
+    }
+
+    /// A bare hit on the impression endpoint (no type param — the shape of
+    /// an ad-server render ping) defaults to an impression.
+    #[test]
+    fn test_parse_impression_endpoint_defaults_to_impression() {
+        let json = r#"{
+            "ts": "2026-05-08T14:45:00Z",
+            "method": "GET",
+            "path": "/i",
+            "headers": {},
+            "query_params": "imp_id=imp-5&sid=sess-5&utm_source=taboola&utm_campaign=c-77",
+            "body": null
+        }"#;
+
+        let event = RawLogParser::parse_line(json).unwrap();
+
+        assert_eq!(event.event_type, EventType::Impression);
+        assert_eq!(event.session_id, Some("sess-5".to_string()));
+        assert_eq!(event.params.get("imp_id"), Some(&"imp-5".to_string()));
+        assert_eq!(event.params.get("utm_campaign"), Some(&"c-77".to_string()));
+    }
+
+    /// Form-encoded impression postbacks (an ad server reporting renders
+    /// server-to-server) keep their IDs instead of collapsing to unknown.
+    #[test]
+    fn test_parse_form_encoded_impression_postback() {
+        let json = r#"{
+            "ts": "2026-05-08T14:45:00Z",
+            "method": "POST",
+            "path": "/i",
+            "headers": {},
+            "query_params": null,
+            "body": "imp_id=imp-11&sid=sess-9&uid=user-9&creative_id=creative-4&utm_source=mgid&utm_campaign=c-12"
+        }"#;
+
+        let event = RawLogParser::parse_line(json).unwrap();
+
+        assert_eq!(event.event_type, EventType::Impression);
+        assert_eq!(event.session_id, Some("sess-9".to_string()));
+        assert_eq!(event.user_id, Some("user-9".to_string()));
+        assert_eq!(event.params.get("imp_id"), Some(&"imp-11".to_string()));
+        assert_eq!(
+            event.params.get("creative_id"),
+            Some(&"creative-4".to_string())
+        );
+        assert_eq!(event.params.get("utm_source"), Some(&"mgid".to_string()));
+    }
+
+    /// A bodyless POST to /i is still an impression (bare render ping).
+    #[test]
+    fn test_parse_bodyless_impression_postback() {
+        let json = r#"{
+            "ts": "2026-05-08T14:45:00Z",
+            "method": "POST",
+            "path": "/i",
+            "headers": {},
+            "query_params": null,
+            "body": null
+        }"#;
+
+        let event = RawLogParser::parse_line(json).unwrap();
+
+        assert_eq!(event.event_type, EventType::Impression);
+    }
+
+    /// An explicit type always wins over the impression endpoint default.
+    #[test]
+    fn test_parse_explicit_type_overrides_impression_endpoint() {
+        let json = r#"{
+            "ts": "2026-05-08T14:45:00Z",
+            "method": "GET",
+            "path": "/i",
+            "headers": {},
+            "query_params": "type=pageview&url=https%3A%2F%2Fexample.com",
+            "body": null
+        }"#;
+
+        let event = RawLogParser::parse_line(json).unwrap();
+
+        assert_eq!(event.event_type, EventType::Pageview);
+    }
+
+    /// /collect must not inherit the impression default — its bare POST
+    /// hits stay unknown, like before /i existed.
+    #[test]
+    fn test_parse_collect_endpoint_does_not_default_to_impression() {
+        let json = r#"{
+            "ts": "2026-05-08T14:45:00Z",
+            "method": "POST",
+            "path": "/collect",
+            "headers": {},
+            "query_params": null,
+            "body": null
+        }"#;
+
+        let event = RawLogParser::parse_line(json).unwrap();
+
+        assert_eq!(event.event_type, EventType::Unknown);
+    }
+
     /// Non-numeric revenue is dropped so (params->>'revenue')::DECIMAL in
     /// the attribution queries cannot fail on one malformed event; finite
     /// numeric revenue is kept verbatim.
@@ -904,18 +1130,83 @@ mod tests {
         assert_eq!(event.params.get("revenue"), None);
     }
 
+    /// Non-integer or negative in_view_ms is dropped so
+    /// (params->>'in_view_ms')::BIGINT in the impression reports cannot
+    /// fail on one malformed event; valid values are kept verbatim.
     #[test]
-    fn test_is_conversion_endpoint() {
-        assert!(RawLogParser::is_conversion_endpoint("/c"));
-        assert!(RawLogParser::is_conversion_endpoint("/c?revenue=1"));
-        assert!(RawLogParser::is_conversion_endpoint("/c/c?revenue=1"));
-        // /collect shares the prefix but is a different endpoint
-        assert!(!RawLogParser::is_conversion_endpoint("/collect"));
-        assert!(!RawLogParser::is_conversion_endpoint("/collect?url=x"));
-        assert!(!RawLogParser::is_conversion_endpoint("/p"));
-        assert!(!RawLogParser::is_conversion_endpoint("/e"));
-        // A /c deeper in the path is not the endpoint
-        assert!(!RawLogParser::is_conversion_endpoint("/p/c"));
+    fn test_in_view_ms_sanitization() {
+        let make_line = |in_view_ms: &str| {
+            format!(
+                r#"{{"ts":"2026-05-08T14:45:00Z","method":"POST","path":"/e","headers":{{}},"body":"{{\"type\":\"impression\",\"imp_id\":\"imp-1\",\"in_view_ms\":\"{in_view_ms}\"}}"}}"#
+            )
+        };
+
+        // Integer milliseconds kept as-is, zero included (never in view)
+        let event = RawLogParser::parse_line(&make_line("2400")).unwrap();
+        assert_eq!(event.params.get("in_view_ms"), Some(&"2400".to_string()));
+        let event = RawLogParser::parse_line(&make_line("0")).unwrap();
+        assert_eq!(event.params.get("in_view_ms"), Some(&"0".to_string()));
+
+        // Garbage, fractional, and negative durations are dropped
+        for bad in ["abc", "1.5", "-100", "12ab", ""] {
+            let event = RawLogParser::parse_line(&make_line(bad)).unwrap();
+            assert_eq!(
+                event.params.get("in_view_ms"),
+                None,
+                "in_view_ms {bad:?} should have been dropped"
+            );
+            // The event itself survives — only the bad value goes
+            assert_eq!(event.event_type, EventType::Impression);
+            assert_eq!(event.params.get("imp_id"), Some(&"imp-1".to_string()));
+        }
+
+        // No in_view_ms at all is untouched (non-viewability callers)
+        let json = r#"{
+            "ts": "2026-05-08T14:45:00Z",
+            "method": "POST",
+            "path": "/e",
+            "headers": {},
+            "body": "{\"type\":\"impression\",\"imp_id\":\"imp-2\"}"
+        }"#;
+        let event = RawLogParser::parse_line(json).unwrap();
+        assert_eq!(event.params.get("in_view_ms"), None);
+    }
+
+    #[test]
+    fn test_default_type_for_path() {
+        // Conversion endpoint
+        assert_eq!(
+            RawLogParser::default_type_for_path("/c"),
+            Some(EventType::Conversion)
+        );
+        assert_eq!(
+            RawLogParser::default_type_for_path("/c?revenue=1"),
+            Some(EventType::Conversion)
+        );
+        assert_eq!(
+            RawLogParser::default_type_for_path("/c/c?revenue=1"),
+            Some(EventType::Conversion)
+        );
+        // Impression endpoint
+        assert_eq!(
+            RawLogParser::default_type_for_path("/i"),
+            Some(EventType::Impression)
+        );
+        assert_eq!(
+            RawLogParser::default_type_for_path("/i?imp_id=x"),
+            Some(EventType::Impression)
+        );
+        // /collect shares the /c prefix but is a different endpoint
+        assert_eq!(RawLogParser::default_type_for_path("/collect"), None);
+        assert_eq!(RawLogParser::default_type_for_path("/collect?url=x"), None);
+        // Longer segments starting with i are not the impression endpoint
+        assert_eq!(RawLogParser::default_type_for_path("/img"), None);
+        assert_eq!(RawLogParser::default_type_for_path("/impressions"), None);
+        assert_eq!(RawLogParser::default_type_for_path("/p"), None);
+        assert_eq!(RawLogParser::default_type_for_path("/e"), None);
+        // A /c or /i deeper in the path is not the endpoint
+        assert_eq!(RawLogParser::default_type_for_path("/p/c"), None);
+        assert_eq!(RawLogParser::default_type_for_path("/p/i"), None);
     }
 
     #[test]
@@ -935,6 +1226,116 @@ mod tests {
 
         assert_eq!(params.get("url"), Some(&"https://example.com".to_string()));
         assert_eq!(params.get("title"), Some(&"Test Page".to_string()));
+    }
+
+    /// A key with no `=` (a bare flag like `?installed`) must survive as an
+    /// empty-string value, identical to `installed=` — the MAP storage has no
+    /// way to distinguish the two, and keeping the key preserves its presence
+    /// for `params->>'installed'` readers. Empty pairs (`&&`) must not create
+    /// a key.
+    #[test]
+    fn test_parse_blank_params_keep_key_as_empty_string() {
+        let params = RawLogParser::parse_query_string("installed&empty=&sid=s1").unwrap();
+
+        assert_eq!(params.get("installed"), Some(&"".to_string()));
+        assert_eq!(params.get("empty"), Some(&"".to_string()));
+        assert_eq!(params.get("sid"), Some(&"s1".to_string()));
+        assert!(!params.contains_key(""), "empty pair must not become a key");
+    }
+
+    /// A repeated key keeps its LAST value — the only deterministic choice
+    /// available once MAP<STRING,STRING> storage (which requires unique keys)
+    /// collapses the duplicates.
+    #[test]
+    fn test_parse_repeated_params_last_value_wins() {
+        let params = RawLogParser::parse_query_string(
+            "utm_source=taboola&utm_source=outbrain&cid=1&cid=2&cid=3",
+        )
+        .unwrap();
+
+        assert_eq!(params.get("utm_source"), Some(&"outbrain".to_string()));
+        assert_eq!(params.get("cid"), Some(&"3".to_string()));
+    }
+
+    /// Values are percent-decoded. `+` stays literal (this is percent
+    /// decoding, not form decoding — the tag's encodeURIComponent never emits
+    /// `+` for a space), and an invalid escape falls back to the raw text.
+    #[test]
+    fn test_parse_encoded_params_decode_percent_escapes() {
+        let params =
+            RawLogParser::parse_query_string("q=a%20b%2Bc&emoji=%F0%9F%8E%AF&plus=a+b&bad=%ZZ")
+                .unwrap();
+
+        assert_eq!(params.get("q"), Some(&"a b+c".to_string()));
+        assert_eq!(params.get("emoji"), Some(&"\u{1F3AF}".to_string()));
+        assert_eq!(params.get("plus"), Some(&"a+b".to_string()));
+        assert_eq!(params.get("bad"), Some(&"%ZZ".to_string()));
+    }
+
+    /// Arbitrary / unknown parameters must flow through untouched — no
+    /// allowlist, per the zero-configuration design.
+    #[test]
+    fn test_parse_arbitrary_params_survive() {
+        let params = RawLogParser::parse_query_string(
+            "tb_click_id=abc-123&gl=us&gclid=xCv9&weird_param!=%value&x=y",
+        )
+        .unwrap();
+
+        assert_eq!(params.get("tb_click_id"), Some(&"abc-123".to_string()));
+        assert_eq!(params.get("gclid"), Some(&"xCv9".to_string()));
+        assert_eq!(params.get("weird_param!"), Some(&"%value".to_string()));
+        assert_eq!(params.get("x"), Some(&"y".to_string()));
+    }
+
+    /// The event URL must be the request target exactly as the client sent
+    /// it — blank keys, repeated keys, ordering, and encoding choices all
+    /// preserved verbatim — rather than a re-encoding of the parsed map.
+    #[test]
+    fn test_parse_preserves_raw_request_target() {
+        let json = r#"{
+            "ts": "2026-05-08T14:30:00Z",
+            "method": "GET",
+            "path": "/p",
+            "headers": {},
+            "query_params": "utm_source=one&utm_source=two&flag&c=x%20y&",
+            "body": null
+        }"#;
+
+        let event = RawLogParser::parse_line(json).unwrap();
+
+        assert_eq!(
+            event.url,
+            "/p?utm_source=one&utm_source=two&flag&c=x%20y&".to_string()
+        );
+    }
+
+    /// Parsing the same request twice must produce the same URL string.
+    /// The URL is built per-event, so any dependence on HashMap iteration
+    /// order shows up as run-to-run (and replay-to-replay) drift.
+    #[test]
+    fn test_parse_url_is_deterministic_across_parses() {
+        let body = "{\"type\":\"pageview\",\"sid\":\"s1\",\"url\":\"https://example.com/lp\",\"title\":\"T\",\"utm_source\":\"taboola\",\"utm_medium\":\"native\",\"tb_image\":\"i1\",\"tb_headline\":\"H\",\"z_last\":\"z\",\"a_first\":\"a\"}";
+        let make_line = || {
+            format!(
+                r#"{{"ts":"2026-05-08T14:30:00Z","method":"POST","path":"/e","headers":{{}},"query_params":null,"body":"{}"}}"#,
+                body.replace('"', "\\\"")
+            )
+        };
+
+        let first = RawLogParser::parse_line(&make_line()).unwrap().url;
+        for _ in 0..50 {
+            let event = RawLogParser::parse_line(&make_line()).unwrap();
+            assert_eq!(event.url, first, "URL changed between identical parses");
+        }
+
+        // The synthesized URL (POST body params, no query string) must also
+        // emit keys in a stable, sorted order. type/sid/uid/cid become typed
+        // fields and do not reappear in params.
+        assert_eq!(
+            first,
+            "/e?a_first=a&tb_headline=H&tb_image=i1&title=T&url=https%3A%2F%2Fexample.com%2Flp&utm_medium=native&utm_source=taboola&z_last=z"
+                .to_string()
+        );
     }
 
     #[test]
@@ -991,5 +1392,205 @@ mod tests {
         }"#;
 
         assert!(RawLogParser::parse_line(json).is_err());
+    }
+
+    // --- End-to-end: raw collector log line -> parser -> Parquet -> read back ---
+    //
+    // The Parquet converters and column readers live in main.rs; these tests
+    // carry local copies of the two read helpers so they stay self-contained
+    // in this module.
+
+    /// Read a nullable UTF8 column back out of in-memory Parquet.
+    fn read_string_column(parquet_data: &[u8], column: &str) -> Vec<Option<String>> {
+        use arrow::array::{Array, StringArray};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), parquet_data).unwrap();
+
+        let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(file.path()).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut values = Vec::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let array = batch
+                .column_by_name(column)
+                .unwrap_or_else(|| panic!("column {} missing from Parquet schema", column));
+            let strings = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap_or_else(|| panic!("column {} is not Utf8", column));
+            for i in 0..strings.len() {
+                values.push(if strings.is_null(i) {
+                    None
+                } else {
+                    Some(strings.value(i).to_string())
+                });
+            }
+        }
+        values
+    }
+
+    /// Read the params map column back out of in-memory Parquet as one
+    /// HashMap per row.
+    fn read_params_column(parquet_data: &[u8], column: &str) -> Vec<HashMap<String, String>> {
+        use arrow::array::{Array, MapArray, StringArray};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), parquet_data).unwrap();
+
+        let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(file.path()).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut rows = Vec::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let array = batch
+                .column_by_name(column)
+                .unwrap_or_else(|| panic!("column {} missing from Parquet schema", column));
+            let map = array
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .unwrap_or_else(|| panic!("column {} is not a Map", column));
+            for i in 0..map.len() {
+                let entries = map.value(i);
+                let keys = entries
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let vals = entries
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let mut row = HashMap::new();
+                for j in 0..keys.len() {
+                    row.insert(keys.value(j).to_string(), vals.value(j).to_string());
+                }
+                rows.push(row);
+            }
+        }
+        rows
+    }
+
+    /// Full pipeline: a pixel GET carrying arbitrary, encoded, blank, and
+    /// repeated query parameters must land in Parquet with the raw request
+    /// target byte-identical in the url column, and the params MAP holding
+    /// the decoded, last-value-wins view (blank keys as empty strings).
+    #[test]
+    fn test_query_params_e2e_pixel_round_trip_preserves_raw_url() {
+        let raw_target = "url=https%3A%2F%2Fexample.com%2Flp%3Futm_source%3Dtaboola&type=pageview&sid=sess-7&tb_click_id=abc-123&installed&empty=&utm_source=one&utm_source=two&title=Test%20Page&";
+        let json = format!(
+            r#"{{
+                "ts": "2026-05-08T14:30:00Z",
+                "method": "GET",
+                "path": "/p",
+                "headers": {{}},
+                "query_params": "{}",
+                "body": null
+            }}"#,
+            raw_target
+        );
+
+        let event = RawLogParser::parse_line(&json).unwrap();
+        assert_eq!(event.event_type, EventType::Pageview);
+
+        let parquet_data = crate::parsed_events_to_parquet(vec![event]).unwrap();
+
+        // The raw URL survives the whole pipeline verbatim: ordering,
+        // encoding, blank keys, repeated keys, even the trailing `&`.
+        assert_eq!(
+            read_string_column(&parquet_data, "url"),
+            vec![Some(format!("/p?{}", raw_target))]
+        );
+
+        // The params MAP is the decoded analysis view: arbitrary keys kept,
+        // percent escapes decoded, blank keys as empty strings, repeated
+        // keys collapsed to the last value.
+        let params = read_params_column(&parquet_data, "params");
+        assert_eq!(params.len(), 1);
+        assert_eq!(
+            params[0].get("url").map(String::as_str),
+            Some("https://example.com/lp?utm_source=taboola")
+        );
+        assert_eq!(
+            params[0].get("title").map(String::as_str),
+            Some("Test Page")
+        );
+        assert_eq!(
+            params[0].get("tb_click_id").map(String::as_str),
+            Some("abc-123")
+        );
+        assert_eq!(params[0].get("installed").map(String::as_str), Some(""));
+        assert_eq!(params[0].get("empty").map(String::as_str), Some(""));
+        assert_eq!(
+            params[0].get("utm_source").map(String::as_str),
+            Some("two"),
+            "repeated key must deterministically keep its last value"
+        );
+    }
+
+    /// A POST whose request target carries a query string keeps that query
+    /// in the url column verbatim — it used to be dropped entirely, because
+    /// POST urls were rebuilt from the body params alone.
+    #[test]
+    fn test_query_params_e2e_post_with_query_string_preserves_raw_url() {
+        let json = r#"{
+            "ts": "2026-05-08T14:31:00Z",
+            "method": "POST",
+            "path": "/e",
+            "headers": {},
+            "query_params": "utm_source=taboola&sid=sess-9",
+            "body": "{\"type\":\"pageview\",\"uid\":\"user-9\"}"
+        }"#;
+
+        let event = RawLogParser::parse_line(json).unwrap();
+        let parquet_data = crate::parsed_events_to_parquet(vec![event]).unwrap();
+
+        assert_eq!(
+            read_string_column(&parquet_data, "url"),
+            vec![Some("/e?utm_source=taboola&sid=sess-9".to_string())]
+        );
+        // Identity fields are promoted out of the params MAP into their
+        // typed columns while ordinary body params remain in the MAP.
+        assert_eq!(
+            read_string_column(&parquet_data, "user_id"),
+            vec![Some("user-9".to_string())]
+        );
+    }
+
+    /// Reprocessing the same raw log line must produce byte-identical
+    /// Parquet url values every time — the rebuilt-URL path (POST payload,
+    /// no query string) must not leak HashMap iteration order into the
+    /// stored column.
+    #[test]
+    fn test_query_params_e2e_replay_is_byte_identical() {
+        let line = r#"{
+            "ts": "2026-05-08T14:32:00Z",
+            "method": "POST",
+            "path": "/c",
+            "headers": {},
+            "query_params": null,
+            "body": "{\"type\":\"conversion\",\"conversion_type\":\"purchase\",\"revenue\":20,\"utm_source\":\"taboola\",\"utm_campaign\":\"c-77\",\"z_param\":\"z\",\"a_param\":\"a\"}"
+        }"#;
+
+        let first = read_string_column(
+            &crate::parsed_events_to_parquet(vec![RawLogParser::parse_line(line).unwrap()])
+                .unwrap(),
+            "url",
+        );
+
+        for _ in 0..20 {
+            let event = RawLogParser::parse_line(line).unwrap();
+            let parquet_data = crate::parsed_events_to_parquet(vec![event]).unwrap();
+            assert_eq!(read_string_column(&parquet_data, "url"), first);
+        }
     }
 }

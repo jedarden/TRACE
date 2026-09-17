@@ -10,7 +10,7 @@ use flate2::read::GzDecoder;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use parquet::{arrow::arrow_writer::ArrowWriter, file::properties::WriterProperties};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -948,6 +948,22 @@ fn parse_raw_hour_key(filename: &str) -> Option<(String, String)> {
 }
 
 /// Process a single raw log file and add to batch
+/// Collapse duplicate impressions: repeated sends carrying the same
+/// `imp_id` within one raw log file (beacon replay, prefetch double-fire,
+/// postback retry) count once. First arrival wins; impressions without an
+/// `imp_id` are kept untouched — there is nothing to key the dedup on.
+/// Other event types are not deduplicated; see docs/notes/impression-capture.md.
+fn dedupe_impressions(events: Vec<raw_log_parser::Event>) -> Vec<raw_log_parser::Event> {
+    let mut seen: HashSet<String> = HashSet::new();
+    events
+        .into_iter()
+        .filter(|e| match e.params.get("imp_id") {
+            Some(id) => seen.insert(id.clone()),
+            None => true,
+        })
+        .collect()
+}
+
 /// Parses raw collector log lines and groups by event_type
 async fn process_raw_log_file(state: &FlusherState, path: &PathBuf) -> Result<AddedToBatch> {
     let filename = path
@@ -1015,6 +1031,23 @@ async fn process_raw_log_file(state: &FlusherState, path: &PathBuf) -> Result<Ad
 
     // Process each event type separately
     for (event_type, events) in events_by_type {
+        // Impression dedup happens file-by-file here because duplicate
+        // sends of the same imp_id land in the same hour's raw log.
+        let events = if event_type == "impression" {
+            let before = events.len();
+            let deduped = dedupe_impressions(events);
+            if deduped.len() < before {
+                info!(
+                    "Dropped {} duplicate impressions with a shared imp_id in {}",
+                    before - deduped.len(),
+                    filename
+                );
+            }
+            deduped
+        } else {
+            events
+        };
+
         info!(
             "Processing {} events of type '{}' from {}",
             events.len(),
@@ -2388,5 +2421,224 @@ mod tests {
         let entries = accumulator.drain();
         let key = entries.keys().next().unwrap();
         assert!(key.starts_with("conversion/date=2026-05-08/hour=14/"));
+    }
+
+    /// Round trip: the tag's impression event (raw log line -> parser ->
+    /// Parquet) comes out with type = 'impression' and its dedup ID,
+    /// viewability, and attribution params intact — what the impression
+    /// reports read.
+    #[test]
+    fn test_impression_round_trip_tag_event_to_parquet() {
+        let line = r#"{
+            "ts": "2026-05-08T14:45:00Z",
+            "method": "POST",
+            "path": "/e",
+            "headers": {
+                "user_agent": "Mozilla/5.0"
+            },
+            "query_params": null,
+            "body": "{\"type\":\"impression\",\"sid\":\"sess-123\",\"uid\":\"user-456\",\"imp_id\":\"pv-1:creative-7\",\"creative_id\":\"creative-7\",\"ad_slot\":\"hero\",\"in_view_ms\":2400,\"utm_source\":\"taboola\",\"utm_campaign\":\"camp-1\"}",
+            "client_ip": "1.2.3.4"
+        }"#;
+
+        let event = raw_log_parser::RawLogParser::parse_line(line).unwrap();
+        assert_eq!(event.event_type, raw_log_parser::EventType::Impression);
+
+        let parquet_data = parsed_events_to_parquet(vec![event]).unwrap();
+
+        assert_eq!(
+            read_string_column(&parquet_data, "type"),
+            vec![Some("impression".to_string())]
+        );
+        assert_eq!(
+            read_string_column(&parquet_data, "session_id"),
+            vec![Some("sess-123".to_string())]
+        );
+
+        let params = read_params_column(&parquet_data, "params");
+        assert_eq!(params.len(), 1);
+        assert_eq!(
+            params[0].get("imp_id").map(String::as_str),
+            Some("pv-1:creative-7")
+        );
+        assert_eq!(
+            params[0].get("creative_id").map(String::as_str),
+            Some("creative-7")
+        );
+        assert_eq!(params[0].get("ad_slot").map(String::as_str), Some("hero"));
+        assert_eq!(
+            params[0].get("in_view_ms").map(String::as_str),
+            Some("2400")
+        );
+        assert_eq!(
+            params[0].get("utm_source").map(String::as_str),
+            Some("taboola")
+        );
+        assert_eq!(
+            params[0].get("utm_campaign").map(String::as_str),
+            Some("camp-1")
+        );
+    }
+
+    /// Round trip: a bare impression pixel hit on /i defaults to
+    /// type = 'impression' in the Parquet output even with no type param.
+    #[test]
+    fn test_impression_round_trip_pixel_to_parquet() {
+        let line = r#"{
+            "ts": "2026-05-08T14:46:00Z",
+            "method": "GET",
+            "path": "/i",
+            "headers": {},
+            "query_params": "imp_id=imp-9&sid=sess-9&utm_source=taboola&utm_campaign=c-77&in_view_ms=1200",
+            "body": null
+        }"#;
+
+        let event = raw_log_parser::RawLogParser::parse_line(line).unwrap();
+        assert_eq!(event.event_type, raw_log_parser::EventType::Impression);
+
+        let parquet_data = parsed_events_to_parquet(vec![event]).unwrap();
+
+        assert_eq!(
+            read_string_column(&parquet_data, "type"),
+            vec![Some("impression".to_string())]
+        );
+        let params = read_params_column(&parquet_data, "params");
+        assert_eq!(params[0].get("imp_id").map(String::as_str), Some("imp-9"));
+        assert_eq!(
+            params[0].get("utm_campaign").map(String::as_str),
+            Some("c-77")
+        );
+        assert_eq!(
+            params[0].get("in_view_ms").map(String::as_str),
+            Some("1200")
+        );
+    }
+
+    /// Malformed in_view_ms must not reach ad_events: one bad value would
+    /// fail the ::BIGINT cast in the impression reports.
+    #[test]
+    fn test_impression_round_trip_drops_bad_in_view_ms() {
+        let line = r#"{
+            "ts": "2026-05-08T14:47:00Z",
+            "method": "POST",
+            "path": "/e",
+            "headers": {},
+            "body": "{\"type\":\"impression\",\"imp_id\":\"imp-1\",\"creative_id\":\"creative-1\",\"in_view_ms\":\"not-a-number\"}"
+        }"#;
+
+        let event = raw_log_parser::RawLogParser::parse_line(line).unwrap();
+
+        let parquet_data = parsed_events_to_parquet(vec![event]).unwrap();
+        assert_eq!(
+            read_string_column(&parquet_data, "type"),
+            vec![Some("impression".to_string())]
+        );
+        let params = read_params_column(&parquet_data, "params");
+        assert!(!params[0].contains_key("in_view_ms"));
+        assert_eq!(
+            params[0].get("creative_id").map(String::as_str),
+            Some("creative-1")
+        );
+    }
+
+    /// Impression events partition under type=impression/ like every other
+    /// event type (batch key format).
+    #[test]
+    fn test_impression_partition_key() {
+        let config = BatchConfig::default();
+        let mut accumulator = BatchAccumulator::new(config);
+
+        accumulator.add(
+            "impression".to_string(),
+            "2026-05-08".to_string(),
+            "14".to_string(),
+            vec![0u8; 100],
+            PathBuf::from("/tmp/test-impression.jsonl.gz"),
+        );
+
+        let entries = accumulator.drain();
+        let key = entries.keys().next().unwrap();
+        assert!(key.starts_with("impression/date=2026-05-08/hour=14/"));
+    }
+
+    /// Build a parsed impression event with the given params.
+    fn impression_event(imp_id: Option<&str>) -> raw_log_parser::Event {
+        let mut params = HashMap::new();
+        if let Some(id) = imp_id {
+            params.insert("imp_id".to_string(), id.to_string());
+        }
+        raw_log_parser::Event {
+            ts: chrono::Utc::now(),
+            ip: None,
+            ua: None,
+            url: "/i".to_string(),
+            event_type: raw_log_parser::EventType::Impression,
+            params,
+            session_id: Some("sess-1".to_string()),
+            user_id: None,
+            cookie_id: None,
+            referer: None,
+            referrer_network: None,
+        }
+    }
+
+    /// Duplicate sends carrying the same imp_id collapse to one event;
+    /// distinct imp_ids and impressions without an imp_id are all kept.
+    #[test]
+    fn test_dedupe_impressions() {
+        // Same imp_id three times -> one event
+        let deduped = dedupe_impressions(vec![
+            impression_event(Some("imp-a")),
+            impression_event(Some("imp-a")),
+            impression_event(Some("imp-a")),
+        ]);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(
+            deduped[0].params.get("imp_id").map(String::as_str),
+            Some("imp-a")
+        );
+
+        // Distinct imp_ids all survive
+        let deduped = dedupe_impressions(vec![
+            impression_event(Some("imp-a")),
+            impression_event(Some("imp-b")),
+        ]);
+        assert_eq!(deduped.len(), 2);
+
+        // No imp_id -> nothing to key on, everything survives
+        let deduped = dedupe_impressions(vec![impression_event(None), impression_event(None)]);
+        assert_eq!(deduped.len(), 2);
+
+        // Mixed: the duplicate collapses, the keyless ones stay
+        let deduped = dedupe_impressions(vec![
+            impression_event(Some("imp-a")),
+            impression_event(None),
+            impression_event(Some("imp-a")),
+            impression_event(None),
+        ]);
+        assert_eq!(deduped.len(), 3);
+    }
+
+    /// Only impressions dedup: the helper never sees other event types in
+    /// production (the caller filters), so this pins the imp_id key is read
+    /// from params regardless of the surrounding event.
+    #[test]
+    fn test_dedupe_impressions_keeps_first_arrival() {
+        let mut first = impression_event(Some("imp-x"));
+        first
+            .params
+            .insert("creative_id".to_string(), "first".to_string());
+        let mut second = impression_event(Some("imp-x"));
+        second
+            .params
+            .insert("creative_id".to_string(), "second".to_string());
+
+        let deduped = dedupe_impressions(vec![first, second]);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(
+            deduped[0].params.get("creative_id").map(String::as_str),
+            Some("first"),
+            "first arrival wins"
+        );
     }
 }

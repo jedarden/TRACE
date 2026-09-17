@@ -74,6 +74,51 @@ conversion events even without an explicit `type` parameter.
 
 ---
 
+## Impression Tracking
+
+First-party impressions (your own ad slots, native widgets, email renders)
+are the top of the funnel — see
+[docs/notes/impression-capture.md](../docs/notes/impression-capture.md)
+for the full contract, including dedup semantics.
+
+### From the JS tag
+
+```javascript
+// From your ad-render callback:
+TRACE.impression({ creative_id: 'creative-7', ad_slot: 'hero', in_view_ms: 2400 });
+
+// String shorthand (creative_id only):
+TRACE.impression('creative-7');
+
+// Network-supplied impression ID used verbatim:
+TRACE.impression({ imp_id: 'adserver-imp-42' });
+```
+
+The event is always sent as `type: 'impression'`. When no `imp_id` is
+supplied the tag generates one scoped to the page view, and repeat calls
+for the same creative/slot are dropped client-side — one impression per
+creative per page view. The flusher collapses duplicate sends sharing an
+`imp_id`.
+
+### Impression pixel (no JavaScript)
+
+```html
+<img src="https://your-domain.com/i?imp_id=imp-9&creative_id=creative-2&sid=SESSION_ID&utm_campaign=c-77"
+     width="1" height="1" alt="" style="display:none">
+```
+
+### Server-to-server postback
+
+```bash
+curl -X POST https://your-domain.com/i \
+  -d 'imp_id=imp-11&sid=sess-9&creative_id=creative-4&utm_source=mgid'
+```
+
+`POST /i` accepts JSON or URL-encoded form data. Hits on `/i` default to
+impression events even without an explicit `type` parameter.
+
+---
+
 ## Features
 
 ### JavaScript Tag Features
