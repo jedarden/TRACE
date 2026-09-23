@@ -97,8 +97,15 @@ impl NormalizationMapping {
         let content = fs::read_to_string(path.as_ref())
             .with_context(|| format!("Failed to read config file: {:?}", path.as_ref()))?;
 
-        let config: NormalizationConfig = toml::from_str(&content)
-            .context("Failed to parse TOML config")?;
+        Self::from_toml_str(&content)
+            .with_context(|| format!("Invalid mapping config: {:?}", path.as_ref()))
+    }
+
+    /// Load normalization configuration from TOML text (e.g. the mapping
+    /// embedded in the replay binary when no --mapping file is given)
+    pub fn from_toml_str(content: &str) -> Result<Self> {
+        let config: NormalizationConfig =
+            toml::from_str(content).context("Failed to parse TOML config")?;
 
         Self::from_config(config)
     }
@@ -108,7 +115,7 @@ impl NormalizationMapping {
         let mut networks = HashMap::new();
         let mut mappings = HashMap::new();
 
-        for (key, network_config) in config.networks {
+        for (_key, network_config) in config.networks {
             let name = network_config.name.clone();
 
             // Build detection rules
@@ -130,10 +137,7 @@ impl NormalizationMapping {
             mappings.insert(name, field_mappings);
         }
 
-        Ok(Self {
-            networks,
-            mappings,
-        })
+        Ok(Self { networks, mappings })
     }
 
     /// Detect the ad network from URL parameters
@@ -142,7 +146,11 @@ impl NormalizationMapping {
         if let Some(source) = params.get("utm_source") {
             let source_lower = source.to_lowercase();
             for (name, detection) in &self.networks {
-                if detection.utm_source_values.iter().any(|v| v == source_lower.as_str()) {
+                if detection
+                    .utm_source_values
+                    .iter()
+                    .any(|v| v == source_lower.as_str())
+                {
                     return name;
                 }
             }
@@ -151,7 +159,7 @@ impl NormalizationMapping {
         // Check for click identifiers (gclid, fbclid, etc.)
         for key in params.keys().map(|k| k.to_lowercase()) {
             for (name, detection) in &self.networks {
-                if detection.click_identifiers.iter().any(|id| id == key) {
+                if detection.click_identifiers.contains(&key) {
                     return name;
                 }
             }
@@ -171,10 +179,7 @@ impl NormalizationMapping {
     }
 
     /// Normalize parameters into canonical fields
-    pub fn normalize(
-        &self,
-        params: &HashMap<String, String>,
-    ) -> HashMap<CanonicalField, String> {
+    pub fn normalize(&self, params: &HashMap<String, String>) -> HashMap<CanonicalField, String> {
         let network = self.detect_network(params);
         let mut result = HashMap::new();
 
@@ -189,7 +194,7 @@ impl NormalizationMapping {
             for (field, param_names) in field_mappings {
                 for param_name in param_names {
                     let param_lower = param_name.to_lowercase();
-                    if let Some((original_key, value)) = params_lower.get(&param_lower) {
+                    if let Some((_original_key, value)) = params_lower.get(&param_lower) {
                         result.insert(*field, value.clone());
                         break; // Use first match
                     }
@@ -235,10 +240,7 @@ pub struct NormalizedData {
 
 impl NormalizedData {
     /// Apply normalization to a set of URL parameters
-    pub fn from_params(
-        params: &HashMap<String, String>,
-        mapping: &NormalizationMapping,
-    ) -> Self {
+    pub fn from_params(params: &HashMap<String, String>, mapping: &NormalizationMapping) -> Self {
         let normalized = mapping.normalize(params);
         let network = mapping.get_network_name(params);
 
@@ -386,8 +388,7 @@ image_id = ["image"]
 item_id = ["item"]
 "#;
 
-        let config: NormalizationConfig = toml::from_str(toml_content).unwrap();
-        NormalizationMapping::from_config(config).unwrap()
+        NormalizationMapping::from_toml_str(toml_content).unwrap()
     }
 
     #[test]
