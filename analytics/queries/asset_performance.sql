@@ -38,6 +38,9 @@ LEFT JOIN {{events_table}} e
     AND e.network = a.network
     AND e.ts >= '{{start_date}}'::TIMESTAMP
     AND e.ts < '{{end_date}}'::TIMESTAMP
+
+    -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
+    AND {{ts_partition_filter}}
 GROUP BY 1, 2, 3, 4, 5
 ORDER BY clicks DESC, views DESC
 LIMIT 50;

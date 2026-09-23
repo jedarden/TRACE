@@ -4,6 +4,36 @@
 
 Partition pruning is a critical optimization technique that allows query engines to skip reading irrelevant partitions based on query predicates. Iceberg's hidden partitioning makes this transparent to users while maintaining performance.
 
+## How TRACE tables are actually laid out and read (verified 2026-09-16)
+
+The DDL in this guide describes the *target* Iceberg state. The pipeline as
+built (session materializer, compactor) writes **Hive-style partition
+directories of ZSTD Parquet** — `started_at_day=YYYY-MM-DD/`,
+`ts_day=YYYY-MM-DD/`, `network=<n>/type=<t>/` — one file per partition per
+run. **No component writes Iceberg `metadata/*.metadata.json` today**, so
+`iceberg_scan` on these paths fails outright (verified on DuckDB 1.5.2, even
+with `unsafe_enable_version_guessing = true`): there is no version hint to
+find. `iceberg_scan` becomes usable once a REST catalog populated with real
+table metadata is deployed (`ICEBERG_CATALOG_URI` is plumbed but unpopulated).
+
+Until then the DuckDB analytics layer reads the tables as
+`read_parquet('<glob>', hive_partitioning = true)`, which prunes at exactly
+one level:
+
+- **Filtering the Hive partition column** (`started_at_day`, `ts_day`,
+  `network`, …) prunes whole directories. Verified below.
+- **Filtering an in-file column only** (`started_at`, `ts`) does **not** skip
+  files on the DuckDB read path, even when every file's Parquet min/max
+  excludes the range — measured `Total Files Read` equals the unfiltered
+  baseline. Range filters on the timestamp are still correct and still filter
+  rows; they just do not save I/O here. An engine reading a *true* Iceberg
+  table (Trino with the `day(started_at)` partition transform) would prune
+  from the range predicate alone.
+
+So the practical rule against the as-built layout: **filter the partition
+column in addition to the timestamp.** The verified sessions examples below
+show both shapes.
+
 ## TRACE Partitioning Strategy
 
 ### Ad Events Table
@@ -51,6 +81,58 @@ WHERE DATE_TRUNC('day', ts) = '2026-05-01';
 SELECT COUNT(*) AS clicks
 FROM trace.ad_events
 WHERE ts >= '2026-05-01' AND ts < '2026-05-02';
+```
+
+### Sessions Table — verified against the live layout (2026-09-16)
+
+Measured on the as-built `trace.sessions` layout (10 day partitions
+`started_at_day=2026-09-01…2026-09-10`, one ZSTD Parquet file per day,
+240 rows/day; 138 MB / 20 M-row variant confirmed the same file counts),
+DuckDB 1.5.2, `read_parquet('…/iceberg/sessions/data/**/*.parquet',
+hive_partitioning = true)`. "Files read" is `TABLE_SCAN → Total Files Read`
+from `EXPLAIN ANALYZE`; with one file per day it equals partitions scanned.
+
+| Query | Files read | Rows out |
+|---|---|---|
+| `started_at >= '2026-09-03' AND started_at < '2026-09-06'` | **10 / 10** ✗ no pruning | 720 |
+| `DATE_TRUNC('day', started_at) = DATE '2026-09-03'` | 10 / 10 ✗ | 240 |
+| `CAST(started_at AS DATE) = DATE '2026-09-03'` | 10 / 10 ✗ | 240 |
+| `started_at_day = DATE '2026-09-03'` | **1 / 10** ✓ | 240 |
+| `started_at_day >= DATE '2026-09-03' AND started_at_day < DATE '2026-09-06'` | **3 / 10** ✓ | 720 |
+| `started_at` range **AND** `started_at_day` range | **3 / 10** ✓ | 720 |
+| no filter (baseline) | 10 / 10 | 2400 |
+
+Readings:
+
+- The timestamp-only range is **correct** (720 = exactly the rows in
+  `[09-03, 09-06)`) but scans every file: DuckDB opens each file's footer and
+  reads it, even though each file's `started_at` min/max is confined to a
+  single day (`parquet_metadata` confirms `[day 00:00:00 .. day 23:54:00]`).
+  The DATE_TRUNC and CAST forms behave the same at the file level while also
+  evaluating an expression per row — still avoid them.
+- Filtering the **partition column** (`started_at_day`, exposed by
+  `hive_partitioning = true` and auto-cast to DATE) prunes exactly: equality
+  → 1 file, 3-day range → 3 files.
+- The belt-and-braces pattern (timestamp range for row filtering **plus**
+  partition-column range for file pruning) is the recommended sessions query:
+
+```sql
+-- ✅ GOOD against trace.sessions as built: partition column prunes files,
+--    the timestamp range keeps row filtering independent of the partitioning
+SELECT COUNT(*) AS sessions
+FROM trace.sessions
+WHERE started_at_day >= DATE '2026-09-03'
+  AND started_at_day <  DATE '2026-09-06'
+  AND started_at >= TIMESTAMP '2026-09-03 00:00:00'
+  AND started_at <  TIMESTAMP '2026-09-06 00:00:00';
+
+-- ❌ BAD against trace.sessions as built: timestamp-only range reads every
+--    partition on the DuckDB read path (10/10 files measured). Acceptable
+--    only against a true Iceberg table under Trino, where the day(started_at)
+--    transform prunes from this predicate.
+SELECT COUNT(*) AS sessions
+FROM trace.sessions
+WHERE started_at >= '2026-09-03' AND started_at < '2026-09-06';
 ```
 
 ### Network-Based Queries on Assets Table
@@ -101,7 +183,7 @@ WHERE ts >= '2026-05-01'
 -- ✅ GOOD: Using DATE_TRUNC with range
 SELECT *
 FROM trace.ad_events
-WHERE ts >= DATE_TRUNC('day', CURRENT_DATE - INTERVAL '7' DAY)
+WHERE ts >= DATE_TRUNC('day', CURRENT_DATE + INTERVAL '-7 days')
   AND ts < DATE_TRUNC('day', CURRENT_DATE);
 
 -- ❌ AVOID: DATE equality on timestamp
@@ -130,7 +212,7 @@ WHERE network IN ('taboola', 'outbrain');
 WITH recent_campaigns AS (
     SELECT DISTINCT campaign_id
     FROM trace.ad_events
-    WHERE ts >= CURRENT_DATE - INTERVAL '7' DAY
+    WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
       AND network = 'taboola'
 )
 SELECT
@@ -140,7 +222,7 @@ SELECT
 FROM recent_campaigns c
 JOIN trace.ad_events e
     ON c.campaign_id = e.campaign_id
-WHERE e.ts >= CURRENT_DATE - INTERVAL '7' DAY
+WHERE e.ts >= CURRENT_DATE + INTERVAL '-7 days'
   AND e.network = 'taboola'
 GROUP BY 1, 2;
 ```
@@ -162,15 +244,25 @@ WHERE ts >= '2026-05-01' AND ts < '2026-05-08';
 
 ### Check Query Plan (DuckDB)
 
+Verified against DuckDB 1.5.2 (2026-09-16):
+
 ```sql
 EXPLAIN ANALYZE
-SELECT COUNT(*) FROM trace.ad_events
-WHERE ts >= '2026-05-01' AND ts < '2026-05-08';
+SELECT COUNT(*) FROM trace.sessions
+WHERE started_at_day >= DATE '2026-09-03'
+  AND started_at_day <  DATE '2026-09-06';
 
--- Look for:
--- - "PARQUET_SCAN: 7 files" (should match days in range)
--- - "PROJECTION" and "AGGREGATE" operators
+-- Look for the TABLE_SCAN node:
+-- - "Total Files Read: 3"  (should match days/partitions in range;
+--   with one file per day partition, files read == partitions scanned)
+-- - "Filters:" — the predicates pushed into the scan
+-- - "Filename(s):" — the glob the scan started from
 ```
+
+`iceberg_scan` (and the `iceberg_*` views that wrap it) require a populated
+Iceberg REST catalog; against the pipeline's current Parquet-only layout they
+fail with a missing-version error — see "How TRACE tables are actually laid
+out and read" above.
 
 ## Partition Evolution
 

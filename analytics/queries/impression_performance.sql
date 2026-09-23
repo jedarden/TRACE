@@ -40,6 +40,7 @@ SELECT
 FROM {{events_table}}
 WHERE ts >= '{{start_date}}'::TIMESTAMP
     AND ts < '{{end_date}}'::TIMESTAMP
+    AND {{ts_partition_filter}}
 GROUP BY 1, 2
 HAVING COUNT(*) FILTER (WHERE type = 'impression') > 0
 ORDER BY unique_impressions DESC

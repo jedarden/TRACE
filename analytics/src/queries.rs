@@ -45,6 +45,15 @@ pub fn list_reports() -> Vec<Report> {
             supports_iceberg: true,
         },
         Report {
+            name: "daily_sessions".to_string(),
+            description: "Daily session summary from the materialized trace.sessions table"
+                .to_string(),
+            category: ReportCategory::Daily,
+            sql_template: include_str!("../queries/daily_sessions.sql").to_string(),
+            default_params: HashMap::new(),
+            supports_iceberg: true,
+        },
+        Report {
             name: "ctr_by_campaign".to_string(),
             description: "Click-through rate by campaign".to_string(),
             category: ReportCategory::Daily,
@@ -289,6 +298,76 @@ pub fn get_daily_reports() -> Vec<Report> {
         .collect()
 }
 
+/// Build the day-partition predicate that accompanies a `ts`/`started_at`
+/// range filter so DuckDB's Parquet read path can prune whole directories.
+///
+/// - `Some(column)`: the backend reads Hive-partitioned directories, and
+///   filtering the partition column is the only thing that skips files —
+///   returns a date range using either literal dates or the default rolling
+///   SQL expressions.
+/// - `None`: the backend reads a true Iceberg table with hidden `day()`
+///   partitioning; the timestamp range predicate already in the template is
+///   what prunes, so this renders as TRUE to keep the SQL valid.
+///
+/// The dates use the same string form the `{{start_date}}`/`{{end_date}}`
+/// substitutions splice into the templates (YYYY-MM-DD from the CLI and the
+/// daily runner).
+pub fn partition_predicate(column: Option<&str>, start: &str, end: &str) -> String {
+    match column {
+        Some(col) => format!(
+            "({} >= {} AND {} < {})",
+            col,
+            partition_date_operand(start),
+            col,
+            partition_date_operand(end)
+        ),
+        None => "TRUE".to_string(),
+    }
+}
+
+/// Render either a user-supplied ISO date or one of the SQL expressions used
+/// by the default rolling window. Report templates splice both forms into
+/// the same partition predicate.
+fn partition_date_operand(value: &str) -> String {
+    if value == "CURRENT_DATE" || value.starts_with("CURRENT_DATE ") {
+        format!("CAST({} AS DATE)", value)
+    } else {
+        format!("'{}'::DATE", value)
+    }
+}
+
+/// Lower-bound-only variant of [`partition_predicate`] for templates with a
+/// fixed rolling window (`ts >= CURRENT_DATE - INTERVAL 'N days'`): the bound
+/// is a SQL expression rather than a spliced date string. Future-dated
+/// partitions do not need an upper bound.
+pub fn partition_lower_bound_predicate(column: Option<&str>, bound_expr: &str) -> String {
+    match column {
+        Some(col) => format!("({} >= CAST({} AS DATE))", col, bound_expr),
+        None => "TRUE".to_string(),
+    }
+}
+
+/// Replace every `{{prefix:expr}}` occurrence, passing `expr` (trimmed) to
+/// `render`. Hand-rolled rather than a regex dependency: the delimiters are
+/// fixed and expressions never contain `}}`. `prefix` is the literal
+/// opening `{{name:` — not a pattern; `find` locates it verbatim.
+fn regex_replace_all<F: Fn(&str) -> String>(sql: &str, prefix: &str, render: F) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut rest = sql;
+    while let Some(start) = rest.find(prefix) {
+        let expr_start = start + prefix.len();
+        if let Some(end_rel) = rest[expr_start..].find("}}") {
+            out.push_str(&rest[..start]);
+            out.push_str(&render(rest[expr_start..expr_start + end_rel].trim()));
+            rest = &rest[expr_start + end_rel + 2..];
+        } else {
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Render template with Iceberg/Parquet-aware SQL substitution
 /// This version uses DuckDBClient to determine the correct table references
 pub fn render_template_with_client(
@@ -306,50 +385,50 @@ pub fn render_template_with_client(
     let assets_table = db.assets_table_sql(config);
     sql = sql.replace("{{assets_table}}", &assets_table);
 
-    // Replace date parameters
-    if let Some(start) = &params.start_date {
-        sql = sql.replace("{{start_date}}", start);
-    } else {
-        sql = sql.replace("{{start_date}}", "CURRENT_DATE - INTERVAL '30 days'");
-    }
+    let sessions_table = db.sessions_table_sql(config);
+    sql = sql.replace("{{sessions_table}}", &sessions_table);
 
-    if let Some(end) = &params.end_date {
-        sql = sql.replace("{{end_date}}", end);
-    } else {
-        sql = sql.replace("{{end_date}}", "CURRENT_DATE");
-    }
+    // Replace date parameters, keeping the partition filters in sync with
+    // the timestamp ranges they mirror
+    let start = params
+        .start_date
+        .clone()
+        .unwrap_or_else(|| "CURRENT_DATE - INTERVAL '30 days'".to_string());
+    let end = params
+        .end_date
+        .clone()
+        .unwrap_or_else(|| "CURRENT_DATE".to_string());
+
+    sql = sql.replace(
+        "{{ts_partition_filter}}",
+        &partition_predicate(db.events_partition_column(config), &start, &end),
+    );
+    sql = sql.replace(
+        "{{sessions_partition_filter}}",
+        &partition_predicate(db.sessions_partition_column(config), &start, &end),
+    );
+
+    // Expression-bound form for templates with fixed rolling windows:
+    // {{ts_partition_filter:CURRENT_DATE - INTERVAL '7 days'}} filters the
+    // partition column from that expression onward (TRUE under Iceberg, like
+    // the plain form)
+    let events_col = db.events_partition_column(config);
+    sql = regex_replace_all(&sql, "{{ts_partition_filter:", |expr| {
+        partition_lower_bound_predicate(events_col, expr)
+    });
+    let sessions_col = db.sessions_partition_column(config);
+    sql = regex_replace_all(&sql, "{{sessions_partition_filter:", |expr| {
+        partition_lower_bound_predicate(sessions_col, expr)
+    });
+
+    sql = sql.replace("{{start_date}}", &start);
+    sql = sql.replace("{{end_date}}", &end);
 
     // Legacy S3 path replacement for backward compatibility
     if let Some(s3_path) = &params.s3_path {
         sql = sql.replace("{{s3_path}}", s3_path);
     } else {
         sql = sql.replace("{{s3_path}}", "s3://my-trace-bucket/trace-events");
-    }
-
-    sql
-}
-
-/// Legacy template rendering (backward compatible)
-/// This version uses the old {{s3_path}} style templates
-pub fn render_template(template: &str, params: &ReportParams) -> String {
-    let mut sql = template.to_string();
-
-    if let Some(s3_path) = &params.s3_path {
-        sql = sql.replace("{{s3_path}}", s3_path);
-    } else {
-        sql = sql.replace("{{s3_path}}", "s3://my-trace-bucket/trace-events");
-    }
-
-    if let Some(start) = &params.start_date {
-        sql = sql.replace("{{start_date}}", start);
-    } else {
-        sql = sql.replace("{{start_date}}", "CURRENT_DATE - INTERVAL '30 days'");
-    }
-
-    if let Some(end) = &params.end_date {
-        sql = sql.replace("{{end_date}}", end);
-    } else {
-        sql = sql.replace("{{end_date}}", "CURRENT_DATE");
     }
 
     sql
@@ -389,7 +468,7 @@ mod tests {
         assert!(report.is_some());
         let report = report.unwrap();
         assert_eq!(report.name, "daily_summary");
-        assert_eq!(report.category, ReportCategory::Metrics);
+        assert_eq!(report.category, ReportCategory::Daily);
         assert!(report.supports_iceberg);
     }
 
@@ -400,44 +479,35 @@ mod tests {
     }
 
     #[test]
-    fn test_render_template_basic() {
-        let template =
-            "SELECT * FROM '{{s3_path}}' WHERE ts >= '{{start_date}}' AND ts < '{{end_date}}'";
-        let params = ReportParams {
-            s3_path: Some("s3://my-bucket/events".to_string()),
-            start_date: Some("2026-01-01".to_string()),
-            end_date: Some("2026-01-31".to_string()),
-        };
-
-        let rendered = render_template(template, &params);
-        assert!(rendered.contains("s3://my-bucket/events"));
-        assert!(rendered.contains("2026-01-01"));
-        assert!(rendered.contains("2026-01-31"));
+    fn test_impression_report_is_registered() {
+        let report = get_report("impression_performance").expect("impression report");
+        assert!(matches!(report.category, ReportCategory::Daily));
+        assert!(report.sql_template.contains("type = 'impression'"));
+        assert!(report.sql_template.contains("unique_impressions"));
     }
 
     #[test]
-    fn test_render_template_defaults() {
-        let template = "SELECT * FROM '{{s3_path}}' WHERE ts >= '{{start_date}}'";
-        let params = ReportParams::default();
-
-        let rendered = render_template(template, &params);
-        assert!(rendered.contains("s3://my-trace-bucket/trace-events"));
-        assert!(rendered.contains("CURRENT_DATE - INTERVAL '30 days'"));
+    fn test_partition_predicate_accepts_default_rolling_window() {
+        assert_eq!(
+            partition_predicate(
+                Some("dt"),
+                "CURRENT_DATE - INTERVAL '30 days'",
+                "CURRENT_DATE"
+            ),
+            "(dt >= CAST(CURRENT_DATE - INTERVAL '30 days' AS DATE) AND dt < CAST(CURRENT_DATE AS DATE))"
+        );
     }
 
     #[test]
     fn test_report_categories() {
-        let reports = list_reports();
-
-        // Check that reports have the expected categories
         let daily_summary = get_report("daily_summary").unwrap();
-        assert!(matches!(daily_summary.category, ReportCategory::Metrics));
+        assert!(matches!(daily_summary.category, ReportCategory::Daily));
 
         let ctr_report = get_report("ctr_by_campaign").unwrap();
-        assert!(matches!(ctr_report.category, ReportCategory::Campaign));
+        assert!(matches!(ctr_report.category, ReportCategory::Daily));
 
         let top_headlines = get_report("top_headlines").unwrap();
-        assert!(matches!(top_headlines.category, ReportCategory::Asset));
+        assert!(matches!(top_headlines.category, ReportCategory::Daily));
 
         let network_comparison = get_report("network_comparison").unwrap();
         assert!(matches!(

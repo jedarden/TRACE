@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Deserialize;
 use std::env;
 
@@ -16,6 +16,14 @@ pub struct Config {
     pub iceberg_catalog_uri: Option<String>,
     /// Iceberg warehouse path (e.g., s3://my-trace-bucket/iceberg)
     pub iceberg_warehouse: Option<String>,
+    /// Replace the two Parquet event views with the schema-version
+    /// compatibility views (crate::events_compat): set
+    /// TRACE_COMPAT_EVENT_VIEWS=1 when the events prefix holds files from
+    /// more than one flusher generation
+    /// (docs/analytics/event_schema_versions.md). Off by default — the
+    /// plain Hive-partitioned views keep day-directory pruning, which the
+    /// compat views give up for a derived `dt` column.
+    pub compat_event_views: bool,
 }
 
 impl Config {
@@ -39,6 +47,9 @@ impl Config {
                 .unwrap_or_else(|_| "/data/reports".to_string()),
             iceberg_catalog_uri: env::var("ICEBERG_CATALOG_URI").ok(),
             iceberg_warehouse: env::var("ICEBERG_WAREHOUSE").ok(),
+            compat_event_views: env::var("TRACE_COMPAT_EVENT_VIEWS")
+                .map(|v| v == "1")
+                .unwrap_or(false),
         })
     }
 
@@ -47,7 +58,10 @@ impl Config {
     }
 
     pub fn s3_compacted_path(&self) -> String {
-        format!("s3://{}/{}/events-compacted", self.s3_bucket, self.s3_prefix)
+        format!(
+            "s3://{}/{}/events-compacted",
+            self.s3_bucket, self.s3_prefix
+        )
     }
 
     /// Check if Iceberg catalog is configured
@@ -57,7 +71,8 @@ impl Config {
 
     /// Get the Iceberg table path for ad_events
     pub fn iceberg_ad_events_path(&self) -> Option<String> {
-        self.iceberg_warehouse.as_ref()
+        self.iceberg_warehouse
+            .as_ref()
             .map(|w| format!("{}/ad_events", w))
     }
 }
@@ -80,6 +95,7 @@ mod tests {
             reports_output_path: "/data/reports".to_string(),
             iceberg_catalog_uri: None,
             iceberg_warehouse: None,
+            compat_event_views: false,
         };
 
         assert_eq!(config.s3_bucket, "test-bucket");
@@ -101,6 +117,7 @@ mod tests {
             reports_output_path: "/data/reports".to_string(),
             iceberg_catalog_uri: None,
             iceberg_warehouse: None,
+            compat_event_views: false,
         };
 
         // Not enabled when only catalog URI is set
@@ -130,10 +147,17 @@ mod tests {
             reports_output_path: "/data/reports".to_string(),
             iceberg_catalog_uri: None,
             iceberg_warehouse: None,
+            compat_event_views: false,
         };
 
-        assert_eq!(config.s3_events_path(), "s3://my-bucket/trace-events/events");
-        assert_eq!(config.s3_compacted_path(), "s3://my-bucket/trace-events/events-compacted");
+        assert_eq!(
+            config.s3_events_path(),
+            "s3://my-bucket/trace-events/events"
+        );
+        assert_eq!(
+            config.s3_compacted_path(),
+            "s3://my-bucket/trace-events/events-compacted"
+        );
     }
 
     #[test]
@@ -149,6 +173,7 @@ mod tests {
             reports_output_path: "/data/reports".to_string(),
             iceberg_catalog_uri: None,
             iceberg_warehouse: None,
+            compat_event_views: false,
         };
 
         // None when warehouse is not set
@@ -156,6 +181,9 @@ mod tests {
 
         // Some when warehouse is set
         config.iceberg_warehouse = Some("s3://my-bucket/iceberg".to_string());
-        assert_eq!(config.iceberg_ad_events_path(), Some("s3://my-bucket/iceberg/ad_events".to_string()));
+        assert_eq!(
+            config.iceberg_ad_events_path(),
+            Some("s3://my-bucket/iceberg/ad_events".to_string())
+        );
     }
 }

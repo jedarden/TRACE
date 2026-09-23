@@ -34,6 +34,9 @@ SELECT
 FROM {{events_table}}
 WHERE ts >= '{{start_date}}'::TIMESTAMP
     AND ts < '{{end_date}}'::TIMESTAMP
+
+    -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
+    AND {{ts_partition_filter}}
     AND campaign_id IS NOT NULL
 GROUP BY 1, 2, 3
 HAVING COUNT(*) FILTER (WHERE type = 'pageview') >= 10
@@ -61,6 +64,9 @@ SELECT
 FROM {{events_table}}
 WHERE ts >= '{{start_date}}'::TIMESTAMP
     AND ts < '{{end_date}}'::TIMESTAMP
+
+    -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
+    AND {{ts_partition_filter}}
     AND creative_id IS NOT NULL
 GROUP BY 1, 2, 3, 4
 HAVING COUNT(*) FILTER (WHERE type = 'pageview') >= 20
@@ -86,6 +92,9 @@ SELECT
 FROM {{events_table}}
 WHERE ts >= '{{start_date}}'::TIMESTAMP
     AND ts < '{{end_date}}'::TIMESTAMP
+
+    -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
+    AND {{ts_partition_filter}}
 GROUP BY 1, 2
 ORDER BY 1 DESC, 2;
 
@@ -114,6 +123,9 @@ SELECT
 FROM {{events_table}}
 WHERE ts >= '{{start_date}}'::TIMESTAMP
     AND ts < '{{end_date}}'::TIMESTAMP
+
+    -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
+    AND {{ts_partition_filter}}
     AND campaign_id IS NOT NULL
     AND creative_id IS NOT NULL
 GROUP BY 1, 2, 3, 4

@@ -4,7 +4,7 @@
 //! by stitching together events into sessions and analyzing user behavior patterns.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// Session configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,10 +173,10 @@ sessions AS (
         COUNT(*) AS event_count,
         COUNT(DISTINCT url) AS unique_pages,
         EXTRACT(EPOCH FROM (MAX(ts) - MIN(ts)))::BIGINT AS duration_seconds,
-        FIRST_VALUE(url) OVER (PARTITION BY session_id, reconstructed_session_seq ORDER BY ts) AS landing_page,
-        FIRST_VALUE(network) OVER (PARTITION BY session_id, reconstructed_session_seq ORDER BY ts) AS source_network,
-        FIRST_VALUE(campaign_id) OVER (PARTITION BY session_id, reconstructed_session_seq ORDER BY ts) AS campaign,
-        FIRST_VALUE(device_type) OVER (PARTITION BY session_id, reconstructed_session_seq ORDER BY ts) AS device_type
+        ARG_MIN(url, ts) AS landing_page,
+        ARG_MIN(network, ts) AS source_network,
+        ARG_MIN(campaign_id, ts) AS campaign,
+        ARG_MIN(device_type, ts) AS device_type
     FROM session_assignments
     WHERE EXTRACT(EPOCH FROM (MAX(ts) - MIN(ts)))::BIGINT / 3600 <= {}
     GROUP BY session_id, reconstructed_session_seq, user_id
@@ -370,7 +370,8 @@ SELECT
 FROM path_frequencies
 ORDER BY frequency DESC
 LIMIT 50;
-"#.to_string()
+"#
+        .to_string()
     }
 
     /// Generate SQL for session flow analysis (transition matrix)
@@ -400,7 +401,8 @@ WHERE next_url IS NOT NULL
 GROUP BY from_page, to_page
 ORDER BY transition_count DESC
 LIMIT 100;
-"#.to_string()
+"#
+        .to_string()
     }
 
     /// Generate SQL for cohort-based journey analysis
@@ -444,7 +446,8 @@ SELECT
 FROM user_sessions
 GROUP BY cohort, day_number
 ORDER BY cohort, day_number;
-"#.to_string(),
+"#
+            .to_string(),
 
             "campaign" => r#"
 -- User journey by campaign cohort
@@ -485,7 +488,8 @@ SELECT
 FROM user_sessions
 GROUP BY cohort, day_number
 ORDER BY cohort, day_number;
-"#.to_string(),
+"#
+            .to_string(),
 
             _ => r#"
 -- Default user journey by day cohort
@@ -524,17 +528,13 @@ SELECT
 FROM user_sessions
 GROUP BY cohort, day_number
 ORDER BY cohort, day_number;
-"#.to_string(),
+"#
+            .to_string(),
         }
     }
 
     /// Generate SQL for funnel analysis with journey paths
     pub fn funnel_with_paths_sql(funnel_steps: &[&str]) -> String {
-        let steps_array: Vec<String> = funnel_steps
-            .iter()
-            .map(|s| format!("'{}'", s))
-            .collect();
-
         format!(
             r#"
 -- Funnel analysis with user journey paths
@@ -637,7 +637,8 @@ FROM last_events
 GROUP BY last_event_type, last_url, second_to_last_url
 ORDER BY sessions DESC
 LIMIT 50;
-"#.to_string()
+"#
+        .to_string()
     }
 
     /// Generate SQL for returning user analysis
@@ -695,7 +696,8 @@ ORDER BY
         WHEN 'returning_6_10' THEN 4
         ELSE 5
     END;
-"#.to_string()
+"#
+        .to_string()
     }
 }
 
@@ -715,7 +717,7 @@ mod tests {
         let config = SessionConfig::default();
         let sql = SessionStitcher::session_reconstruction_sql(&config);
 
-        assert!(sql.contains("session_timeout_minutes"));
+        assert!(sql.contains("gap_minutes > 30"));
         assert!(sql.contains("reconstructed_session"));
         assert!(sql.contains("gap_minutes"));
     }
@@ -732,7 +734,7 @@ mod tests {
     #[test]
     fn test_attribution_sql() {
         let sql = SessionStitcher::attribution_sql(None);
-        assert!(sql.contains("multi-touch attribution"));
+        assert!(sql.contains("Multi-touch attribution analysis"));
         assert!(sql.contains("attribution_model"));
 
         let sql_conversion = SessionStitcher::attribution_sql(Some("purchase"));
@@ -750,7 +752,7 @@ mod tests {
     fn test_session_flow_matrix_sql() {
         let sql = SessionStitcher::session_flow_matrix_sql();
         assert!(sql.contains("LEAD(url)"));
-        assert!(sql.contains("transition_matrix"));
+        assert!(sql.contains("Session flow transition matrix"));
     }
 
     #[test]
@@ -775,7 +777,7 @@ mod tests {
     fn test_drop_off_analysis_sql() {
         let sql = SessionStitcher::drop_off_analysis_sql();
         assert!(sql.contains("last_event_type"));
-        assert!(sql.contains("drop_off"));
+        assert!(sql.contains("Analyze where users drop off"));
     }
 
     #[test]

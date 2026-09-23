@@ -1,10 +1,10 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use tracing::{error, info};
 
 use crate::config::Config;
 use crate::duckdb::DuckDBClient;
-use crate::queries::{get_report, render_template, render_template_with_client, ReportParams};
+use crate::queries::{get_report, render_template_with_client, ReportParams};
 
 pub async fn run_report(
     db: &DuckDBClient,
@@ -14,8 +14,7 @@ pub async fn run_report(
     params: &ReportParams,
     config: &Config,
 ) -> Result<()> {
-    let report = get_report(name)
-        .ok_or_else(|| anyhow::anyhow!("Report '{}' not found", name))?;
+    let report = get_report(name).ok_or_else(|| anyhow::anyhow!("Report '{}' not found", name))?;
 
     info!("Running report: {}", name);
     if config.is_iceberg_enabled() {
@@ -24,13 +23,14 @@ pub async fn run_report(
         info!("Using Parquet file backend");
     }
 
-    // Use Iceberg-aware rendering if configured
-    let sql = if config.is_iceberg_enabled() && report.supports_iceberg {
-        render_template_with_client(&report.sql_template, params, db, config)
-    } else {
-        // Fall back to legacy rendering for Parquet or unsupported reports
-        render_template(&report.sql_template, params)
-    };
+    // Always render through the client: it resolves the backend-specific
+    // table references ({{events_table}}, {{sessions_table}}, …) and the
+    // day-partition filters ({{ts_partition_filter}},
+    // {{sessions_partition_filter}}) for whichever backend is configured.
+    // The pre-Iceberg legacy renderer this replaced left {{events_table}}
+    // unexpanded, which made every Parquet-mode report fail at execution
+    // time — there is deliberately no second rendering path to fall back to.
+    let sql = render_template_with_client(&report.sql_template, params, db, config);
 
     let result = db.execute_query(&sql)?;
 
@@ -81,7 +81,10 @@ pub fn execute_query(
 pub async fn run_scheduled_reports(config: Config, interval_secs: u64) -> Result<()> {
     use tokio::time::{interval, Duration};
 
-    info!("Starting scheduled reports runner (interval: {}s)", interval_secs);
+    info!(
+        "Starting scheduled reports runner (interval: {}s)",
+        interval_secs
+    );
 
     let mut timer = interval(Duration::from_secs(interval_secs));
 
@@ -107,13 +110,18 @@ pub async fn run_daily_reports(config: &Config) -> Result<()> {
     let date_stamp = Utc::now().format("%Y-%m-%d").to_string();
     let params = ReportParams {
         s3_path: Some(s3_path),
-        start_date: Some((Utc::now() - chrono::Days::new(7)).format("%Y-%m-%d").to_string()),
+        start_date: Some(
+            (Utc::now() - chrono::Days::new(7))
+                .format("%Y-%m-%d")
+                .to_string(),
+        ),
         end_date: Some(Utc::now().format("%Y-%m-%d").to_string()),
     };
 
     // Daily reports: CTR summary, top performers, fatigued creatives
     let reports = vec![
         ("daily_summary", "Daily event summary"),
+        ("daily_sessions", "Daily session summary (trace.sessions)"),
         ("ctr_by_campaign", "CTR summary by campaign"),
         ("top_headlines", "Top performing headlines"),
         ("top_images", "Top performing images"),
@@ -123,15 +131,21 @@ pub async fn run_daily_reports(config: &Config) -> Result<()> {
     for (report_name, description) in reports {
         info!("Running daily report: {} - {}", report_name, description);
 
-        let base_path = format!("{}/{}_{}", config.reports_output_path, date_stamp, report_name);
+        let base_path = format!(
+            "{}/{}_{}",
+            config.reports_output_path, date_stamp, report_name
+        );
         let json_path = format!("{}.json", base_path);
         let csv_path = format!("{}.csv", base_path);
 
         // Generate both JSON and CSV outputs
-        if let Err(e) = run_report(&db, report_name, "json", Some(&json_path), &params, config).await {
+        if let Err(e) =
+            run_report(&db, report_name, "json", Some(&json_path), &params, config).await
+        {
             error!("Report '{}' (JSON) failed: {}", report_name, e);
         }
-        if let Err(e) = run_report(&db, report_name, "csv", Some(&csv_path), &params, config).await {
+        if let Err(e) = run_report(&db, report_name, "csv", Some(&csv_path), &params, config).await
+        {
             error!("Report '{}' (CSV) failed: {}", report_name, e);
         }
     }

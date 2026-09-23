@@ -20,7 +20,10 @@ The normalized view provides these common fields:
 
 - **`network`** - Detected ad network (taboola, outbrain, mgid, revcontent, googleads, unknown)
 - **`campaign_id`** - Campaign identifier from `utm_campaign`
+- **`ad_id`** - Ad/ad-group identifier (normalized from network-specific field)
 - **`creative_id`** - Unique creative identifier (normalized from network-specific field)
+- **`publisher_id`** - Publisher/site identifier where the network passes one
+- **`placement_id`** - Placement/target position identifier
 - **`headline`** - Creative headline/title text (normalized from network-specific field)
 - **`image_id`** - Image or thumbnail identifier (normalized from network-specific field)
 - **`item_id`** - Item identifier where available
@@ -33,7 +36,7 @@ Load the normalization views in DuckDB:
 
 ```sql
 -- Load the normalization views
-COPY /path/to/TRACE/docs/analytics/normalization.sql
+.read /path/to/TRACE/docs/analytics/normalization.sql
 -- Or paste the contents directly
 ```
 
@@ -132,7 +135,7 @@ SELECT
     SUM(views) AS total_views,
     ROUND(100.0 * SUM(clicks) / NULLIF(SUM(views), 0), 2) AS ctr
 FROM normalized_campaigns
-WHERE ts >= CURRENT_DATE - INTERVAL '7 days'
+WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
 GROUP BY network
 ORDER BY ctr DESC;
 ```

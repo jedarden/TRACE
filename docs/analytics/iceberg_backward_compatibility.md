@@ -2,7 +2,7 @@
 
 ## Core Principles
 
-### Safe Schema Changes (Always Backward Compatible)
+### Backward-Compatible Schema Changes
 
 1. **ADD COLUMN** with nullable or default value
    ```sql
@@ -78,27 +78,45 @@ COMMENT ON COLUMN trace.ad_events.campaign_id IS 'DEPRECATED: Use campaign_id_v2
 
 ### Handling Missing Columns in Views
 
+A view over `trace.ad_events` binds to the table's *current* schema, so it
+cannot "handle" a column the table does not have — after the V002-V004
+migrations, every column exists and rows written before a migration simply
+read as NULL there. What a unified view is for is normalizing those NULLs
+and projecting one stable column set for readers:
+
 ```sql
--- Create views that handle multiple schema versions
+-- Normalize values across schema versions. Every column referenced here
+-- exists in the current table (see analytics/schemas/ad_events_iceberg.sql);
+-- rows written before the column's migration read as NULL.
 CREATE OR REPLACE VIEW trace.ad_events_unified AS
 SELECT
     ts, ip, ua, url, type,
     session_id, user_id, cookie_id,
+    network, campaign_id, campaign_name,
+    creative_id, headline, image_id, item_id,
+    params,
 
-    -- Use COALESCE for versioned columns
-    COALESCE(campaign_id_v2, campaign_id) AS campaign_id,
+    -- V002 (migrations/V002__add_referrer_attribution.sql)
+    referrer, referrer_network,
+    attribution_campaign_id, attribution_creative_id,
+    attribution_touches, attribution_days_to_convert,
+    device_type, device_os, device_browser,
 
-    -- Handle optional engagement metrics (V003+)
-    scroll_depth_pct,
-    dwell_time_ms,
+    -- V003 (migrations/V003__add_engagement_metrics.sql): NULL for scroll/
+    -- dwell events recorded before V003
+    scroll_depth_pct, dwell_time_ms,
 
-    -- Handle optional quality scores (V004+)
-    COALESCE(quality_score, 1.0) AS quality_score,  -- Default to valid if not scored
-
-    network, campaign_name, creative_id, headline, image_id, item_id,
-    params
+    -- V004 (migrations/V004__add_quality_scores.sql): NULL until scored
+    COALESCE(quality_score, 1.0) AS quality_score  -- default to valid if not scored
 FROM trace.ad_events;
 ```
+
+The *file*-level version mix — raw Parquet written by older flusher
+generations that genuinely lack these columns (and store `params` as a JSON
+string instead of a MAP) — cannot be solved by a view over the table. See
+[Event Schema Versions](event_schema_versions.md) and
+`analytics/schemas/events_compat_views.sql` for the compatibility views
+that span those file generations.
 
 ### Time Travel Queries with Schema Evolution
 
@@ -214,12 +232,16 @@ ORDER BY reference_count ASC;
 
 ### Schema Compatibility Matrix
 
+Table versions use the canonical `analytics/schemas/migrations/` numbering;
+the raw *file* generations that predate each version are listed in
+[Event Schema Versions](event_schema_versions.md).
+
 | Schema Version | Columns Added | Compatible Readers | Migration Required |
 |----------------|---------------|-------------------|-------------------|
-| V1 (base) | Initial schema | V1+ | No |
-| V2 | referrer, attribution, device | V2+ | Optional for referrer data |
-| V3 | engagement metrics | V3+ | Optional for engagement |
-| V4 | quality scores | V4+ | Optional for quality filtering |
+| V001 (base) | Initial schema | V001+ | No |
+| V002 | referrer, attribution, device (9 columns) | V002+ | Optional for referrer data |
+| V003 | engagement metrics (6 columns) | V003+ | Optional for engagement |
+| V004 | quality scores (8 columns) | V004+ | Optional for quality filtering |
 
 ## Emergency Procedures
 

@@ -8,6 +8,9 @@ WITH session_conversions AS (
     FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+
+    -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
+        AND {{ts_partition_filter}}
         AND session_id IS NOT NULL
     GROUP BY session_id
     HAVING COUNT(*) FILTER (WHERE type = 'conversion') > 0
@@ -30,6 +33,9 @@ session_touchpoints AS (
     INNER JOIN session_conversions sc ON e.session_id = sc.session_id
     WHERE e.ts >= '{{start_date}}'::TIMESTAMP
         AND e.ts < '{{end_date}}'::TIMESTAMP
+
+    -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
+        AND {{ts_partition_filter}}
         AND e.session_id IS NOT NULL
 ),
 linear_attribution AS (

@@ -32,6 +32,9 @@ WITH session_dwell_events AS (
     FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+
+    -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
+        AND {{ts_partition_filter}}
         AND type = 'dwell'
         AND dwell_time_ms IS NOT NULL
         AND session_id IS NOT NULL
@@ -86,6 +89,9 @@ SELECT
 FROM {{events_table}}
 WHERE ts >= '{{start_date}}'::TIMESTAMP
     AND ts < '{{end_date}}'::TIMESTAMP
+
+    -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
+    AND {{ts_partition_filter}}
     AND type = 'dwell'
     AND dwell_time_ms IS NOT NULL
     AND session_id IS NOT NULL
@@ -109,6 +115,9 @@ WITH creative_dwell AS (
     FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+
+    -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
+        AND {{ts_partition_filter}}
         AND type = 'dwell'
         AND dwell_time_ms IS NOT NULL
         AND session_id IS NOT NULL
@@ -163,6 +172,9 @@ WITH event_sequence AS (
     FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+
+    -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
+        AND {{ts_partition_filter}}
         AND session_id IS NOT NULL
 ),
 page_dwell_inferred AS (
@@ -224,6 +236,9 @@ SELECT
 FROM {{events_table}}
 WHERE ts >= '{{start_date}}'::TIMESTAMP
     AND ts < '{{end_date}}'::TIMESTAMP
+
+    -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
+    AND {{ts_partition_filter}}
     AND type = 'dwell'
     AND dwell_time_ms IS NOT NULL
 GROUP BY 1

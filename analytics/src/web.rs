@@ -6,7 +6,7 @@ use axum::{
     routing::get,
     Router,
 };
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -119,7 +119,7 @@ async fn execute_query(
                 csv: Some(csv),
                 json: Some(json),
             })
-        },
+        }
         Err(e) => Json(QueryResponse {
             columns: vec![],
             rows: vec![],
@@ -142,7 +142,9 @@ async fn list_reports_api() -> Json<ReportListResponse> {
         })
         .collect();
 
-    Json(ReportListResponse { reports: report_info })
+    Json(ReportListResponse {
+        reports: report_info,
+    })
 }
 
 async fn run_report_api(

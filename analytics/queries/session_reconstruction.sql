@@ -8,6 +8,8 @@ WITH event_gaps AS (
     FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+        -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
+        AND {{ts_partition_filter}}
         AND session_id IS NOT NULL
 ),
 session_assignments AS (
@@ -27,13 +29,13 @@ sessions AS (
         COUNT(*) AS event_count,
         COUNT(DISTINCT url) AS unique_pages,
         EXTRACT(EPOCH FROM (MAX(ts) - MIN(ts)))::BIGINT AS duration_seconds,
-        FIRST_VALUE(url) OVER (PARTITION BY session_id, reconstructed_session_seq ORDER BY ts) AS landing_page,
-        FIRST_VALUE(network) OVER (PARTITION BY session_id, reconstructed_session_seq ORDER BY ts) AS source_network,
-        FIRST_VALUE(campaign_id) OVER (PARTITION BY session_id, reconstructed_session_seq ORDER BY ts) AS campaign,
-        FIRST_VALUE(device_type) OVER (PARTITION BY session_id, reconstructed_session_seq ORDER BY ts) AS device_type
+        ARG_MIN(url, ts) AS landing_page,
+        ARG_MIN(network, ts) AS source_network,
+        ARG_MIN(campaign_id, ts) AS campaign,
+        ARG_MIN(device_type, ts) AS device_type
     FROM session_assignments
-    WHERE EXTRACT(EPOCH FROM (MAX(ts) - MIN(ts)))::BIGINT / 3600 <= 4
     GROUP BY session_id, reconstructed_session_seq, user_id
+    HAVING EXTRACT(EPOCH FROM (MAX(ts) - MIN(ts)))::BIGINT / 3600 <= 4
 )
 SELECT
     reconstructed_session_id AS session_id,

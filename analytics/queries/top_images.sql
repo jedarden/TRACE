@@ -9,6 +9,9 @@ FROM {{events_table}}
 WHERE params->>'tb_image' IS NOT NULL
     AND ts >= '{{start_date}}'::TIMESTAMP
     AND ts < '{{end_date}}'::TIMESTAMP
+
+    -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
+    AND {{ts_partition_filter}}
 GROUP BY 1, 2
 ORDER BY clicks DESC
 LIMIT 50;

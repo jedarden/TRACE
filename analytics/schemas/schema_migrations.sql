@@ -138,44 +138,41 @@ $$;
 -- Defined Migrations
 -- ============================================================================
 
+-- Numbering note: the versions below mirror the canonical migration files
+-- in analytics/schemas/migrations/ (V002__add_referrer_attribution.sql,
+-- V003__add_engagement_metrics.sql, V004__add_quality_scores.sql). This
+-- file previously drifted from that directory — V003 held only the device
+-- columns that belong to V002, shifting engagement and quality up by one —
+-- which made the backward-compatibility matrix in
+-- docs/analytics/iceberg_backward_compatibility.md wrong by a version.
+
 -- ----------------------------------------------------------------------------
--- Migration V002: Add referrer and attribution fields
+-- Migration V002: Add referrer, attribution, and device fields
 -- ----------------------------------------------------------------------------
 
 SELECT trace.apply_migration(
     2,
-    'Add referrer tracking and attribution fields',
+    'Add referrer tracking, attribution, and device fields',
     $$ALTER TABLE trace.ad_events ADD COLUMN referrer STRING;
       ALTER TABLE trace.ad_events ADD COLUMN referrer_network STRING;
       ALTER TABLE trace.ad_events ADD COLUMN attribution_campaign_id STRING;
       ALTER TABLE trace.ad_events ADD COLUMN attribution_creative_id STRING;
       ALTER TABLE trace.ad_events ADD COLUMN attribution_touches INT;
-      ALTER TABLE trace.ad_events ADD COLUMN attribution_days_to_convert INT;$$,
+      ALTER TABLE trace.ad_events ADD COLUMN attribution_days_to_convert INT;
+      ALTER TABLE trace.ad_events ADD COLUMN device_type STRING;
+      ALTER TABLE trace.ad_events ADD COLUMN device_os STRING;
+      ALTER TABLE trace.ad_events ADD COLUMN device_browser STRING;$$,
     $$-- Rollback V002: Note that Iceberg doesn't support DROP COLUMN in all engines
       -- Instead, we use time travel to query pre-V002 data:
       -- SELECT * FROM trace.ad_events FOR VERSION AS OF <pre_v002_snapshot_id>$$
 );
 
 -- ----------------------------------------------------------------------------
--- Migration V003: Add device detection
+-- Migration V003: Add engagement metrics
 -- ----------------------------------------------------------------------------
 
 SELECT trace.apply_migration(
     3,
-    'Add device detection fields',
-    $$ALTER TABLE trace.ad_events ADD COLUMN device_type STRING;
-      ALTER TABLE trace.ad_events ADD COLUMN device_os STRING;
-      ALTER TABLE trace.ad_events ADD COLUMN device_browser STRING;$$,
-    $$-- Rollback V003: Use time travel or ignore columns in queries
-      -- SELECT * FROM trace.ad_events FOR VERSION AS OF <pre_v003_snapshot_id>$$
-);
-
--- ----------------------------------------------------------------------------
--- Migration V004: Add engagement metrics
--- ----------------------------------------------------------------------------
-
-SELECT trace.apply_migration(
-    4,
     'Add engagement metrics (scroll, dwell)',
     $$ALTER TABLE trace.ad_events ADD COLUMN scroll_depth_pct INT;
       ALTER TABLE trace.ad_events ADD COLUMN scroll_time_ms INT;
@@ -183,16 +180,16 @@ SELECT trace.apply_migration(
       ALTER TABLE trace.ad_events ADD COLUMN dwell_visible_pct INT;
       ALTER TABLE trace.ad_events ADD COLUMN viewport_width INT;
       ALTER TABLE trace.ad_events ADD COLUMN viewport_height INT;$$,
-    $$-- Rollback V004: Use time travel or ignore columns in queries
-      -- SELECT * FROM trace.ad_events FOR VERSION AS OF <pre_v004_snapshot_id>$$
+    $$-- Rollback V003: Use time travel or ignore columns in queries
+      -- SELECT * FROM trace.ad_events FOR VERSION AS OF <pre_v003_snapshot_id>$$
 );
 
 -- ----------------------------------------------------------------------------
--- Migration V005: Add quality scoring
+-- Migration V004: Add quality scoring
 -- ----------------------------------------------------------------------------
 
 SELECT trace.apply_migration(
-    5,
+    4,
     'Add quality scoring and validation fields',
     $$ALTER TABLE trace.ad_events ADD COLUMN quality_score DOUBLE;
       ALTER TABLE trace.ad_events ADD COLUMN bot_probability DOUBLE;
@@ -202,8 +199,8 @@ SELECT trace.apply_migration(
       ALTER TABLE trace.ad_events ADD COLUMN validation_reason STRING;
       ALTER TABLE trace.ad_events ADD COLUMN enriched_at TIMESTAMP;
       ALTER TABLE trace.ad_events ADD COLUMN enrichment_version STRING;$$,
-    $$-- Rollback V005: Use time travel or ignore columns in queries
-      -- SELECT * FROM trace.ad_events FOR VERSION AS OF <pre_v005_snapshot_id>$$
+    $$-- Rollback V004: Use time travel or ignore columns in queries
+      -- SELECT * FROM trace.ad_events FOR VERSION AS OF <pre_v004_snapshot_id>$$
 );
 
 -- ============================================================================
@@ -259,14 +256,14 @@ WITH version_columns AS (
               'creative_id', 'headline', 'image_id', 'item_id', 'params'] AS columns
     UNION ALL
     SELECT 'V002', ARRAY['referrer', 'referrer_network', 'attribution_campaign_id',
-                          'attribution_creative_id', 'attribution_touches', 'attribution_days_to_convert']
+                          'attribution_creative_id', 'attribution_touches',
+                          'attribution_days_to_convert',
+                          'device_type', 'device_os', 'device_browser']
     UNION ALL
-    SELECT 'V003', ARRAY['device_type', 'device_os', 'device_browser']
-    UNION ALL
-    SELECT 'V004', ARRAY['scroll_depth_pct', 'scroll_time_ms', 'dwell_time_ms',
+    SELECT 'V003', ARRAY['scroll_depth_pct', 'scroll_time_ms', 'dwell_time_ms',
                           'dwell_visible_pct', 'viewport_width', 'viewport_height']
     UNION ALL
-    SELECT 'V005', ARRAY['quality_score', 'bot_probability', 'fraud_score',
+    SELECT 'V004', ARRAY['quality_score', 'bot_probability', 'fraud_score',
                           'is_valid', 'is_verified', 'validation_reason',
                           'enriched_at', 'enrichment_version']
 ),
@@ -320,13 +317,11 @@ BEGIN
         attribution_creative_id,
         COALESCE(attribution_touches, 0) AS attribution_touches,
         COALESCE(attribution_days_to_convert, 0) AS attribution_days_to_convert,
-
-        -- V003 fields (NULL for older data)
         COALESCE(device_type, 'unknown') AS device_type,
         COALESCE(device_os, 'unknown') AS device_os,
         COALESCE(device_browser, 'unknown') AS device_browser,
 
-        -- V004 fields (NULL for older data)
+        -- V003 fields (NULL for older data)
         scroll_depth_pct,
         scroll_time_ms,
         dwell_time_ms,
@@ -334,7 +329,7 @@ BEGIN
         viewport_width,
         viewport_height,
 
-        -- V005 fields (defaults for older data)
+        -- V004 fields (defaults for older data)
         COALESCE(quality_score, 1.0) AS quality_score,
         COALESCE(bot_probability, 0.0) AS bot_probability,
         COALESCE(fraud_score, 0.0) AS fraud_score,
@@ -359,14 +354,14 @@ $$;
 --
 -- Apply a new migration:
 --   SELECT trace.apply_migration(
---       6,
+--       5,
 --       'Add new feature column',
 --       'ALTER TABLE trace.ad_events ADD COLUMN new_feature STRING;',
 --       '-- No rollback available'
 --   );
 --
 -- Rollback a migration (if rollback SQL exists):
---   SELECT trace.rollback_migration(5);
+--   SELECT trace.rollback_migration(4);
 --
 -- Rebuild compatibility views:
 --   CALL trace.rebuild_compatibility_views();

@@ -1,6 +1,6 @@
 # Apache Iceberg Integration for TRACE
 
-> **Schema Definition**: The complete Iceberg table schema for ad events is defined in `analytics/schemas/ad_events_iceberg.sql`. This file includes the main ad_events table, dimension tables for campaigns/creatives, and helper views for common analytics queries.
+> **Schema Definition**: The canonical Iceberg table schema for ad events is defined in `analytics/schemas/ad_events_iceberg.sql`. This file summarizes the main ad_events table, dimension tables for campaigns/creatives, and helper views for common analytics queries.
 
 ## Overview
 
@@ -135,7 +135,11 @@ See `analytics/schemas/ad_events_iceberg.sql` for the complete schema including:
 
 ### Events Table (Generic)
 
-For general-purpose event tracking:
+For general-purpose event tracking. The identity columns are nullable but
+must be declared: the report templates in `analytics/queries/` filter and
+group on `session_id` (session reconstruction, attribution, daily summary),
+and a table without it silently returns zero rows for those reports on all
+data instead of only on pre-identity data.
 
 ```sql
 CREATE TABLE trace.events (
@@ -144,11 +148,19 @@ CREATE TABLE trace.events (
   ua STRING,
   url STRING NOT NULL,
   params MAP<STRING, STRING> NOT NULL,
-  type STRING NOT NULL
+  type STRING NOT NULL,
+  -- Identity: NULL on events written before the flusher captured these
+  session_id STRING,
+  user_id STRING,
+  cookie_id STRING
 )
 PARTITIONED BY DAYS(ts)
 LOCATED AT 's3://my-trace-bucket/iceberg/events';
 ```
+
+Events older than the identity columns read as NULL there; see
+[Event Schema Versions](event_schema_versions.md) for how the raw Parquet
+generations map onto this table and how to query them together.
 
 ### Partitioning Strategy
 

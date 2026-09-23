@@ -1,5 +1,6 @@
 mod config;
 mod duckdb;
+mod events_compat;
 mod queries;
 mod reporter;
 mod s3;
@@ -126,17 +127,25 @@ async fn main() -> Result<()> {
                 let json_path = format!("{}.json", base_path);
                 let csv_path = format!("{}.csv", base_path);
 
-                if let Err(e) = reporter::run_report(&db, &name, "json", Some(&json_path), &params, &config).await {
+                if let Err(e) =
+                    reporter::run_report(&db, &name, "json", Some(&json_path), &params, &config)
+                        .await
+                {
                     error!("Report execution (JSON) failed: {}", e);
                     std::process::exit(1);
                 }
-                if let Err(e) = reporter::run_report(&db, &name, "csv", Some(&csv_path), &params, &config).await {
+                if let Err(e) =
+                    reporter::run_report(&db, &name, "csv", Some(&csv_path), &params, &config).await
+                {
                     error!("Report execution (CSV) failed: {}", e);
                     std::process::exit(1);
                 }
                 info!("Reports saved: {} and {}", json_path, csv_path);
             } else {
-                if let Err(e) = reporter::run_report(&db, &name, &format, output.as_deref(), &params, &config).await {
+                if let Err(e) =
+                    reporter::run_report(&db, &name, &format, output.as_deref(), &params, &config)
+                        .await
+                {
                     error!("Report execution failed: {}", e);
                     std::process::exit(1);
                 }
@@ -182,15 +191,14 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Commands::MaterializeSessions {
-            date,
-            events_glob,
-        } => {
+        Commands::MaterializeSessions { date, events_glob } => {
             let config = config::Config::from_env()?;
 
             let day = match &date {
-                Some(d) => Some(chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
-                    .with_context(|| format!("Invalid --date '{}': expected YYYY-MM-DD", d))?),
+                Some(d) => Some(
+                    chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+                        .with_context(|| format!("Invalid --date '{}': expected YYYY-MM-DD", d))?,
+                ),
                 None => None,
             };
 

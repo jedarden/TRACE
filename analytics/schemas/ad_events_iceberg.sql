@@ -17,47 +17,80 @@
 -- ----------------------------------------------------------------------------
 -- Primary Ad Events Table
 -- ----------------------------------------------------------------------------
--- This is the main table for all ad-related events (pageview, click, scroll, dwell)
+-- This is the main table for all ad-related events (pageview, impression,
+-- click, scroll, dwell)
 -- It includes both raw event fields and normalized ad campaign fields.
 
+-- Column provenance: V001 is the initial schema; V002-V004 are the
+-- migrations in analytics/schemas/migrations/ (canonical numbering — the
+-- same one docs/analytics/iceberg_backward_compatibility.md documents).
+-- Pre-existing tables gain the later columns through those migrations, not
+-- by re-running this DDL.
 CREATE TABLE IF NOT EXISTS trace.ad_events (
     -- Primary timestamp (partitioning field)
     ts TIMESTAMP NOT NULL,
 
-    -- Basic event fields
+    -- Basic event fields (V001)
     ip STRING,
     ua STRING,
     url STRING NOT NULL,
-    type STRING NOT NULL,  -- pageview, click, scroll, dwell
+    type STRING NOT NULL,  -- pageview, click, scroll, dwell, impression, conversion
 
-    -- Traffic source referrer (V002 — see docs/analytics/iceberg_backward_compatibility.md).
-    -- document.referrer from the JS tag (POST body / pixel query param),
-    -- falling back to the HTTP Referer header captured by the collector.
-    -- Pre-existing tables get this column via:
-    --   ALTER TABLE trace.ad_events ADD COLUMN referrer STRING DEFAULT NULL;
-    referrer STRING,
-
-    -- Identity fields
+    -- Identity fields (V001)
     session_id STRING,
     user_id STRING,
     cookie_id STRING,  -- First-party cookie identity
 
-    -- Normalized network detection
+    -- Normalized network detection (V001)
     network STRING,  -- taboola, outbrain, mgid, revcontent, unknown
 
-    -- Campaign identifiers
+    -- Campaign identifiers (V001)
     campaign_id STRING,  -- utm_campaign normalized
     campaign_name STRING,  -- Campaign name from network API (if available)
 
-    -- Creative identifiers (normalized across networks)
+    -- Creative identifiers, normalized across networks (V001)
     creative_id STRING,  -- Network-specific creative ID
     headline STRING,  -- Normalized headline/title
     image_id STRING,  -- Normalized image/thumbnail ID
     item_id STRING,  -- Content item ID
 
-    -- Raw parameters (for flexibility)
-    params MAP<STRING, STRING>
+    -- Raw parameters (V001)
+    -- Parquet files from the first two flusher generations stored this as
+    -- a JSON VARCHAR string, not a MAP — see
+    -- docs/analytics/event_schema_versions.md for the file-version history
+    -- and the compatibility views that span it.
+    params MAP<STRING, STRING>,
 
+    -- V002 (migrations/V002__add_referrer_attribution.sql)
+    -- document.referrer from the JS tag (POST body / pixel query param),
+    -- falling back to the HTTP Referer header captured by the collector.
+    referrer STRING,
+    referrer_network STRING,  -- google, facebook, twitter, direct, etc.
+    attribution_campaign_id STRING,  -- Original campaign that led to conversion
+    attribution_creative_id STRING,  -- Original creative that led to conversion
+    attribution_touches INT,  -- Number of ad touches before conversion
+    attribution_days_to_convert INT,  -- Days from first touch to conversion
+    device_type STRING,  -- desktop, mobile, tablet
+    device_os STRING,  -- ios, android, windows, macos, linux
+    device_browser STRING,  -- chrome, firefox, safari, edge
+
+    -- V003 (migrations/V003__add_engagement_metrics.sql)
+    scroll_depth_pct INT,  -- Percentage of page scrolled (0-100)
+    scroll_time_ms INT,  -- Time spent scrolling in milliseconds
+    dwell_time_ms INT,  -- Total dwell time in milliseconds
+    dwell_visible_pct INT,  -- Percentage of time ad was visible (0-100)
+    viewport_width INT,  -- Viewport width in pixels
+    viewport_height INT,  -- Viewport height in pixels
+
+    -- V004 (migrations/V004__add_quality_scores.sql)
+    quality_score DOUBLE,  -- Overall quality score (0.0-1.0)
+    bot_probability DOUBLE,  -- Probability of bot traffic (0.0-1.0)
+    fraud_score DOUBLE,  -- Fraud probability score (0.0-1.0)
+    is_valid BOOLEAN,  -- Passed basic validation
+    is_verified BOOLEAN,  -- Passed deep verification
+    validation_reason STRING,  -- Reason if validation failed
+    enriched_at TIMESTAMP,  -- When enrichment was applied
+    enrichment_version STRING  -- Version of enrichment pipeline
 )
 PARTITIONED BY DAYS(ts)
 LOCATED AT 's3://my-trace-bucket/iceberg/ad_events';
@@ -225,5 +258,10 @@ ORDER BY 1 DESC, 2;
 --
 -- 3. After migration, update all queries to use trace.ad_events instead of
 --    read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
+--
+-- 4. Until then, query the raw Parquet through the schema-version
+--    compatibility views (analytics/schemas/events_compat_views.sql, or
+--    events_compat::setup_compat_events_views from the analytics crate) —
+--    they span the pre-V002 file generations that read_parquet alone cannot.
 --
 -- ============================================================================

@@ -18,6 +18,9 @@ WITH session_touches AS (
     FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+
+    -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
+        AND {{ts_partition_filter}}
         AND session_id IS NOT NULL
 ),
 conversion_touches AS (

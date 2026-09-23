@@ -27,6 +27,14 @@ FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
 LIMIT 100;
 ```
 
+> A bare glob only works when every file under it has the same schema. The
+> bucket holds events from three flusher generations, and the first two
+> store `params` as a JSON string where the current one writes a MAP —
+> those cannot share one scan. Query through the `parquet_events`
+> compatibility view instead (`analytics/schemas/events_compat_views.sql`,
+> or `events_compat::setup_compat_events_views` from the analytics crate);
+> see [Event Schema Versions](event_schema_versions.md).
+
 ## Core Metrics
 
 ### Click-Through Rate (CTR)
@@ -58,9 +66,35 @@ SELECT
     COUNT(*) AS events,
     COUNT(DISTINCT session_id) AS unique_sessions
 FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
-WHERE ts >= CURRENT_DATE - INTERVAL '30 days'
+WHERE ts >= CURRENT_DATE + INTERVAL '-30 days'
 GROUP BY 1, 2
 ORDER BY 1, 2;
+```
+
+### Impression Performance
+
+First-party impressions are persisted as `type = 'impression'`, with their
+deduplication ID and attribution dimensions in the `params` map. The shipped
+`impression_performance` report exposes raw and unique impression counts,
+click-through rate, and viewability:
+
+```bash
+trace-analytics run impression_performance \
+  --start-date 2026-09-01 --end-date 2026-09-08
+```
+
+For ad-hoc SQL, count `params->>'imp_id'` distinctly so retries that cross a
+raw-file boundary do not inflate unique impressions:
+
+```sql
+SELECT
+    params->>'utm_campaign' AS campaign,
+    COUNT(*) AS impressions,
+    COUNT(DISTINCT params->>'imp_id') AS unique_impressions,
+    AVG(TRY_CAST(params->>'in_view_ms' AS BIGINT)) AS avg_in_view_ms
+FROM parquet_events
+WHERE type = 'impression'
+GROUP BY 1;
 ```
 
 ### Hourly Traffic Pattern
@@ -72,7 +106,7 @@ SELECT
     type,
     COUNT(*) AS events
 FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
-WHERE ts >= CURRENT_DATE - INTERVAL '7 days'
+WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
 GROUP BY 1, 2
 ORDER BY 1, 2;
 ```
@@ -91,7 +125,7 @@ WITH funnel AS (
         COUNT(*) FILTER (WHERE type = 'scroll') AS scrolls,
         COUNT(*) FILTER (WHERE type = 'dwell') AS dwells
     FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
-    WHERE ts >= CURRENT_DATE - INTERVAL '7 days'
+    WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
     GROUP BY 1
 )
 SELECT
@@ -128,7 +162,7 @@ SELECT
         2
     ) AS revenue_per_click
 FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
-WHERE ts >= CURRENT_DATE - INTERVAL '30 days'
+WHERE ts >= CURRENT_DATE + INTERVAL '-30 days'
 GROUP BY 1, 2, 3
 ORDER BY revenue DESC
 LIMIT 20;
@@ -149,7 +183,7 @@ SELECT
     MAX(ts) AS last_seen
 FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
 WHERE params->>'tb_headline' IS NOT NULL
-    AND ts >= CURRENT_DATE - INTERVAL '7 days'
+    AND ts >= CURRENT_DATE + INTERVAL '-7 days'
 GROUP BY 1, 2
 ORDER BY clicks DESC
 LIMIT 50;
@@ -167,7 +201,7 @@ SELECT
     COUNT(DISTINCT params->>'tb_headline') AS num_headlines
 FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
 WHERE params->>'tb_image' IS NOT NULL
-    AND ts >= CURRENT_DATE - INTERVAL '14 days'
+    AND ts >= CURRENT_DATE + INTERVAL '-14 days'
 GROUP BY 1, 2
 ORDER BY clicks DESC
 LIMIT 50;
@@ -189,7 +223,7 @@ SELECT
 FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
 WHERE params->>'tb_headline' IS NOT NULL
     AND params->>'tb_image' IS NOT NULL
-    AND ts >= CURRENT_DATE - INTERVAL '7 days'
+    AND ts >= CURRENT_DATE + INTERVAL '-7 days'
 GROUP BY 1, 2
 HAVING COUNT(*) FILTER (WHERE type = 'click') >= 10
 ORDER BY clicks DESC
@@ -214,7 +248,7 @@ SELECT
     COUNT(DISTINCT params->>'utm_campaign') AS num_campaigns,
     COUNT(DISTINCT params->>'tb_headline') AS num_headlines
 FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
-WHERE ts >= CURRENT_DATE - INTERVAL '7 days'
+WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
 GROUP BY 1
 ORDER BY clicks DESC;
 ```
@@ -260,14 +294,14 @@ WITH daily_metrics AS (
         params->>'utm_campaign' AS campaign,
         COUNT(*) FILTER (WHERE type = 'click') AS clicks
     FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
-    WHERE ts >= CURRENT_DATE - INTERVAL '14 days'
+    WHERE ts >= CURRENT_DATE + INTERVAL '-14 days'
     GROUP BY 1, 2
 ),
 trends AS (
     SELECT
         campaign,
-        AVG(clicks) FILTER (WHERE date >= CURRENT_DATE - INTERVAL '7 days') AS recent_clicks,
-        AVG(clicks) FILTER (WHERE date < CURRENT_DATE - INTERVAL '7 days') AS prior_clicks
+        AVG(clicks) FILTER (WHERE date >= CURRENT_DATE + INTERVAL '-7 days') AS recent_clicks,
+        AVG(clicks) FILTER (WHERE date < CURRENT_DATE + INTERVAL '-7 days') AS prior_clicks
     FROM daily_metrics
     GROUP BY 1
 )
@@ -296,7 +330,7 @@ WITH creative_daily AS (
         COUNT(*) FILTER (WHERE type = 'click') AS clicks,
         COUNT(*) FILTER (WHERE type = 'pageview') AS views
     FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
-    WHERE ts >= CURRENT_DATE - INTERVAL '30 days'
+    WHERE ts >= CURRENT_DATE + INTERVAL '-30 days'
         AND params->>'tb_headline' IS NOT NULL
     GROUP BY 1, 2
     HAVING COUNT(*) FILTER (WHERE type = 'pageview') >= 100
@@ -313,9 +347,9 @@ daily_ctr AS (
 fatigue AS (
     SELECT
         headline,
-        AVG(ctr) FILTER (WHERE date >= CURRENT_DATE - INTERVAL '7 days') AS recent_ctr,
-        AVG(ctr) FILTER (WHERE date < CURRENT_DATE - INTERVAL '7 days'
-                          AND date >= CURRENT_DATE - INTERVAL '21 days') AS prior_ctr
+        AVG(ctr) FILTER (WHERE date >= CURRENT_DATE + INTERVAL '-7 days') AS recent_ctr,
+        AVG(ctr) FILTER (WHERE date < CURRENT_DATE + INTERVAL '-7 days'
+                          AND date >= CURRENT_DATE + INTERVAL '-21 days') AS prior_ctr
     FROM daily_ctr
     GROUP BY 1
 )
@@ -350,7 +384,7 @@ WITH session_metrics AS (
         MAX(ts) AS session_end,
         EXTRACT(EPOCH FROM (MAX(ts) - MIN(ts))) / 60 AS session_duration_minutes
     FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
-    WHERE ts >= CURRENT_DATE - INTERVAL '7 days'
+    WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
         AND session_id IS NOT NULL
     GROUP BY session_id
 )
@@ -380,7 +414,7 @@ WITH user_journeys AS (
         ts,
         ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY ts) AS step_number
     FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
-    WHERE ts >= CURRENT_DATE - INTERVAL '7 days'
+    WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
         AND session_id IS NOT NULL
 )
 SELECT
@@ -410,7 +444,7 @@ SELECT
     MAX(ts) AS last_seen,
     EXTRACT(DAY FROM (MAX(ts) - MIN(ts))) + 1 AS days_active
 FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
-WHERE ts >= CURRENT_DATE - INTERVAL '30 days'
+WHERE ts >= CURRENT_DATE + INTERVAL '-30 days'
     AND user_id IS NOT NULL
 GROUP BY user_id
 ORDER BY num_sessions DESC
@@ -429,7 +463,7 @@ WITH session_sources AS (
         params->>'utm_medium' AS medium,
         MIN(ts) AS session_start
     FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
-    WHERE ts >= CURRENT_DATE - INTERVAL '7 days'
+    WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
         AND session_id IS NOT NULL
     GROUP BY session_id, source, campaign, medium
 )
@@ -459,7 +493,7 @@ WITH session_engagement AS (
         COUNT(*) FILTER (WHERE type = 'scroll') AS scrolls,
         EXTRACT(EPOCH FROM (MAX(ts) - MIN(ts))) / 60 AS duration_minutes
     FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
-    WHERE ts >= CURRENT_DATE - INTERVAL '7 days'
+    WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
         AND session_id IS NOT NULL
     GROUP BY session_id
 ),
@@ -508,7 +542,7 @@ WITH decorated_sessions AS (
         MIN(ts) AS first_event,
         MAX(ts) AS last_event
     FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
-    WHERE ts >= CURRENT_DATE - INTERVAL '7 days'
+    WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
         AND session_id IS NOT NULL
     GROUP BY session_id
 )
@@ -540,7 +574,7 @@ WITH session_events AS (
         LAG(type) OVER (PARTITION BY session_id ORDER BY ts) AS prev_type,
         LAG(url) OVER (PARTITION BY session_id ORDER BY ts) AS prev_url
     FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
-    WHERE ts >= CURRENT_DATE - INTERVAL '7 days'
+    WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
         AND session_id IS NOT NULL
 )
 SELECT
@@ -566,7 +600,7 @@ WITH sessions AS (
         COUNT(*) AS events,
         COUNT(*) FILTER (WHERE type = 'pageview') AS pageviews
     FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
-    WHERE ts >= CURRENT_DATE - INTERVAL '7 days'
+    WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
         AND session_id IS NOT NULL
     GROUP BY 1
 )
@@ -651,7 +685,7 @@ ORDER BY 1 DESC, 3 DESC;
 
 -- Query the view
 SELECT * FROM daily_summary
-WHERE date >= CURRENT_DATE - INTERVAL '7 days';
+WHERE date >= CURRENT_DATE + INTERVAL '-7 days';
 ```
 
 ## Alerts and Anomalies
@@ -675,7 +709,7 @@ WITH hourly_baseline AS (
             ROWS BETWEEN 7 PRECEDING AND 1 PRECEDING
         ) AS baseline_stddev
     FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
-    WHERE ts >= CURRENT_DATE - INTERVAL '14 days'
+    WHERE ts >= CURRENT_DATE + INTERVAL '-14 days'
     GROUP BY 1
 )
 SELECT
@@ -704,7 +738,7 @@ WITH campaign_activity AS (
         MAX(ts) AS last_event,
         COUNT(*) AS total_events
     FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
-    WHERE ts >= CURRENT_DATE - INTERVAL '7 days'
+    WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
     GROUP BY 1
 )
 SELECT

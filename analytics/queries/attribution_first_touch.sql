@@ -17,6 +17,8 @@ WITH session_touches AS (
     FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+        -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
+        AND {{ts_partition_filter}}
         AND session_id IS NOT NULL
     GROUP BY session_id, ts, type, params
 ),
@@ -42,7 +44,7 @@ SELECT
     COALESCE(utm_source, '(direct)') AS source,
     COALESCE(utm_medium, '(none)') AS medium,
     COALESCE(utm_campaign, '(not set)') AS campaign,
-    COALESCE(first_content, '(not set)') AS content,
+    COALESCE(utm_content, '(not set)') AS content,
     COALESCE(utm_term, '(not set)') AS term,
     COALESCE(network, '(unknown)') AS ad_network,
     attributed_sessions,

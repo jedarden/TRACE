@@ -49,6 +49,9 @@ WITH session_events AS (
     FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+
+    -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
+        AND {{ts_partition_filter}}
         AND session_id IS NOT NULL
     GROUP BY session_id
 ),
@@ -122,6 +125,9 @@ WITH session_creative AS (
     FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+
+    -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
+        AND {{ts_partition_filter}}
         AND session_id IS NOT NULL
         AND creative_id IS NOT NULL
     GROUP BY session_id, creative_id, headline, network
@@ -177,6 +183,9 @@ WITH user_journey AS (
     FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+
+    -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
+        AND {{ts_partition_filter}}
         AND session_id IS NOT NULL
     GROUP BY session_id, network, campaign_id
 ),
@@ -247,6 +256,9 @@ WITH conversion_sessions AS (
     FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+
+    -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
+        AND {{ts_partition_filter}}
         AND session_id IS NOT NULL
     GROUP BY session_id, network, campaign_id
     HAVING CASE
@@ -342,6 +354,9 @@ SELECT
 FROM {{events_table}}
 WHERE ts >= '{{start_date}}'::TIMESTAMP
     AND ts < '{{end_date}}'::TIMESTAMP
+
+    -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
+    AND {{ts_partition_filter}}
     AND session_id IS NOT NULL
 GROUP BY 1, 2
 ORDER BY 1 DESC, 2;
