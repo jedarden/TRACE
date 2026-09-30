@@ -69,11 +69,11 @@ impl Config {
         self.iceberg_catalog_uri.is_some() && self.iceberg_warehouse.is_some()
     }
 
-    /// Get the Iceberg table path for ad_events
+    /// Get the Iceberg table path for ad_events in the `trace` namespace.
     pub fn iceberg_ad_events_path(&self) -> Option<String> {
         self.iceberg_warehouse
             .as_ref()
-            .map(|w| format!("{}/ad_events", w))
+            .map(|w| format!("{}/trace/ad_events", w))
     }
 }
 
@@ -183,7 +183,7 @@ mod tests {
         config.iceberg_warehouse = Some("s3://my-bucket/iceberg".to_string());
         assert_eq!(
             config.iceberg_ad_events_path(),
-            Some("s3://my-bucket/iceberg/ad_events".to_string())
+            Some("s3://my-bucket/iceberg/trace/ad_events".to_string())
         );
     }
 }

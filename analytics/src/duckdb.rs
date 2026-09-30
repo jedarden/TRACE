@@ -35,6 +35,31 @@ pub struct DuckDBClient {
 
 impl DuckDBClient {
     pub fn new(config: &Config) -> Result<Self> {
+        let client = Self::open(config)?;
+
+        // Setup Iceberg views if configured
+        if config.is_iceberg_enabled() {
+            client.setup_iceberg_views(config)?;
+        } else {
+            // Setup Parquet views for backward compatibility
+            let s3_path = format!("s3://{}/{}", config.s3_bucket, config.s3_prefix);
+            client.setup_parquet_views(&s3_path, config)?;
+        }
+
+        Ok(client)
+    }
+
+    /// Open the configured engine over the existing Hive Parquet tree even
+    /// when a catalog is configured. Used only by the explicit one-time
+    /// catalog bootstrap command.
+    pub fn new_for_iceberg_migration(config: &Config) -> Result<Self> {
+        let client = Self::open(config)?;
+        let s3_path = format!("s3://{}/{}", config.s3_bucket, config.s3_prefix);
+        client.setup_parquet_views(&s3_path, config)?;
+        Ok(client)
+    }
+
+    fn open(config: &Config) -> Result<Self> {
         let conn = Connection::open_in_memory()?;
 
         // Install and load required extensions
@@ -68,18 +93,7 @@ impl DuckDBClient {
 
         conn.execute("SET threads=4;", params![])?;
 
-        let client = Self { conn };
-
-        // Setup Iceberg views if configured
-        if config.is_iceberg_enabled() {
-            client.setup_iceberg_views(config)?;
-        } else {
-            // Setup Parquet views for backward compatibility
-            let s3_path = format!("s3://{}/{}", config.s3_bucket, config.s3_prefix);
-            client.setup_parquet_views(&s3_path, config)?;
-        }
-
-        Ok(client)
+        Ok(Self { conn })
     }
 
     /// Direct access to the underlying connection for modules that run their
@@ -142,7 +156,7 @@ impl DuckDBClient {
         let catalog_option = format!("catalog_uri => '{}'", catalog_uri);
 
         // Create view for ad_events table
-        let ad_events_path = format!("{}/ad_events", warehouse);
+        let ad_events_path = format!("{}/trace/ad_events", warehouse);
         let ad_events_sql = format!(
             "CREATE OR REPLACE VIEW iceberg_ad_events AS \
              SELECT * FROM iceberg_scan('{}', {});",
@@ -153,7 +167,7 @@ impl DuckDBClient {
             .context("Failed to create view for Iceberg ad_events table")?;
 
         // Create view for campaigns dimension table
-        let campaigns_path = format!("{}/campaigns", warehouse);
+        let campaigns_path = format!("{}/trace/campaigns", warehouse);
         let campaigns_sql = format!(
             "CREATE OR REPLACE VIEW iceberg_campaigns AS \
              SELECT * FROM iceberg_scan('{}', {});",
@@ -164,7 +178,7 @@ impl DuckDBClient {
             .context("Failed to create view for Iceberg campaigns table")?;
 
         // Create view for creatives dimension table
-        let creatives_path = format!("{}/creatives", warehouse);
+        let creatives_path = format!("{}/trace/creatives", warehouse);
         let creatives_sql = format!(
             "CREATE OR REPLACE VIEW iceberg_creatives AS \
              SELECT * FROM iceberg_scan('{}', {});",
@@ -177,7 +191,7 @@ impl DuckDBClient {
         // Create view for assets dimension table (headlines, images, and
         // landing pages exploded from synced creatives — schema in
         // analytics/schemas/assets_iceberg.sql)
-        let assets_path = format!("{}/assets", warehouse);
+        let assets_path = format!("{}/trace/assets", warehouse);
         let assets_sql = format!(
             "CREATE OR REPLACE VIEW iceberg_assets AS \
              SELECT * FROM iceberg_scan('{}', {});",
@@ -189,7 +203,7 @@ impl DuckDBClient {
 
         // Create view for the sessions table (day(started_at) partition
         // transform — schema in analytics/schemas/sessions_iceberg.sql)
-        let sessions_path = format!("{}/sessions", warehouse);
+        let sessions_path = format!("{}/trace/sessions", warehouse);
         let sessions_sql = format!(
             "CREATE OR REPLACE VIEW iceberg_sessions AS \
              SELECT * FROM iceberg_scan('{}', {});",

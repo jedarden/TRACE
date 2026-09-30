@@ -37,9 +37,9 @@ spec:
             - name: COMPACTOR_INTERVAL_SECONDS
               value: "86400"
             - name: ICEBERG_COMPACTION
-              # The current job only appends output files. Keep off until the
-              # migration and atomic snapshot rewrite cutover is complete.
-              value: "false"
+              # Run in Iceberg mode; without the publication gate, the process
+              # stays alive but does not delete catalog-referenced inputs.
+              value: "true"
             - name: ICEBERG_CATALOG_URI
               valueFrom:
                 configMapKeyRef:

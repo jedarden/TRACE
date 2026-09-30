@@ -335,6 +335,15 @@ impl BatchAccumulator {
         std::mem::take(&mut self.entries)
     }
 
+    fn requeue(&mut self, entry: BatchEntry) {
+        self.total_size_bytes += entry.data.len();
+        self.oldest_entry_at.get_or_insert_with(Instant::now);
+        self.entries
+            .entry(entry.key.clone())
+            .or_default()
+            .push(entry);
+    }
+
     fn size_bytes(&self) -> usize {
         self.total_size_bytes
     }
@@ -943,9 +952,9 @@ async fn flush_batch(state: &FlusherState, reason: &str) -> Result<()> {
         }
     }
 
-    // S3 upload is the durable source of truth. Catalog failure is surfaced
-    // for alerting, while the uploaded objects remain available to the
-    // compactor's reconciliation pass.
+    // Catalog failure must retain the source files and retry the same object
+    // keys. The publisher is idempotent if a catalog commit succeeded but its
+    // response was lost.
     let iceberg_objects: Vec<(String, Vec<u8>)> = entries
         .values()
         .flatten()
@@ -958,9 +967,24 @@ async fn flush_batch(state: &FlusherState, reason: &str) -> Result<()> {
         .collect();
     if let Err(error) = state.s3.publish_iceberg(iceberg_objects).await {
         error!(
-            "Iceberg publication failed after Parquet upload; objects remain in S3 for reconciliation: {}",
+            "Iceberg publication failed after Parquet upload; retaining sources for retry: {}",
             error
         );
+        let failed_keys: std::collections::HashSet<&str> = upload_errors
+            .iter()
+            .map(|(entry, _)| entry.key.as_str())
+            .collect();
+        let mut batch = state.batch.lock().await;
+        for entry in entries.values().flatten() {
+            if !failed_keys.contains(entry.key.as_str()) {
+                batch.requeue(entry.clone());
+            }
+        }
+        drop(batch);
+        for (entry, upload_error) in upload_errors {
+            move_to_dlq(state, &entry.source_file, &upload_error.to_string()).await;
+        }
+        return Err(error).context("publish uploaded Parquet files to Iceberg");
     }
 
     // Delete source files for successful uploads

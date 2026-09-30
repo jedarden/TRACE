@@ -40,7 +40,10 @@ spec:
             - name: CATALOG_URI
               value: jdbc:sqlite:/var/lib/iceberg/catalog.db
             - name: CATALOG_WAREHOUSE
-              value: s3://my-trace-bucket/trace-events/iceberg
+              valueFrom:
+                configMapKeyRef:
+                  name: trace-config
+                  key: iceberg-warehouse
             - name: CATALOG_IO__IMPL
               value: org.apache.iceberg.aws.s3.S3FileIO
             - name: CATALOG_CLIENT_REGION

@@ -500,8 +500,13 @@ async fn main() -> Result<()> {
         };
 
         // Run Iceberg compaction
-        let publisher = trace_iceberg::publisher::PublisherConfig::from_env()?
-            .context("Iceberg compaction requires a REST catalog and warehouse")?;
+        let Some(publisher) = trace_iceberg::publisher::PublisherConfig::from_env()? else {
+            warn!(
+                "Iceberg compactor is paused: migrate existing files and enable TRACE_ICEBERG_PUBLISH after snapshot rewrite support is available"
+            );
+            wait_for_shutdown().await;
+            return Ok(());
+        };
         let iceberg_config = iceberg::IcebergCompactorConfig {
             lookback_days,
             warehouse,
@@ -605,6 +610,19 @@ async fn shutdown_signal() {
         .unwrap()
         .recv()
         .await;
+}
+
+async fn wait_for_shutdown() {
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            if let Err(error) = signal {
+                warn!("Failed to listen for Ctrl-C: {}", error);
+            }
+        }
+        _ = &mut shutdown => {}
+    }
 }
 
 #[cfg(test)]

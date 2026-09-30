@@ -1,6 +1,7 @@
 mod config;
 mod duckdb;
 mod events_compat;
+mod iceberg_migration;
 mod queries;
 mod reporter;
 mod s3;
@@ -86,6 +87,9 @@ enum Commands {
         #[arg(long)]
         events_glob: Option<String>,
     },
+    /// Bootstrap catalog tables from the existing Hive-style Parquet tree.
+    /// Requires an empty `trace` namespace and paused producers.
+    MigrateIceberg,
 }
 
 #[tokio::main]
@@ -226,6 +230,19 @@ async fn main() -> Result<()> {
                     error!("Session materialization failed: {}", e);
                     std::process::exit(1);
                 }
+            }
+        }
+        Commands::MigrateIceberg => {
+            let mut config = config::Config::from_env()?;
+            config.compat_event_views = true;
+            let db = duckdb::DuckDBClient::new_for_iceberg_migration(&config)?;
+            for table in iceberg_migration::migrate_existing_files(db.connection(), &config)? {
+                info!(
+                    table = %table.name,
+                    rows = table.row_count,
+                    snapshots = table.snapshot_count,
+                    "Migrated existing Parquet files into Iceberg"
+                );
             }
         }
     }
