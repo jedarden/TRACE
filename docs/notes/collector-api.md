@@ -149,40 +149,66 @@ with improved flusher logic.
 
 ## Retry
 
-- **2xx is terminal.** The tag is fire-and-forget (`sendBeacon` with a
-  `fetch` keepalive fallback); no retry on success.
-- **4xx is permanent.** A 400/413/405 will fail identically on retry — fix
-  the payload, don't resend it.
-- **Transport failures** (connection refused, timeout, 5xx): retrying is
-  *safe* but *duplicating* — see idempotency below. For the browser tag the
-  practical answer is not to retry; for server-to-server postbacks, retry
-  with an idempotency key (below).
-- **CORS**: the collector serves no CORS headers and no `OPTIONS` route
-  (a preflight gets 405). `sendBeacon` never preflights, so tag events
-  still arrive cross-origin fire-and-forget; but the `fetch` fallback with
-  `Content-Type: application/json` does preflight and will fail
-  cross-origin. Deploy first-party (tag and collector on the same site —
-  the documented `trace.example.com` pattern), or terminate CORS at the
-  fronting proxy.
+- **2xx is terminal for ingestion.** Treat `POST` `204` and pixel `GET`
+  `200` as accepted and do not retry because of the response. The JavaScript
+  tag is fire-and-forget (`sendBeacon` with a `fetch` keepalive fallback), so
+  it does not inspect the response or retry on success. A browser pixel has
+  the same terminal-success rule even though the image request normally has
+  no application callback.
+- **4xx is permanent.** `400` (non-UTF-8 body), `413` (body over 2 MiB),
+  `405` (wrong method), and `404` (unknown path) are rejected before logging.
+  Retrying the unchanged request cannot succeed; fix the request or endpoint
+  configuration first.
+- **Transport failures** (connection refused, timeout, `5xx`, or an
+  ambiguous disconnect after sending): the collector may already have
+  accepted the request, so a retry can create a duplicate. The browser tag
+  does not implement an application retry; a server-to-server caller that
+  must retry should send the same stable natural key on every attempt (below).
+- **Browser delivery constraints**: `sendBeacon()` has no response callback.
+  The tag uses it whenever available and ignores its boolean return, so a
+  browser that refuses to queue a beacon (for example, because of its
+  keepalive quota) does not fall back to `fetch`. If `sendBeacon()` is absent,
+  the tag issues `fetch(..., { keepalive: true })` without awaiting a status
+  or retrying a rejected promise. Page lifecycle, offline state, and browser
+  keepalive limits can therefore lose a browser event before the collector
+  sees it.
+- **CORS**: the collector serves no CORS headers and no `OPTIONS` route (a
+  preflight gets 405). The tag's `sendBeacon()` payload is a JSON blob, so its
+  `application/json` content type is not CORS-safelisted and a cross-origin
+  beacon can preflight just like the `fetch` fallback. Deploy the tag and
+  collector on the same origin, or terminate CORS at the fronting proxy.
 
 ## Idempotency
 
-There is none, by design, at any layer that matters to callers:
+The collector does not support caller-controlled idempotency, by design:
 
 - The collector is **append-only and at-least-once**: one log line per
   *accepted request*, so a client that retries a delivered event produces
   duplicate rows in `ad_events`. There is no event ID, dedupe key, or
-  upsert at ingestion. The one exception downstream: impression events
-  carrying an `imp_id` are deduplicated in the flusher, per raw log file —
-  see [`impression-capture.md`](impression-capture.md).
-- Consequences: ad-network postback retries and beacon replays inflate
-  counts. Callers that cannot avoid retrying (S2S webhooks) should include
-  a natural idempotency key as an ordinary parameter (`order_id`,
-  `transaction_id` — or `imp_id` for impressions) so later processing can
-  collapse duplicates.
+  upsert at ingestion. An `Idempotency-Key` header is not supported or
+  honored, and a body/query field with that name is ordinary event data.
+- The one downstream exception is impression events carrying an `imp_id`:
+  the flusher deduplicates them per raw log file — see
+  [`impression-capture.md`](impression-capture.md). This is not a general
+  idempotency facility and does not deduplicate conversions or other tag
+  events.
+- Consequently, ad-network postback retries and beacon replays can inflate
+  counts. Server-to-server callers should choose a stable business natural
+  key before the first request and include the same value on every retry:
+  use a provider impression ID as `imp_id`, or a transaction/order ID such
+  as `transaction_id` or `order_id` for conversions. Send it as an ordinary
+  body or query parameter; the collector records it, while downstream
+  processing is responsible for collapsing duplicates by that key.
 - The flip side of no-ingestion-state: the collector holds no per-client
   session and cannot create retry loops or ordering artifacts; a request's
   position in the log is its arrival order, nothing more.
+
+The resulting guarantee is **best-effort at-least-once append semantics for
+requests whose raw-log write succeeds, with no exactly-once guarantee**. A
+successful response only means that the request reached the in-memory buffer;
+the documented I/O failure path can still lose it. A retry after an ambiguous
+transport failure can recover such a loss, but can also add a second raw-log
+line when the first attempt was already accepted.
 
 ## The recorded line
 
