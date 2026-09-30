@@ -314,14 +314,20 @@ SELECT
         WHERE EXISTS (
             SELECT 1 FROM {{events_table}} e2
             WHERE e2.session_id = {{events_table}}.session_id
-            AND e2.type = 'click'
+                AND e2.ts >= '{{start_date}}'::TIMESTAMP
+                AND e2.ts < '{{end_date}}'::TIMESTAMP
+                AND {{ts_partition_filter}}
+                AND e2.type = 'click'
         )
     )) AS sessions_with_click,
     COUNT(DISTINCT session_id FILTER (
         WHERE EXISTS (
             SELECT 1 FROM {{events_table}} e2
             WHERE e2.session_id = {{events_table}}.session_id
-            AND e2.type = 'scroll'
+                AND e2.ts >= '{{start_date}}'::TIMESTAMP
+                AND e2.ts < '{{end_date}}'::TIMESTAMP
+                AND {{ts_partition_filter}}
+                AND e2.type = 'scroll'
         )
     )) AS sessions_with_scroll,
     -- Conversion count
@@ -329,10 +335,16 @@ SELECT
         WHERE EXISTS (
             SELECT 1 FROM {{events_table}} e2
             WHERE e2.session_id = {{events_table}}.session_id
-            AND (e2.type = 'conversion' OR (
+                AND e2.ts >= '{{start_date}}'::TIMESTAMP
+                AND e2.ts < '{{end_date}}'::TIMESTAMP
+                AND {{ts_partition_filter}}
+                AND (e2.type = 'conversion' OR (
                 SELECT COUNT(DISTINCT url)
                 FROM {{events_table}} e3
                 WHERE e3.session_id = {{events_table}}.session_id
+                    AND e3.ts >= '{{start_date}}'::TIMESTAMP
+                    AND e3.ts < '{{end_date}}'::TIMESTAMP
+                    AND {{ts_partition_filter}}
             ) >= 3)
         )
     )) AS conversions,
@@ -342,10 +354,16 @@ SELECT
             WHERE EXISTS (
                 SELECT 1 FROM {{events_table}} e2
                 WHERE e2.session_id = {{events_table}}.session_id
-                AND (e2.type = 'conversion' OR (
+                    AND e2.ts >= '{{start_date}}'::TIMESTAMP
+                    AND e2.ts < '{{end_date}}'::TIMESTAMP
+                    AND {{ts_partition_filter}}
+                    AND (e2.type = 'conversion' OR (
                     SELECT COUNT(DISTINCT url)
                     FROM {{events_table}} e3
                     WHERE e3.session_id = {{events_table}}.session_id
+                        AND e3.ts >= '{{start_date}}'::TIMESTAMP
+                        AND e3.ts < '{{end_date}}'::TIMESTAMP
+                        AND {{ts_partition_filter}}
                 ) >= 3)
             )
         )) / NULLIF(COUNT(DISTINCT session_id), 0),

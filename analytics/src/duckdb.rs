@@ -247,10 +247,11 @@ impl DuckDBClient {
     /// docs/analytics/iceberg_partition_pruning.md and
     /// `test_partition_predicate_prunes_files_scanned` below).
     ///
-    /// The two event views have one opt-in exception: with
+    /// The two raw event views have one opt-in exception: with
     /// `compat_event_views` they come from `crate::events_compat` instead,
-    /// trading the day-directory pruning for the ability to span flusher
-    /// generations whose schemas differ.
+    /// trading day-directory pruning for the ability to span flusher
+    /// generations whose schemas differ. Reports use the canonical compacted
+    /// ad_events view below unless this compatibility mode is enabled.
     pub fn setup_parquet_views(&self, s3_path: &str, config: &Config) -> Result<()> {
         if config.compat_event_views {
             // Opt-in (TRACE_COMPAT_EVENT_VIEWS=1): the events prefix spans
@@ -325,19 +326,28 @@ impl DuckDBClient {
     pub fn events_table_sql(&self, config: &Config) -> String {
         if config.is_iceberg_enabled() {
             "iceberg_ad_events".to_string()
-        } else {
+        } else if config.compat_event_views {
+            // Mixed-generation raw files need the schema-normalizing view.
+            // It derives `dt` from `ts` and intentionally does not prune.
             "parquet_events".to_string()
+        } else {
+            // The compacted analytics data has a canonical schema and the
+            // physical ts_day= partition required for Parquet file pruning.
+            "parquet_ad_events".to_string()
         }
     }
 
-    /// Get the SQL fragment for querying compacted events
-    /// For Iceberg, we filter on the main table; for Parquet, use compacted view
+    /// Get the SQL fragment for querying compacted events. Standard Parquet
+    /// mode and Iceberg mode read canonical ad_events; the compatibility mode
+    /// uses the raw compacted view to preserve its mixed-generation schema.
     pub fn events_compacted_sql(&self, config: &Config) -> String {
         if config.is_iceberg_enabled() {
             // For Iceberg, we can filter on the main table with time-based partition pruning
             "iceberg_ad_events".to_string()
-        } else {
+        } else if config.compat_event_views {
             "parquet_events_compacted".to_string()
+        } else {
+            "parquet_ad_events".to_string()
         }
     }
 
@@ -392,18 +402,17 @@ impl DuckDBClient {
     /// The physical day-partition column of the events tables, when the
     /// backend has one.
     ///
-    /// Parquet mode reads Hive-style `dt=YYYY-MM-DD/` directories
-    /// (`events/**`, `events-compacted/**`), so `dt` is a real — and the only
-    /// prunable — partition column; a `ts` range alone does not skip files on
-    /// this read path. Iceberg mode reads a true Iceberg table where
-    /// partitioning is hidden (`DAYS(ts)` transform): there is no `ts_day`
-    /// column to reference and the `ts` range predicate itself prunes, so
-    /// this returns None and template partition filters render as TRUE.
+    /// Standard Parquet reports read the compacted Hive-style
+    /// `ts_day=YYYY-MM-DD/` directories, so `ts_day` is the physical partition
+    /// column required to skip files; a `ts` range alone does not prune this
+    /// read path. The opt-in mixed-generation compatibility view derives `dt`
+    /// from `ts` and cannot prune. Iceberg mode reads the real Iceberg table,
+    /// where the hidden `DAYS(ts)` transform lets a `ts` range prune files.
     pub fn events_partition_column(&self, config: &Config) -> Option<&'static str> {
-        if config.is_iceberg_enabled() {
+        if config.is_iceberg_enabled() || config.compat_event_views {
             None
         } else {
-            Some("dt")
+            Some("ts_day")
         }
     }
 
@@ -653,12 +662,12 @@ mod partition_pruning_tests {
         dir
     }
 
-    /// Write one Parquet file per day under `<root>/events-compacted/dt=<day>/`
-    /// — the layout the compactor produces (no partition column in-file; the
-    /// day lives only in the directory name).
+    /// Write one Parquet file per day under
+    /// `<root>/iceberg/ad_events/data/ts_day=<day>/` — the compacted ad_events
+    /// layout (no partition column in-file; the day lives only in the path).
     fn write_daily_partitions(root: &Path, days: &[&str]) {
         for day in days {
-            let dir = root.join(format!("events-compacted/dt={}", day));
+            let dir = root.join(format!("iceberg/ad_events/data/ts_day={}", day));
             fs::create_dir_all(&dir).expect("create partition dir");
             let conn = Connection::open_in_memory().expect("open scratch connection");
             conn.execute_batch(&format!(
@@ -755,19 +764,22 @@ mod partition_pruning_tests {
 
         let conn = Connection::open_in_memory().expect("open connection");
         let view_sql = hive_parquet_view_sql(
-            "parquet_events_compacted",
-            &format!("{}/**/*.parquet", root.join("events-compacted").display()),
+            "parquet_ad_events",
+            &format!(
+                "{}/**/*.parquet",
+                root.join("iceberg/ad_events/data").display()
+            ),
         );
         conn.execute(&view_sql, params![]).expect("create view");
 
         // The predicate the renderer emits for the events table in Parquet
         // mode, for the middle day only.
-        let predicate = partition_predicate(Some("dt"), "2026-09-02", "2026-09-03");
+        let predicate = partition_predicate(Some("ts_day"), "2026-09-02", "2026-09-03");
 
         let pruned = files_scanned(
             &conn,
             &format!(
-                "SELECT COUNT(*) FROM parquet_events_compacted WHERE {} AND {}",
+                "SELECT COUNT(*) FROM parquet_ad_events WHERE {} AND {}",
                 day_window("2026-09-02", "2026-09-03"),
                 predicate
             ),
@@ -780,7 +792,7 @@ mod partition_pruning_tests {
         let baseline = files_scanned(
             &conn,
             &format!(
-                "SELECT COUNT(*) FROM parquet_events_compacted WHERE {}",
+                "SELECT COUNT(*) FROM parquet_ad_events WHERE {}",
                 day_window("2026-09-02", "2026-09-03")
             ),
         );
@@ -790,7 +802,7 @@ mod partition_pruning_tests {
         let pruned_rows: i64 = conn
             .query_row(
                 &format!(
-                    "SELECT COUNT(*) FROM parquet_events_compacted WHERE {} AND {}",
+                    "SELECT COUNT(*) FROM parquet_ad_events WHERE {} AND {}",
                     day_window("2026-09-02", "2026-09-03"),
                     predicate
                 ),
@@ -801,7 +813,7 @@ mod partition_pruning_tests {
         let baseline_rows: i64 = conn
             .query_row(
                 &format!(
-                    "SELECT COUNT(*) FROM parquet_events_compacted WHERE {}",
+                    "SELECT COUNT(*) FROM parquet_ad_events WHERE {}",
                     day_window("2026-09-02", "2026-09-03")
                 ),
                 [],
@@ -957,7 +969,7 @@ mod partition_pruning_tests {
 
     /// End-to-end through the report runner's rendering path: a shipped
     /// template (daily_summary) rendered for Parquet mode must carry the
-    /// `dt` partition predicate and actually prune; the same template with
+    /// `ts_day` partition predicate and actually prune; the same template with
     /// the placeholder blanked must not.
     #[test]
     fn test_rendered_daily_summary_report_prunes_files_scanned() {
@@ -967,8 +979,11 @@ mod partition_pruning_tests {
 
         let conn = Connection::open_in_memory().expect("open connection");
         let view_sql = hive_parquet_view_sql(
-            "parquet_events",
-            &format!("{}/**/*.parquet", root.join("events-compacted").display()),
+            "parquet_ad_events",
+            &format!(
+                "{}/**/*.parquet",
+                root.join("iceberg/ad_events/data").display()
+            ),
         );
         conn.execute(&view_sql, params![]).expect("create view");
 
@@ -983,7 +998,7 @@ mod partition_pruning_tests {
         let template = include_str!("../queries/daily_summary.sql");
         let sql = render_template_with_client(template, &params, &db, &config);
         assert!(
-            sql.contains("dt >= '2026-09-02'::DATE"),
+            sql.contains("ts_day >= '2026-09-02'::DATE"),
             "rendered report must filter the partition column:\n{}",
             sql
         );
@@ -996,7 +1011,7 @@ mod partition_pruning_tests {
         // passing for the wrong reason.
         let sql_no_partition = sql
             .lines()
-            .filter(|line| !line.contains("dt >= '2026-09-02'::DATE"))
+            .filter(|line| !line.contains("ts_day >= '2026-09-02'::DATE"))
             .collect::<Vec<_>>()
             .join("\n");
         let unpruned = files_scanned(db.connection(), &sql_no_partition);
@@ -1072,6 +1087,8 @@ mod partition_pruning_tests {
         let db = DuckDBClient {
             conn: Connection::open_in_memory().expect("open connection"),
         };
+        assert_eq!(db.events_table_sql(&config), "parquet_ad_events");
+        assert_eq!(db.events_partition_column(&config), Some("ts_day"));
         let params = ReportParams {
             s3_path: None,
             start_date: Some("2026-09-02".to_string()),
@@ -1079,14 +1096,40 @@ mod partition_pruning_tests {
         };
 
         for report in crate::queries::list_reports() {
+            let executable_sql = report
+                .sql_template
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let event_scans = executable_sql.matches("FROM {{events_table}}").count()
+                + executable_sql.matches("JOIN {{events_table}}").count();
+            let event_partition_filters = executable_sql.matches("{{ts_partition_filter").count();
+            assert_eq!(
+                event_partition_filters, event_scans,
+                "report '{}' must pair every event scan with a partition filter",
+                report.name
+            );
+
+            let session_scans = executable_sql.matches("FROM {{sessions_table}}").count()
+                + executable_sql.matches("JOIN {{sessions_table}}").count();
+            let session_partition_filters = executable_sql
+                .matches("{{sessions_partition_filter")
+                .count();
+            assert_eq!(
+                session_partition_filters, session_scans,
+                "report '{}' must pair every session scan with a partition filter",
+                report.name
+            );
+
             // Each template must carry the partition predicate of the table
-            // it reads: `dt` for the event reports, `started_at_day` for the
+            // it reads: `ts_day` for the event reports, `started_at_day` for the
             // sessions report. Both the date-spliced form and the
             // expression-bound rolling-window form render as `<col> >= …`.
             let expected_column = if report.sql_template.contains("{{sessions_table}}") {
                 "started_at_day"
             } else {
-                "dt"
+                "ts_day"
             };
             let sql = crate::queries::render_template_with_client(
                 &report.sql_template,
@@ -1107,12 +1150,24 @@ mod partition_pruning_tests {
                 expected_column,
                 sql
             );
+            let partition_filter = format!("{} >=", expected_column);
+            let rendered_partition_filters = sql.matches(partition_filter.as_str()).count();
+            let expected_filter_count = if expected_column == "started_at_day" {
+                session_scans
+            } else {
+                event_scans
+            };
+            assert_eq!(
+                rendered_partition_filters, expected_filter_count,
+                "report '{}' must render one {} predicate per table scan:\n{}",
+                report.name, expected_column, sql
+            );
         }
     }
 
     /// The sessions side of the same guarantee: the shipped daily_sessions
     /// report must prune via `started_at_day` the way the event reports
-    /// prune via `dt`, and must actually execute against the materialized
+    /// prune via `ts_day`, and must actually execute against the materialized
     /// session schema.
     #[test]
     fn test_rendered_daily_sessions_report_prunes_files_scanned() {
@@ -1252,6 +1307,12 @@ mod partition_pruning_tests {
         compat_db
             .setup_parquet_views(&s3_path, &compat_config)
             .expect("compat setup");
+        assert_eq!(compat_db.events_table_sql(&compat_config), "parquet_events");
+        assert_eq!(
+            compat_db.events_partition_column(&compat_config),
+            None,
+            "the derived compatibility day is not a physical partition column"
+        );
         let count: i64 = compat_db
             .connection()
             .query_row("SELECT COUNT(*) FROM parquet_events", [], |row| row.get(0))

@@ -502,11 +502,11 @@ mod tests {
     fn test_partition_predicate_accepts_default_rolling_window() {
         assert_eq!(
             partition_predicate(
-                Some("dt"),
+                Some("ts_day"),
                 "CURRENT_DATE - INTERVAL '30 days'",
                 "CURRENT_DATE"
             ),
-            "(dt >= CAST(CURRENT_DATE - INTERVAL '30 days' AS DATE) AND dt < CAST(CURRENT_DATE AS DATE))"
+            "(ts_day >= CAST(CURRENT_DATE - INTERVAL '30 days' AS DATE) AND ts_day < CAST(CURRENT_DATE AS DATE))"
         );
     }
 

@@ -151,9 +151,11 @@ WITH event_gaps AS (
         *,
         LAG(ts) OVER (PARTITION BY session_id ORDER BY ts) AS prev_ts,
         EXTRACT(EPOCH FROM (ts - LAG(ts) OVER (PARTITION BY session_id ORDER BY ts))) / 60 AS gap_minutes
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM read_parquet('s3://{{s3_path}}/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+        AND ts_day >= CAST('{{start_date}}' AS DATE)
+        AND ts_day < CAST('{{end_date}}' AS DATE)
         AND session_id IS NOT NULL
 ),
 session_assignments AS (
@@ -212,10 +214,12 @@ WITH user_events AS (
         *,
         LAG(ts) OVER (ORDER BY ts) AS prev_ts,
         EXTRACT(EPOCH FROM (ts - LAG(ts) OVER (ORDER BY ts))) / 60 AS gap_minutes
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM read_parquet('s3://{{s3_path}}/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
     WHERE user_id = '{}'
         AND ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+        AND ts_day >= CAST('{{start_date}}' AS DATE)
+        AND ts_day < CAST('{{end_date}}' AS DATE)
 ),
 session_markers AS (
     SELECT
@@ -276,9 +280,11 @@ WITH user_touchpoints AS (
         FIRST_VALUE(url) OVER (PARTITION BY user_id, session_id ORDER BY ts) AS url,
         FIRST_VALUE(type) OVER (PARTITION BY user_id, session_id ORDER BY ts) AS event_type,
         MIN(ts) OVER (PARTITION BY user_id, session_id ORDER BY ts) AS session_ts
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM read_parquet('s3://{{s3_path}}/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+        AND ts_day >= CAST('{{start_date}}' AS DATE)
+        AND ts_day < CAST('{{end_date}}' AS DATE)
         AND user_id IS NOT NULL
 ),
 conversions AS (
@@ -287,9 +293,11 @@ conversions AS (
         session_id,
         MIN(ts) AS conversion_ts,
         type AS conversion_type
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM read_parquet('s3://{{s3_path}}/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+        AND ts_day >= CAST('{{start_date}}' AS DATE)
+        AND ts_day < CAST('{{end_date}}' AS DATE)
         {}
     GROUP BY user_id, session_id, type
 ),
@@ -346,9 +354,11 @@ WITH session_paths AS (
         ARRAY_AGG(url ORDER BY ts) AS path,
         COUNT(*) AS steps,
         MIN(ts) AS session_start
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM read_parquet('s3://{{s3_path}}/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+        AND ts_day >= CAST('{{start_date}}' AS DATE)
+        AND ts_day < CAST('{{end_date}}' AS DATE)
         AND session_id IS NOT NULL
         AND type = 'pageview'
     GROUP BY session_id
@@ -385,9 +395,11 @@ WITH page_transitions AS (
         LEAD(url) OVER (PARTITION BY session_id ORDER BY ts) AS next_url,
         type,
         LEAD(type) OVER (PARTITION BY session_id ORDER BY ts) AS next_type
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM read_parquet('s3://{{s3_path}}/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+        AND ts_day >= CAST('{{start_date}}' AS DATE)
+        AND ts_day < CAST('{{end_date}}' AS DATE)
         AND session_id IS NOT NULL
         AND type = 'pageview'
 )
@@ -415,9 +427,11 @@ WITH user_cohorts AS (
         user_id,
         FIRST_VALUE(network) OVER (PARTITION BY user_id ORDER BY ts) AS acquisition_network,
         MIN(ts) OVER (PARTITION BY user_id) AS first_touch_ts
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM read_parquet('s3://{{s3_path}}/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+        AND ts_day >= CAST('{{start_date}}' AS DATE)
+        AND ts_day < CAST('{{end_date}}' AS DATE)
         AND user_id IS NOT NULL
 ),
 user_sessions AS (
@@ -430,10 +444,12 @@ user_sessions AS (
         COUNT(*) AS events,
         COUNT(DISTINCT e.url) AS unique_pages,
         EXTRACT(DAY FROM (MIN(e.ts) - c.first_touch_ts)) AS day_number
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet') e
+    FROM read_parquet('s3://{{s3_path}}/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true) e
     INNER JOIN user_cohorts c ON e.user_id = c.user_id
     WHERE e.ts >= '{{start_date}}'::TIMESTAMP
         AND e.ts < '{{end_date}}'::TIMESTAMP
+        AND e.ts_day >= CAST('{{start_date}}' AS DATE)
+        AND e.ts_day < CAST('{{end_date}}' AS DATE)
     GROUP BY e.user_id, c.acquisition_network, c.first_touch_ts, e.session_id
 )
 SELECT
@@ -456,9 +472,11 @@ WITH user_cohorts AS (
         user_id,
         FIRST_VALUE(campaign_id) OVER (PARTITION BY user_id ORDER BY ts) AS campaign,
         MIN(ts) OVER (PARTITION BY user_id) AS first_touch_ts
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM read_parquet('s3://{{s3_path}}/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+        AND ts_day >= CAST('{{start_date}}' AS DATE)
+        AND ts_day < CAST('{{end_date}}' AS DATE)
         AND user_id IS NOT NULL
         AND campaign_id IS NOT NULL
 ),
@@ -472,10 +490,12 @@ user_sessions AS (
         COUNT(*) AS events,
         COUNT(DISTINCT e.url) AS unique_pages,
         EXTRACT(DAY FROM (MIN(e.ts) - c.first_touch_ts)) AS day_number
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet') e
+    FROM read_parquet('s3://{{s3_path}}/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true) e
     INNER JOIN user_cohorts c ON e.user_id = c.user_id
     WHERE e.ts >= '{{start_date}}'::TIMESTAMP
         AND e.ts < '{{end_date}}'::TIMESTAMP
+        AND e.ts_day >= CAST('{{start_date}}' AS DATE)
+        AND e.ts_day < CAST('{{end_date}}' AS DATE)
     GROUP BY e.user_id, c.campaign, c.first_touch_ts, e.session_id
 )
 SELECT
@@ -497,9 +517,11 @@ WITH user_cohorts AS (
     SELECT
         user_id,
         DATE(MIN(ts)) AS cohort_date
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM read_parquet('s3://{{s3_path}}/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+        AND ts_day >= CAST('{{start_date}}' AS DATE)
+        AND ts_day < CAST('{{end_date}}' AS DATE)
         AND user_id IS NOT NULL
     GROUP BY user_id
 ),
@@ -512,10 +534,12 @@ user_sessions AS (
         COUNT(*) AS events,
         COUNT(DISTINCT e.url) AS unique_pages,
         EXTRACT(DAY FROM (MIN(e.ts) - c.cohort_date)) AS day_number
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet') e
+    FROM read_parquet('s3://{{s3_path}}/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true) e
     INNER JOIN user_cohorts c ON e.user_id = c.user_id
     WHERE e.ts >= '{{start_date}}'::TIMESTAMP
         AND e.ts < '{{end_date}}'::TIMESTAMP
+        AND e.ts_day >= CAST('{{start_date}}' AS DATE)
+        AND e.ts_day < CAST('{{end_date}}' AS DATE)
     GROUP BY e.user_id, c.cohort_date, e.session_id
 )
 SELECT
@@ -549,9 +573,11 @@ WITH funnel_steps AS (
             {}
             ELSE 0
         END AS funnel_step
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM read_parquet('s3://{{s3_path}}/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+        AND ts_day >= CAST('{{start_date}}' AS DATE)
+        AND ts_day < CAST('{{end_date}}' AS DATE)
         AND user_id IS NOT NULL
 ),
 user_progression AS (
@@ -607,9 +633,11 @@ WITH session_sequences AS (
         ARRAY_AGG(type ORDER BY ts) AS event_sequence,
         ARRAY_AGG(url ORDER BY ts) AS url_sequence,
         COUNT(*) AS total_events
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM read_parquet('s3://{{s3_path}}/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+        AND ts_day >= CAST('{{start_date}}' AS DATE)
+        AND ts_day < CAST('{{end_date}}' AS DATE)
         AND session_id IS NOT NULL
     GROUP BY session_id, user_id
 ),
@@ -654,9 +682,11 @@ WITH user_sessions_summary AS (
         COUNT(*) AS total_events,
         COUNT(DISTINCT url) AS total_unique_pages,
         COUNT(DISTINCT DATE_TRUNC('day', ts)) AS active_days
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM read_parquet('s3://{{s3_path}}/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+        AND ts_day >= CAST('{{start_date}}' AS DATE)
+        AND ts_day < CAST('{{end_date}}' AS DATE)
         AND user_id IS NOT NULL
     GROUP BY user_id
 ),
@@ -671,9 +701,11 @@ session_gaps AS (
             WHEN COUNT(DISTINCT session_id) BETWEEN 6 AND 10 THEN 'returning_6_10'
             ELSE 'returning_11_plus'
         END AS user_segment
-    FROM read_parquet('s3://{{s3_path}}/events/**/*.parquet')
+    FROM read_parquet('s3://{{s3_path}}/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
+        AND ts_day >= CAST('{{start_date}}' AS DATE)
+        AND ts_day < CAST('{{end_date}}' AS DATE)
         AND user_id IS NOT NULL
     GROUP BY user_id
 )
@@ -720,6 +752,41 @@ mod tests {
         assert!(sql.contains("gap_minutes > 30"));
         assert!(sql.contains("reconstructed_session"));
         assert!(sql.contains("gap_minutes"));
+    }
+
+    #[test]
+    fn test_generated_event_queries_use_hive_partition_pruning() {
+        let config = SessionConfig::default();
+        let steps = ["pageview", "purchase"];
+        let queries = [
+            SessionStitcher::session_reconstruction_sql(&config),
+            SessionStitcher::user_journey_sql("user-123", &config),
+            SessionStitcher::attribution_sql(None),
+            SessionStitcher::attribution_sql(Some("purchase")),
+            SessionStitcher::common_paths_sql(),
+            SessionStitcher::session_flow_matrix_sql(),
+            SessionStitcher::cohort_journey_sql("acquisition"),
+            SessionStitcher::cohort_journey_sql("campaign"),
+            SessionStitcher::cohort_journey_sql("day"),
+            SessionStitcher::funnel_with_paths_sql(&steps),
+            SessionStitcher::drop_off_analysis_sql(),
+            SessionStitcher::returning_user_sql(),
+        ];
+
+        for (index, sql) in queries.iter().enumerate() {
+            let scans = sql.matches("read_parquet(").count();
+            assert!(scans > 0, "generated query {index} has no Parquet source");
+            assert_eq!(
+                scans,
+                sql.matches("hive_partitioning = true").count(),
+                "generated query {index} must enable Hive partition extraction"
+            );
+            assert_eq!(
+                scans,
+                sql.matches("ts_day >=").count(),
+                "generated query {index} must prune each scan by ts_day"
+            );
+        }
     }
 
     #[test]

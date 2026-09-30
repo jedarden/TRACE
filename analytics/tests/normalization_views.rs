@@ -22,7 +22,7 @@ const NORMALIZATION_SQL: &str = "../docs/analytics/normalization.sql";
 
 /// The live view's source in `normalization.sql`. It must be the FIRST
 /// occurrence in the file — later ones sit inside comment blocks.
-const SOURCE: &str = "read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')";
+const SOURCE: &str = "read_parquet(\n        's3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet',\n        hive_partitioning = true\n    )";
 
 /// One fixture event: the label doubles as the event `url`, so assertions can
 /// select their row by `url`.
@@ -148,6 +148,7 @@ fn open_db() -> Connection {
     conn.execute_batch(
         "CREATE TABLE fixtures (
             ts TIMESTAMP,
+            ts_day DATE,
             ip VARCHAR,
             ua VARCHAR,
             url VARCHAR,
@@ -186,7 +187,7 @@ fn open_db() -> Connection {
         );
         conn.execute(
             &format!(
-                "INSERT INTO fixtures VALUES (TIMESTAMP '2026-09-01 12:00:00', \
+                "INSERT INTO fixtures VALUES (TIMESTAMP '2026-09-01 12:00:00', DATE '2026-09-01', \
                  '192.0.2.1', 'test-ua', '{}', 'click', {map})",
                 f.label.replace('\'', "''"),
             ),
@@ -206,7 +207,7 @@ fn open_db() -> Connection {
     // occurrences live inside comment blocks, which get stripped below.
     let sql = sql.replacen(
         SOURCE,
-        "(SELECT ts, ip, ua, url, type, params FROM fixtures)",
+        "(SELECT ts, ts_day, ip, ua, url, type, params FROM fixtures)",
         1,
     );
     let sql = strip_block_comments(&sql);
@@ -269,6 +270,19 @@ fn normalized_row(conn: &Connection, fixture: &str) -> Row {
         },
     )
     .unwrap_or_else(|e| panic!("querying fixture {fixture}: {e}"))
+}
+
+#[test]
+fn normalized_campaigns_exposes_the_hive_day_for_pruned_queries() {
+    let conn = open_db();
+    let day: String = conn
+        .query_row(
+            "SELECT CAST(ts_day AS VARCHAR) FROM normalized_campaigns WHERE url = 'googleads-gclid'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("normalized view should preserve the Hive partition column");
+    assert_eq!(day, "2026-09-01");
 }
 
 fn s(v: &Option<String>) -> Option<&str> {

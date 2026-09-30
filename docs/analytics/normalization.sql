@@ -49,10 +49,16 @@ WITH network_detection AS (
             WHEN params['rc_id'] IS NOT NULL OR params['rc_title'] IS NOT NULL THEN 'revcontent'
             ELSE COALESCE(params['utm_source'], 'unknown')
         END AS detected_network
-    FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
+    -- The Hive key is stored in the path, not in the Parquet file. Keep
+    -- ts_day in the view projection so downstream queries can prune files.
+    FROM read_parquet(
+        's3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet',
+        hive_partitioning = true
+    )
 )
 SELECT
     ts,
+    ts_day,
     ip,
     ua,
     url,
@@ -164,6 +170,7 @@ SELECT
     COUNT(DISTINCT creative_id) AS unique_creatives
 FROM normalized_campaigns
 WHERE ts >= CURRENT_DATE + INTERVAL '-30 days'
+    AND ts_day >= CAST(CURRENT_DATE - INTERVAL '30 days' AS DATE)
 GROUP BY 1, 2
 ORDER BY 1, 2;
 
@@ -190,6 +197,7 @@ SELECT
 FROM normalized_campaigns
 WHERE headline IS NOT NULL
     AND ts >= CURRENT_DATE + INTERVAL '-7 days'
+    AND ts_day >= CAST(CURRENT_DATE - INTERVAL '7 days' AS DATE)
 GROUP BY 1, 2, 3
 HAVING COUNT(*) FILTER (WHERE type = 'click') >= 10
 ORDER BY clicks DESC
@@ -211,6 +219,7 @@ WITH creative_daily AS (
         COUNT(*) FILTER (WHERE type = 'pageview') AS views
     FROM normalized_campaigns
     WHERE ts >= CURRENT_DATE + INTERVAL '-30 days'
+        AND ts_day >= CAST(CURRENT_DATE - INTERVAL '30 days' AS DATE)
         AND creative_id IS NOT NULL
     GROUP BY 1, 2, 3, 4
     HAVING COUNT(*) FILTER (WHERE type = 'pageview') >= 100
@@ -277,6 +286,7 @@ WITH creative_fingerprints AS (
     FROM normalized_campaigns
     WHERE headline IS NOT NULL
         AND ts >= CURRENT_DATE + INTERVAL '-14 days'
+        AND ts_day >= CAST(CURRENT_DATE - INTERVAL '14 days' AS DATE)
     GROUP BY 1, 2, 3
 )
 SELECT
@@ -308,10 +318,11 @@ SELECT
     params['tb_image'] AS image_id,
     params['tb_item'] AS item_id,
     COUNT(*) AS clicks
-FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
+FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
 WHERE params['tb_headline'] IS NOT NULL
     AND type = 'click'
     AND ts >= CURRENT_DATE + INTERVAL '-7 days'
+    AND ts_day >= CAST(CURRENT_DATE - INTERVAL '7 days' AS DATE)
 GROUP BY 1, 2, 3
 ORDER BY clicks DESC
 LIMIT 20;
@@ -323,10 +334,11 @@ SELECT
     params['ob_creative'] AS creative_id,
     params['ob_item'] AS item_id,
     COUNT(*) AS clicks
-FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
+FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
 WHERE params['ob_creative'] IS NOT NULL
     AND type = 'click'
     AND ts >= CURRENT_DATE + INTERVAL '-7 days'
+    AND ts_day >= CAST(CURRENT_DATE - INTERVAL '7 days' AS DATE)
 GROUP BY 1, 2
 ORDER BY clicks DESC
 LIMIT 20;
@@ -338,10 +350,11 @@ SELECT
     params['mg_title'] AS title,
     params['mg_id'] AS creative_id,
     COUNT(*) AS clicks
-FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
+FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
 WHERE params['mg_title'] IS NOT NULL
     AND type = 'click'
     AND ts >= CURRENT_DATE + INTERVAL '-7 days'
+    AND ts_day >= CAST(CURRENT_DATE - INTERVAL '7 days' AS DATE)
 GROUP BY 1, 2
 ORDER BY clicks DESC
 LIMIT 20;
@@ -354,10 +367,11 @@ SELECT
     params['rc_id'] AS creative_id,
     params['rc_thumb'] AS thumbnail,
     COUNT(*) AS clicks
-FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
+FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
 WHERE params['rc_title'] IS NOT NULL
     AND type = 'click'
     AND ts >= CURRENT_DATE + INTERVAL '-7 days'
+    AND ts_day >= CAST(CURRENT_DATE - INTERVAL '7 days' AS DATE)
 GROUP BY 1, 2, 3
 ORDER BY clicks DESC
 LIMIT 20;
@@ -370,10 +384,11 @@ SELECT
     params['adgroupid'] AS ad_group_id,
     params['campaignid'] AS campaign_id,
     COUNT(*) AS clicks
-FROM read_parquet('s3://my-trace-bucket/trace-events/events/**/*.parquet')
+FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
 WHERE params['gclid'] IS NOT NULL
     AND type = 'click'
     AND ts >= CURRENT_DATE + INTERVAL '-7 days'
+    AND ts_day >= CAST(CURRENT_DATE - INTERVAL '7 days' AS DATE)
 GROUP BY 1, 2, 3
 ORDER BY clicks DESC
 LIMIT 20;
