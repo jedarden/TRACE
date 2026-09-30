@@ -1151,14 +1151,18 @@ mod partition_pruning_tests {
                 sql
             );
             let partition_filter = format!("{} >=", expected_column);
-            let rendered_partition_filters = sql.matches(partition_filter.as_str()).count();
             let expected_filter_count = if expected_column == "started_at_day" {
                 session_scans
             } else {
                 event_scans
             };
+            let executable_partition_filters = sql
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("--"))
+                .map(|line| line.matches(partition_filter.as_str()).count())
+                .sum::<usize>();
             assert_eq!(
-                rendered_partition_filters, expected_filter_count,
+                executable_partition_filters, expected_filter_count,
                 "report '{}' must render one {} predicate per table scan:\n{}",
                 report.name, expected_column, sql
             );
