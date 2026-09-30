@@ -16,6 +16,7 @@
 use duckdb::Connection;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Path to the doc file, relative to this crate (`analytics/`).
 const NORMALIZATION_SQL: &str = "../docs/analytics/normalization.sql";
@@ -23,6 +24,8 @@ const NORMALIZATION_SQL: &str = "../docs/analytics/normalization.sql";
 /// The live view's source in `normalization.sql`. It must be the FIRST
 /// occurrence in the file — later ones sit inside comment blocks.
 const SOURCE: &str = "read_parquet(\n        's3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet',\n        hive_partitioning = true\n    )";
+
+static TEMP_DIR_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
 /// One fixture event: the label doubles as the event `url`, so assertions can
 /// select their row by `url`.
@@ -196,6 +199,17 @@ fn open_db() -> Connection {
         .unwrap_or_else(|e| panic!("inserting fixture {}: {e}", f.label));
     }
 
+    initialize_views(
+        &conn,
+        "(SELECT ts, ts_day, ip, ua, url, type, params FROM fixtures)",
+    );
+
+    conn
+}
+
+/// Load the documented views from the SQL file, swapping only the Parquet
+/// source so these checks never need network access or an installed extension.
+fn initialize_views(conn: &Connection, source: &str) {
     let sql = fs::read_to_string(manifest_dir().join(NORMALIZATION_SQL))
         .expect("reading normalization.sql from docs/");
     assert!(
@@ -203,23 +217,34 @@ fn open_db() -> Connection {
         "normalization.sql no longer contains the expected S3 source; \
          update SOURCE in this test"
     );
+    assert!(
+        sql.contains("INSTALL httpfs;"),
+        "missing httpfs installation"
+    );
+    assert!(sql.contains("LOAD httpfs;"), "missing httpfs load");
+    assert!(
+        sql.contains("SET s3_region = 'us-east-1';"),
+        "missing S3 region"
+    );
     // Swap only the live view's source (first occurrence); the remaining
     // occurrences live inside comment blocks, which get stripped below.
-    let sql = sql.replacen(
-        SOURCE,
-        "(SELECT ts, ts_day, ip, ua, url, type, params FROM fixtures)",
-        1,
-    );
+    let sql = sql.replacen(SOURCE, source, 1);
     let sql = strip_block_comments(&sql);
     for (index, statement) in sql.split(';').enumerate() {
         if statement.trim().is_empty() {
             continue;
         }
+        // Extensions and S3 configuration are exercised by the documented
+        // CLI workflow; fixture tests intentionally stay local and offline.
+        if ["INSTALL HTTPFS", "LOAD HTTPFS", "SET S3_REGION"]
+            .iter()
+            .any(|prefix| statement.trim().to_uppercase().starts_with(prefix))
+        {
+            continue;
+        }
         conn.execute_batch(statement)
             .unwrap_or_else(|error| panic!("building normalization view {}: {error}", index + 1));
     }
-
-    conn
 }
 
 fn manifest_dir() -> PathBuf {
@@ -520,4 +545,184 @@ fn every_fixture_is_detected_exactly_once() {
         ],
         "every fixture must land in exactly one network bucket"
     );
+}
+
+/// Populate enough recent and prior traffic to make all five documented
+/// views return representative results. The lower recent CTR also exercises
+/// the fatigue calculation rather than only its empty-result path.
+fn insert_performance_fixtures(conn: &Connection) {
+    conn.execute_batch(
+        "INSERT INTO fixtures
+         WITH periods(event_day, daily_clicks) AS (
+             VALUES (CAST(CURRENT_DATE + INTERVAL '-1 day' AS DATE), 12),
+                    (CAST(CURRENT_DATE + INTERVAL '-2 days' AS DATE), 12),
+                    (CAST(CURRENT_DATE + INTERVAL '-3 days' AS DATE), 12),
+                    (CAST(CURRENT_DATE + INTERVAL '-10 days' AS DATE), 20),
+                    (CAST(CURRENT_DATE + INTERVAL '-11 days' AS DATE), 20),
+                    (CAST(CURRENT_DATE + INTERVAL '-12 days' AS DATE), 20)
+         ),
+         networks(network, campaign, creative) AS (
+             VALUES ('taboola', 'camp-taboola', 'creative-taboola'),
+                    ('outbrain', 'camp-outbrain', 'creative-outbrain')
+         ),
+         events AS (
+             SELECT d.event_day, n.network, n.campaign, n.creative,
+                    'pageview' AS event_type, p.event_index
+             FROM periods d CROSS JOIN networks n CROSS JOIN range(100) p(event_index)
+             UNION ALL
+             SELECT d.event_day, n.network, n.campaign, n.creative,
+                    'click' AS event_type, p.event_index
+             FROM periods d CROSS JOIN networks n
+             CROSS JOIN LATERAL range(d.daily_clicks) p(event_index)
+         )
+         SELECT
+             CAST(event_day AS TIMESTAMP) + INTERVAL '12 hours',
+             event_day,
+             '192.0.2.2',
+             'analytics-view-test',
+             'analytics-' || network || '-' || CAST(event_day AS VARCHAR) || '-' || event_type || '-' || event_index,
+             event_type,
+             CASE network
+                 WHEN 'taboola' THEN MAP(
+                     ['utm_source', 'utm_campaign', 'tb_item', 'tb_image', 'tb_headline'],
+                     [network, campaign, 'item-taboola', creative, 'Shared Campaign'])
+                 ELSE MAP(
+                     ['utm_source', 'utm_campaign', 'ob_item', 'ob_creative', 'headline'],
+                     [network, campaign, 'item-outbrain', creative, 'Shared Campaign'])
+             END
+         FROM events",
+    )
+    .expect("insert performance view fixtures");
+}
+
+fn assert_performance_views(conn: &Connection) {
+    let normalized: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM normalized_campaigns
+             WHERE network IN ('taboola', 'outbrain') AND headline = 'Shared Campaign'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query normalized_campaigns");
+    let network_counts: Vec<(String, i64)> = conn
+        .prepare(
+            "SELECT network, COUNT(*) FROM normalized_campaigns
+             WHERE headline = 'Shared Campaign' GROUP BY network ORDER BY network",
+        )
+        .expect("prepare network-count diagnostic")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query network-count diagnostic")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect network-count diagnostic");
+    assert_eq!(
+        normalized,
+        2 * (3 * 112 + 3 * 120),
+        "both mapped networks should retain their shared headline: {network_counts:?}"
+    );
+
+    let performance_groups: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM network_performance
+             WHERE network IN ('taboola', 'outbrain')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query network_performance");
+    assert!(
+        performance_groups >= 12,
+        "both networks should have at least six days each"
+    );
+
+    let top_creatives: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM top_creatives WHERE headline = 'Shared Campaign'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query top_creatives");
+    assert_eq!(top_creatives, 2, "each network's creative should qualify");
+
+    let fatigue: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM creative_fatigue
+             WHERE headline = 'Shared Campaign' AND fatigue_change_pct < 0",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query creative_fatigue");
+    assert_eq!(fatigue, 2, "both creatives should show declining CTR");
+
+    let (fingerprint, network_count, clicks): (String, i64, i64) = conn
+        .query_row(
+            "SELECT normalized_headline, num_networks, total_clicks
+             FROM cross_network_creatives LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("query cross_network_creatives");
+    assert_eq!(fingerprint, "shared campaign");
+    assert_eq!(network_count, 2);
+    assert_eq!(clicks, 2 * (3 * 12 + 3 * 20));
+}
+
+#[test]
+fn every_documented_view_returns_representative_fixture_data() {
+    let conn = open_db();
+    insert_performance_fixtures(&conn);
+    assert_performance_views(&conn);
+}
+
+#[test]
+fn every_documented_view_reads_the_hive_partitioned_parquet_layout() {
+    let root = temp_dir("normalization-partitions");
+    let parquet_root = root.join("iceberg/ad_events/data");
+    fs::create_dir_all(&parquet_root).expect("create Parquet output directory");
+
+    let writer = Connection::open_in_memory().expect("open Parquet writer");
+    writer
+        .execute_batch(
+            "CREATE TABLE fixtures (
+                ts TIMESTAMP, ts_day DATE, ip VARCHAR, ua VARCHAR,
+                url VARCHAR, type VARCHAR, params MAP(VARCHAR, VARCHAR)
+             )",
+        )
+        .expect("create Parquet fixture table");
+    insert_performance_fixtures(&writer);
+    writer
+        .execute_batch(&format!(
+            "COPY fixtures TO '{}' (FORMAT PARQUET, PARTITION_BY (ts_day))",
+            parquet_root.display()
+        ))
+        .expect("write Hive-partitioned fixture files");
+
+    let conn = Connection::open_in_memory().expect("open partition query connection");
+    let glob = format!(
+        "read_parquet('{}', hive_partitioning = true)",
+        parquet_root.join("**/*.parquet").display()
+    );
+    initialize_views(&conn, &glob);
+    assert_performance_views(&conn);
+
+    let partition_days: i64 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT ts_day) FROM normalized_campaigns
+             WHERE headline = 'Shared Campaign'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read Hive partition column in normalized_campaigns");
+    assert_eq!(partition_days, 6);
+
+    fs::remove_dir_all(root).expect("remove Parquet fixtures");
+}
+
+fn temp_dir(label: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "trace-{}-{}-{}",
+        label,
+        std::process::id(),
+        TEMP_DIR_SEQUENCE.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir_all(&path).expect("create temporary fixture directory");
+    path
 }

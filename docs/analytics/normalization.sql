@@ -7,15 +7,40 @@
 -- runs fixture events through this exact file and asserts the same values the
 -- Rust normalizer produces.
 --
--- Usage: Load these views in your DuckDB/Trino session before running queries.
+-- DuckDB quick start (from the repository root):
+--   duckdb trace-analytics.duckdb < docs/analytics/normalization.sql
+--
+-- After configuring the bucket path, this file runs with the DuckDB CLI. Set
+-- AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY before starting DuckDB (plus
+-- AWS_SESSION_TOKEN for temporary credentials), then replace `my-trace-bucket` in the
+-- active normalized_campaigns read_parquet source with the bucket that contains
+-- this Hive-partitioned Parquet layout:
+--   s3://<bucket>/trace-events/iceberg/ad_events/data/ts_day=YYYY-MM-DD/*.parquet
+--
+-- For an S3-compatible service, set s3_endpoint, s3_url_style and s3_use_ssl
+-- in the configuration block below. For local data, replace that active glob
+-- with a local Hive-partitioned Parquet glob, such as
+--   '/path/to/iceberg/ad_events/data/**/*.parquet'
+-- Then run the quick-start command above.
 
 -- ============================================================================
 -- DuckDB Views
 -- ============================================================================
 
--- Install required extensions
--- INSTALL httpfs;
--- LOAD httpfs;
+-- Install and configure remote Parquet access. INSTALL is persistent in the
+-- DuckDB extension directory; LOAD is required in every new DuckDB process.
+INSTALL httpfs;
+LOAD httpfs;
+
+-- AWS S3 region. Credentials are read from the AWS environment; no credential
+-- values need to be embedded in this file.
+SET s3_region = 'us-east-1';
+
+-- For an S3-compatible service, uncomment and edit these settings. For a
+-- plain HTTP endpoint, set s3_use_ssl = false.
+-- SET s3_endpoint = 's3.example.net:9000';
+-- SET s3_url_style = 'path';
+-- SET s3_use_ssl = true;
 
 -- ============================================================================
 -- Normalized Campaigns View
@@ -214,7 +239,7 @@ WITH creative_daily AS (
         network,
         creative_id,
         headline,
-        DATE(ts) AS date,
+        DATE(ts) AS event_date,
         COUNT(*) FILTER (WHERE type = 'click') AS clicks,
         COUNT(*) FILTER (WHERE type = 'pageview') AS views
     FROM normalized_campaigns
@@ -229,7 +254,7 @@ daily_ctr AS (
         network,
         creative_id,
         headline,
-        date,
+        event_date,
         clicks,
         views,
         ROUND(100.0 * clicks / NULLIF(views, 0), 2) AS ctr
@@ -240,10 +265,12 @@ fatigue_metrics AS (
         network,
         creative_id,
         headline,
-        AVG(ctr) FILTER (WHERE date >= CURRENT_DATE + INTERVAL '-7 days') AS recent_ctr,
         AVG(ctr) FILTER (
-            WHERE date < CURRENT_DATE + INTERVAL '-7 days'
-            AND date >= CURRENT_DATE + INTERVAL '-21 days'
+            WHERE event_date >= CAST(CURRENT_DATE - INTERVAL '7 days' AS DATE)
+        ) AS recent_ctr,
+        AVG(ctr) FILTER (
+            WHERE event_date < CAST(CURRENT_DATE - INTERVAL '7 days' AS DATE)
+            AND event_date >= CAST(CURRENT_DATE - INTERVAL '21 days' AS DATE)
         ) AS prior_ctr
     FROM daily_ctr
     GROUP BY 1, 2, 3
@@ -272,12 +299,10 @@ CREATE OR REPLACE VIEW cross_network_creatives AS
 WITH creative_fingerprints AS (
     SELECT
         -- Create a normalized fingerprint for matching
-        LOWER(
-            REGEXP_REPLACE(
-                COALESCE(headline, ''),
-                '[^a-z0-9\s]',
-                ''
-            )
+        REGEXP_REPLACE(
+            LOWER(COALESCE(headline, '')),
+            '[^a-z0-9[:space:]]',
+            ''
         ) AS normalized_headline,
         network,
         creative_id,
