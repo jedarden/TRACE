@@ -17,11 +17,12 @@ them. Conversion-specific semantics (`/c` defaults, revenue handling) are in
 The collector is **log-first**: it validates transport concerns only —
 routing, method, body size, UTF-8 — and never inspects event content. There
 is no schema, no required field, and no event-type validation at ingestion.
-Every accepted request becomes exactly one JSON line in the current hour's
-raw log (`raw-YYYYMMDD-HH.jsonl`, UTC); all parsing and typing happens in
-the flusher. A direct consequence: **the collector never rejects a payload
-for being malformed** — only for being untransportable (too large, or not
-UTF-8 text).
+Every accepted ingestion request is passed to the raw-log writer once; when
+the write succeeds it produces exactly one JSON line in the current hour's
+raw log (`raw-YYYYMMDD-HH.jsonl`, UTC). All parsing and typing happens in the
+flusher. A direct consequence: **the collector never rejects a payload for
+being malformed** — only for being untransportable (too large, or not UTF-8
+text).
 
 ## Endpoints
 
@@ -42,7 +43,7 @@ default to `pageview`, `/e` and `POST /collect` to `unknown`, `/c` to
 
 ## Request contract
 
-### JS-tag path — `POST /collect` (or `/e`, `/c`, `/i`)
+### POST ingestion — `POST /collect` (or `/e`, `/c`, `/i`)
 
 - **Body**: any UTF-8 text up to the size limit. The tag sends a JSON
   object, labeled `application/json` by both its `sendBeacon` blob and its
@@ -52,6 +53,11 @@ default to `pageview`, `/e` and `POST /collect` to `unknown`, `/c` to
   format detection happens in the flusher (JSON first, then form encoding).
 - **Query string**: may accompany the body; it is recorded but the flusher
   derives event params from the POST body only.
+- **Event fields**: the JavaScript tag's JSON includes `type`, `url`, `ts`,
+  session/user identifiers, and `referrer`; extra event fields are passed
+  through. Form or JSON postbacks may use their corresponding fields (for
+  example `conversion_type`/`revenue` on `/c` or `imp_id` on `/i`). These
+  fields are not required or validated by the collector.
 - **Headers captured** (everything else is dropped — notably, no cookies
   are ever read or stored):
 
@@ -74,8 +80,11 @@ default to `pageview`, `/e` and `POST /collect` to `unknown`, `/c` to
 ### Pixel path — `GET /collect` (or `/p`, `/c`, `/i`)
 
 - **Query string**: stored verbatim (still percent-encoded, undecoded).
-  **No parameters are required** — a bare `GET /p` succeeds and is logged;
-  the flusher's endpoint defaults (above) type it.
+  Pixel callers commonly send `url`, `type`, session/user identifiers, and
+  attribution fields; `/c` commonly carries `conversion_type` and `revenue`,
+  while `/i` commonly carries `imp_id` and creative fields. **No parameters
+  are required** — a bare `GET /p` succeeds and is logged; the flusher's
+  endpoint defaults (above) type it.
 - **Body**: GET bodies are ignored entirely (not logged).
 - Same header capture and client-IP rules as the POST path.
 
@@ -83,18 +92,25 @@ default to `pageview`, `/e` and `POST /collect` to `unknown`, `/c` to
 
 | Status | When | Body | Logged? |
 |---|---|---|---|
-| `200` | GET endpoints | 35-byte 1×1 transparent GIF89a, `Content-Type: image/gif` | yes |
-| `204` | POST endpoints | empty | yes |
-| `400` | body is not valid UTF-8 | error text | **no** |
-| `404` | unknown path | error text | **no** |
-| `405` | method not routed for that path (e.g. `POST /p`, `GET /e`, `PUT /collect`, `OPTIONS /collect`) | error text | **no** |
-| `413` | body exceeds 2 MiB | error text | **no** |
+| `200` | `GET /collect`, `/p`, `/c`, or `/i` | Exact 35-byte 1×1 transparent GIF89a; route sets `Content-Type: image/gif` and no cache/CORS headers | yes |
+| `204` | `POST /collect`, `/e`, `/c`, or `/i` | Empty; the route sets no application response headers | yes |
+| `200` | `GET /health` | `OK`, with `Content-Type: text/plain; charset=utf-8`; not an ingestion response | **no** |
+| `400` | POST body is not valid UTF-8 | Framework-generated plain-text error body | **no** |
+| `404` | unknown path | Framework-generated plain-text error body | **no** |
+| `405` | method not routed for that path (e.g. `POST /p`, `GET /e`, `PUT /collect`, `OPTIONS /collect`) | Framework-generated plain-text error body | **no** |
+| `413` | POST body exceeds 2 MiB | Framework-generated plain-text error body | **no** |
 
-Rejected requests never touch the log — a 4xx has no side effects.
+The raw event log contains only accepted ingestion requests. Rejected
+requests never reach a collector handler, and health checks never call the
+raw-log writer. A 4xx therefore has no raw-log side effect, although the
+HTTP trace layer may still emit a server-side access diagnostic. The
+framework-generated error responses use `Content-Type: text/plain;
+charset=utf-8`.
 
 Two caveats clients should know about:
 
-- **A 2xx means "accepted into the in-memory buffer", not "durable".** If
+- **A successful ingestion response means "accepted into the in-memory
+  buffer", not "durable".** If
   the append to the log file fails (disk full, I/O error), the collector
   logs the error server-side and still returns success; the event is lost.
   Durability arrives at hourly rotation / graceful shutdown, when the file
