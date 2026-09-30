@@ -747,6 +747,29 @@ mod tests {
         assert_eq!(raw.body, None, "pixels carry no body");
     }
 
+    /// Arbitrary and repeated query parameters remain unchanged when a real
+    /// pixel request passes through the collector and is persisted to JSONL.
+    /// The flusher's Parquet round-trip for the same query is covered in
+    /// `test_query_params_e2e_pixel_round_trip_preserves_raw_url`.
+    #[tokio::test]
+    async fn contract_get_pixel_preserves_complex_query_verbatim() {
+        let (state, dir) = test_state();
+        let query = "url=https%3A%2F%2Fexample.com%2Flp%3Futm_source%3Dtaboola&type=pageview&sid=sess-7&tb_click_id=abc-123&installed&empty=&utm_source=one&utm_source=two&title=Test%20Page&";
+
+        let response = send(&state, get(&format!("/collect?{query}"))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let logged = read_all_logged_requests(&state, &dir).await;
+        assert_eq!(logged.len(), 1);
+        let raw = &logged[0];
+        assert_eq!(raw.path, "/collect");
+        assert_eq!(raw.query_params.as_deref(), Some(query));
+        assert_eq!(
+            format!("{}?{}", raw.path, raw.query_params.as_deref().unwrap()),
+            format!("/collect?{query}")
+        );
+    }
+
     /// GET /p with no query string at all still succeeds — the pixel
     /// endpoint performs no parameter validation.
     #[tokio::test]
