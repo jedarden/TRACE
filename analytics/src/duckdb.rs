@@ -29,6 +29,12 @@ fn create_optional_parquet_view(
     }
 }
 
+fn ensure_trace_schema(conn: &Connection) -> Result<()> {
+    conn.execute("CREATE SCHEMA IF NOT EXISTS trace;", params![])
+        .context("Failed to create trace schema")?;
+    Ok(())
+}
+
 pub struct DuckDBClient {
     conn: Connection,
 }
@@ -151,6 +157,8 @@ impl DuckDBClient {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Iceberg warehouse not configured"))?;
 
+        ensure_trace_schema(&self.conn)?;
+
         // Build the catalog connection string
         // DuckDB iceberg_scan format: iceberg_scan('table_path', catalog_uri => 'uri')
         let catalog_option = format!("catalog_uri => '{}'", catalog_uri);
@@ -193,13 +201,21 @@ impl DuckDBClient {
         // analytics/schemas/assets_iceberg.sql)
         let assets_path = format!("{}/trace/assets", warehouse);
         let assets_sql = format!(
-            "CREATE OR REPLACE VIEW iceberg_assets AS \
+            "CREATE OR REPLACE VIEW trace.assets AS \
              SELECT * FROM iceberg_scan('{}', {});",
             assets_path, catalog_option
         );
         self.conn
             .execute(&assets_sql, params![])
             .context("Failed to create view for Iceberg assets table")?;
+        // Keep the old backend-specific name for migration callers while the
+        // analytics surface uses the documented trace.assets relation.
+        self.conn
+            .execute(
+                "CREATE OR REPLACE VIEW iceberg_assets AS SELECT * FROM trace.assets;",
+                params![],
+            )
+            .context("Failed to create compatibility view for Iceberg assets")?;
 
         // Create view for the sessions table (day(started_at) partition
         // transform — schema in analytics/schemas/sessions_iceberg.sql)
@@ -284,11 +300,21 @@ impl DuckDBClient {
         )?;
 
         let assets_glob = format!("{}/assets/**/*.parquet", s3_path);
+        ensure_trace_schema(&self.conn)?;
+        create_optional_parquet_view(
+            &self.conn,
+            "trace.assets",
+            &assets_glob,
+            "Failed to create view for partitioned assets",
+        )?;
+        // The migration bootstrap still discovers the legacy view name.
+        // Keep it as a second Hive-backed registration while new analytics
+        // queries use trace.assets.
         create_optional_parquet_view(
             &self.conn,
             "parquet_assets",
             &assets_glob,
-            "Failed to create view for partitioned assets",
+            "Failed to create compatibility view for partitioned assets",
         )?;
 
         Ok(())
@@ -346,15 +372,11 @@ impl DuckDBClient {
     /// Get the SQL fragment for querying the assets dimension table
     /// (headlines, images, and landing pages synced from the ad network
     /// APIs, partitioned by network and type)
-    pub fn assets_table_sql(&self, config: &Config) -> String {
-        if config.is_iceberg_enabled() {
-            "iceberg_assets".to_string()
-        } else {
-            // The syncer writes Hive-style network=<n>/type=<t> directories.
-            // Keep the view registered in setup_parquet_views so predicates
-            // on network and type remain file-prunable.
-            "parquet_assets".to_string()
-        }
+    pub fn assets_table_sql(&self, _config: &Config) -> String {
+        // Both backends expose the documented trace.assets relation. The
+        // Parquet registration keeps Hive partition columns visible so
+        // network/type predicates remain file-prunable.
+        "trace.assets".to_string()
     }
 
     /// Get the SQL fragment for querying the sessions table
@@ -662,7 +684,7 @@ mod partition_pruning_tests {
             ("mgid", "headline"),
             ("mgid", "image"),
         ] {
-            let dir = root.join(format!("network={}/type={}", network, asset_type));
+            let dir = root.join(format!("assets/network={}/type={}", network, asset_type));
             fs::create_dir_all(&dir).expect("create asset partition dir");
             let path = dir.join("part-00000.parquet");
             let conn = Connection::open_in_memory().expect("open scratch connection");
@@ -800,16 +822,13 @@ mod partition_pruning_tests {
         write_asset_partitions(&root);
 
         let conn = Connection::open_in_memory().expect("open connection");
-        let view_sql = hive_parquet_view_sql(
-            "parquet_assets",
-            &format!("{}/**/*.parquet", root.display()),
-        );
-        conn.execute(&view_sql, params![])
-            .expect("create assets view");
+        let db = DuckDBClient { conn };
+        db.setup_parquet_views(&root.display().to_string(), &parquet_config())
+            .expect("register trace.assets view");
 
         let network_only = files_scanned(
-            &conn,
-            "SELECT COUNT(*) FROM parquet_assets WHERE network = 'taboola'",
+            db.connection(),
+            "SELECT COUNT(*) FROM trace.assets WHERE network = 'taboola'",
         );
         assert_eq!(
             network_only, 2,
@@ -817,15 +836,15 @@ mod partition_pruning_tests {
         );
 
         let network_and_type = files_scanned(
-            &conn,
-            "SELECT COUNT(*) FROM parquet_assets WHERE network = 'taboola' AND type = 'headline'",
+            db.connection(),
+            "SELECT COUNT(*) FROM trace.assets WHERE network = 'taboola' AND type = 'headline'",
         );
         assert_eq!(
             network_and_type, 1,
             "network/type predicates must read only one asset partition"
         );
 
-        let all_files = files_scanned(&conn, "SELECT COUNT(*) FROM parquet_assets");
+        let all_files = files_scanned(db.connection(), "SELECT COUNT(*) FROM trace.assets");
         assert_eq!(
             all_files, 4,
             "unfiltered assets query must read all partitions"
@@ -838,7 +857,8 @@ mod partition_pruning_tests {
     fn test_asset_performance_report_keeps_zero_traffic_assets() {
         let conn = Connection::open_in_memory().expect("open connection");
         conn.execute_batch(
-            "CREATE TABLE iceberg_assets (
+            "CREATE SCHEMA trace;
+             CREATE TABLE trace.assets (
                  asset_id VARCHAR,
                  network VARCHAR,
                  type VARCHAR,
@@ -852,7 +872,7 @@ mod partition_pruning_tests {
                  type VARCHAR,
                  ts TIMESTAMP
              );
-             INSERT INTO iceberg_assets VALUES
+             INSERT INTO trace.assets VALUES
                  ('taboola:headline:shared', 'taboola', 'headline', 'Shared', 'creative-1', 'Taboola campaign'),
                  ('outbrain:headline:shared', 'outbrain', 'headline', 'Shared', 'creative-1', 'Outbrain campaign'),
                  ('taboola:image:quiet', 'taboola', 'image', 'Quiet image', 'creative-quiet', 'Quiet campaign');
@@ -925,14 +945,14 @@ mod partition_pruning_tests {
         let db = DuckDBClient {
             conn: Connection::open_in_memory().expect("open connection"),
         };
-        assert_eq!(db.assets_table_sql(&parquet_config()), "parquet_assets");
+        assert_eq!(db.assets_table_sql(&parquet_config()), "trace.assets");
 
         let config = Config {
             iceberg_catalog_uri: Some("http://catalog:8181".to_string()),
             iceberg_warehouse: Some("s3://bucket/iceberg".to_string()),
             ..parquet_config()
         };
-        assert_eq!(db.assets_table_sql(&config), "iceberg_assets");
+        assert_eq!(db.assets_table_sql(&config), "trace.assets");
     }
 
     /// End-to-end through the report runner's rendering path: a shipped
