@@ -67,6 +67,25 @@ TRACE is a lightweight, self-hosted event tracking system built for affiliate ma
 | 📉 **Creative fatigue** | Performance decay of individual assets over time |
 | 🌐 **Cross-network comparison** | Same creative tested across multiple traffic sources |
 
+## 📈 Asset Performance and Creative Arbitrage
+
+The analytics service exposes the synced `trace.assets` dimension joined to
+normalized `trace.ad_events`. Asset rows stay in the result even when they had
+no events in the requested window, so zero-traffic headlines and images are
+visible alongside their active peers:
+
+```bash
+trace-analytics run asset_performance \
+  --start-date 2026-09-01 --end-date 2026-09-08
+```
+
+For creative arbitrage, find creative IDs observed on more than one ad network:
+
+```bash
+trace-analytics run cross_network_creatives \
+  --start-date 2026-09-01 --end-date 2026-09-08
+```
+
 ## 📁 Project Structure
 
 ```

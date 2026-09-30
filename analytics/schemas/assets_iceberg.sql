@@ -17,7 +17,10 @@
 -- ----------------------------------------------------------------------------
 -- Primary Assets Table
 -- ----------------------------------------------------------------------------
--- Dimension table for creative assets with performance metrics
+-- Dimension table for creative assets and their creative/campaign join keys.
+-- Event-derived performance metrics are retained as optional columns for
+-- consumers that materialize aggregates; analytics/queries/asset_performance.sql
+-- computes the requested event-window metrics directly from trace.ad_events.
 
 CREATE TABLE IF NOT EXISTS trace.assets (
     -- Primary identifiers
@@ -28,9 +31,16 @@ CREATE TABLE IF NOT EXISTS trace.assets (
     type STRING NOT NULL,  -- headline, image, video, thumbnail
     content STRING NOT NULL,  -- Text for headlines, URL for media
 
+    -- Join keys populated by the creative syncer
+    creative_id STRING,
+    campaign_id STRING,
+    campaign_name STRING,
+    item_id STRING,
+
     -- Timestamps
     first_seen TIMESTAMP NOT NULL,
     last_seen TIMESTAMP NOT NULL,
+    synced_at TIMESTAMP NOT NULL,
 
     -- Performance metrics
     total_views BIGINT,
@@ -163,7 +173,7 @@ asset_metrics AS (
     GROUP BY headline, network
 )
 SELECT
-    a.headline,
+    a.content AS headline,
     a.network,
     a.total_views,
     a.total_clicks,

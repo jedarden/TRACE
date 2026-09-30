@@ -1,6 +1,6 @@
 use crate::config::Config;
 use anyhow::{Context, Result};
-use duckdb::{params, Connection};
+use duckdb::{params, types::ValueRef, Connection};
 
 /// SQL for a view over a Hive-partitioned Parquet glob. The
 /// `hive_partitioning = true` flag is what exposes the directory-named
@@ -91,16 +91,22 @@ impl DuckDBClient {
 
     pub fn execute_query(&self, sql: &str) -> Result<QueryResult> {
         let mut stmt = self.conn.prepare(sql)?;
-        let columns: Vec<String> = stmt.column_names().into_iter().map(String::from).collect();
-        let rows = stmt
-            .query_map([], |row| {
+        // DuckDB exposes the result schema only after the prepared statement
+        // has been stepped. Querying first also avoids the duckdb-rs panic
+        // from calling Statement::column_names() on an unexecuted statement.
+        let rows = stmt.query([])?;
+        let columns = rows
+            .as_ref()
+            .map(|statement| statement.column_names())
+            .unwrap_or_default();
+        let rows = rows
+            .mapped(|row| {
                 let mut values = Vec::new();
                 for i in 0..row.as_ref().column_count() {
-                    let value: Option<String> = row.get(i)?;
-                    values.push(value.unwrap_or_else(|| "NULL".to_string()));
+                    values.push(value_to_string(row.get_ref(i)?));
                 }
                 Ok(values)
-            })?
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(QueryResult { columns, rows })
@@ -263,6 +269,14 @@ impl DuckDBClient {
             "Failed to create view for partitioned sessions",
         )?;
 
+        let assets_glob = format!("{}/assets/**/*.parquet", s3_path);
+        create_optional_parquet_view(
+            &self.conn,
+            "parquet_assets",
+            &assets_glob,
+            "Failed to create view for partitioned assets",
+        )?;
+
         Ok(())
     }
 
@@ -322,14 +336,10 @@ impl DuckDBClient {
         if config.is_iceberg_enabled() {
             "iceberg_assets".to_string()
         } else {
-            // For Parquet mode, read the syncer's asset dimension files
-            // directly. Each file carries network/type as columns, so no
-            // hive_partitioning is needed (it would duplicate them)
-            let assets_path = format!("s3://{}/{}/assets", config.s3_bucket, config.s3_prefix);
-            format!(
-                "(SELECT * FROM read_parquet('{}/**/*.parquet'))",
-                assets_path
-            )
+            // The syncer writes Hive-style network=<n>/type=<t> directories.
+            // Keep the view registered in setup_parquet_views so predicates
+            // on network and type remain file-prunable.
+            "parquet_assets".to_string()
         }
     }
 
@@ -546,6 +556,31 @@ mod tests {
     }
 }
 
+fn value_to_string(value: ValueRef<'_>) -> String {
+    match value {
+        ValueRef::Null => "NULL".to_string(),
+        ValueRef::Boolean(value) => value.to_string(),
+        ValueRef::TinyInt(value) => value.to_string(),
+        ValueRef::SmallInt(value) => value.to_string(),
+        ValueRef::Int(value) => value.to_string(),
+        ValueRef::BigInt(value) => value.to_string(),
+        ValueRef::HugeInt(value) => value.to_string(),
+        ValueRef::UTinyInt(value) => value.to_string(),
+        ValueRef::USmallInt(value) => value.to_string(),
+        ValueRef::UInt(value) => value.to_string(),
+        ValueRef::UBigInt(value) => value.to_string(),
+        ValueRef::Float(value) => value.to_string(),
+        ValueRef::Double(value) => value.to_string(),
+        ValueRef::Decimal(value) => value.to_string(),
+        ValueRef::Text(value) => String::from_utf8_lossy(value).into_owned(),
+        ValueRef::Blob(value) => String::from_utf8_lossy(value).into_owned(),
+        ValueRef::Timestamp(_, value) => value.to_string(),
+        ValueRef::Date32(value) => value.to_string(),
+        ValueRef::Time64(_, value) => value.to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
 /// Regression guard for partition pruning on the DuckDB read path.
 ///
 /// The pipeline writes Hive-style day directories of Parquet
@@ -600,6 +635,32 @@ mod partition_pruning_tests {
                 dir.join("part-00000.parquet").display()
             ))
             .expect("write partition file");
+        }
+    }
+
+    /// Write one asset fixture file per Hive partition. The syncer includes
+    /// network/type in each row as well as in the directory names, matching
+    /// the production asset Parquet layout.
+    fn write_asset_partitions(root: &Path) {
+        for (network, asset_type) in [
+            ("taboola", "headline"),
+            ("taboola", "image"),
+            ("mgid", "headline"),
+            ("mgid", "image"),
+        ] {
+            let dir = root.join(format!("network={}/type={}", network, asset_type));
+            fs::create_dir_all(&dir).expect("create asset partition dir");
+            let path = dir.join("part-00000.parquet");
+            let conn = Connection::open_in_memory().expect("open scratch connection");
+            conn.execute_batch(&format!(
+                "COPY (SELECT '{network}:{asset_type}' AS asset_id,
+                              '{network}' AS network,
+                              '{asset_type}' AS type,
+                              'fixture content' AS content)
+                 TO '{}' (FORMAT parquet);",
+                path.display()
+            ))
+            .expect("write asset partition file");
         }
     }
 
@@ -717,6 +778,147 @@ mod partition_pruning_tests {
         );
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn test_asset_partition_predicates_prune_files_scanned() {
+        let root = scratch_dir("assets");
+        write_asset_partitions(&root);
+
+        let conn = Connection::open_in_memory().expect("open connection");
+        let view_sql = hive_parquet_view_sql(
+            "parquet_assets",
+            &format!("{}/**/*.parquet", root.display()),
+        );
+        conn.execute(&view_sql, params![])
+            .expect("create assets view");
+
+        let network_only = files_scanned(
+            &conn,
+            "SELECT COUNT(*) FROM parquet_assets WHERE network = 'taboola'",
+        );
+        assert_eq!(
+            network_only, 2,
+            "network predicate must read only the selected network partitions"
+        );
+
+        let network_and_type = files_scanned(
+            &conn,
+            "SELECT COUNT(*) FROM parquet_assets WHERE network = 'taboola' AND type = 'headline'",
+        );
+        assert_eq!(
+            network_and_type, 1,
+            "network/type predicates must read only one asset partition"
+        );
+
+        let all_files = files_scanned(&conn, "SELECT COUNT(*) FROM parquet_assets");
+        assert_eq!(
+            all_files, 4,
+            "unfiltered assets query must read all partitions"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn test_asset_performance_report_keeps_zero_traffic_assets() {
+        let conn = Connection::open_in_memory().expect("open connection");
+        conn.execute_batch(
+            "CREATE TABLE iceberg_assets (
+                 asset_id VARCHAR,
+                 network VARCHAR,
+                 type VARCHAR,
+                 content VARCHAR,
+                 creative_id VARCHAR,
+                 campaign_name VARCHAR
+             );
+             CREATE TABLE iceberg_ad_events (
+                 creative_id VARCHAR,
+                 network VARCHAR,
+                 type VARCHAR,
+                 ts TIMESTAMP
+             );
+             INSERT INTO iceberg_assets VALUES
+                 ('taboola:headline:shared', 'taboola', 'headline', 'Shared', 'creative-1', 'Taboola campaign'),
+                 ('outbrain:headline:shared', 'outbrain', 'headline', 'Shared', 'creative-1', 'Outbrain campaign'),
+                 ('taboola:image:quiet', 'taboola', 'image', 'Quiet image', 'creative-quiet', 'Quiet campaign');
+             INSERT INTO iceberg_ad_events VALUES
+                 ('creative-1', 'taboola', 'pageview', TIMESTAMP '2026-09-02 10:00:00'),
+                 ('creative-1', 'taboola', 'click', TIMESTAMP '2026-09-02 10:01:00'),
+                 ('creative-1', 'outbrain', 'click', TIMESTAMP '2026-09-02 11:00:00'),
+                 ('creative-1', 'taboola', 'click', TIMESTAMP '2026-08-01 11:00:00');",
+        )
+        .expect("seed asset-performance fixtures");
+
+        let config = Config {
+            iceberg_catalog_uri: Some("http://catalog:8181".to_string()),
+            iceberg_warehouse: Some("s3://bucket/iceberg".to_string()),
+            ..parquet_config()
+        };
+        let db = DuckDBClient { conn };
+        let params = ReportParams {
+            s3_path: None,
+            start_date: Some("2026-09-01".to_string()),
+            end_date: Some("2026-09-08".to_string()),
+        };
+        let sql = crate::queries::render_template_with_client(
+            include_str!("../queries/asset_performance.sql"),
+            &params,
+            &db,
+            &config,
+        );
+        assert!(!sql.contains("{{"), "unrendered placeholder:\n{}", sql);
+
+        let result = db
+            .execute_query(&sql)
+            .expect("execute asset-performance report");
+        assert_eq!(result.rows.len(), 3, "every fixture asset must be reported");
+
+        let row_for = |asset_id: &str| {
+            result
+                .rows
+                .iter()
+                .find(|row| row[0] == asset_id)
+                .unwrap_or_else(|| panic!("missing asset row: {}", asset_id))
+        };
+        let taboola = row_for("taboola:headline:shared");
+        assert_eq!(
+            taboola[5], "1",
+            "taboola pageview must match by network and creative"
+        );
+        assert_eq!(
+            taboola[6], "1",
+            "taboola click must match by network and creative"
+        );
+
+        let outbrain = row_for("outbrain:headline:shared");
+        assert_eq!(outbrain[5], "0");
+        assert_eq!(
+            outbrain[6], "1",
+            "same creative id must remain network-scoped"
+        );
+
+        let quiet = row_for("taboola:image:quiet");
+        assert_eq!(
+            quiet[5], "0",
+            "zero-traffic asset must remain in the report"
+        );
+        assert_eq!(quiet[6], "0", "zero-traffic asset must have zero clicks");
+    }
+
+    #[test]
+    fn test_assets_table_sql_uses_partitioned_parquet_view() {
+        let db = DuckDBClient {
+            conn: Connection::open_in_memory().expect("open connection"),
+        };
+        assert_eq!(db.assets_table_sql(&parquet_config()), "parquet_assets");
+
+        let config = Config {
+            iceberg_catalog_uri: Some("http://catalog:8181".to_string()),
+            iceberg_warehouse: Some("s3://bucket/iceberg".to_string()),
+            ..parquet_config()
+        };
+        assert_eq!(db.assets_table_sql(&config), "iceberg_assets");
     }
 
     /// End-to-end through the report runner's rendering path: a shipped
