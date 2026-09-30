@@ -135,11 +135,13 @@ See `analytics/schemas/ad_events_iceberg.sql` for the complete schema including:
 
 ### Events Table (Generic)
 
-For general-purpose event tracking. The identity columns are nullable but
-must be declared: the report templates in `analytics/queries/` filter and
-group on `session_id` (session reconstruction, attribution, daily summary),
-and a table without it silently returns zero rows for those reports on all
-data instead of only on pre-identity data.
+For general-purpose event tracking. This table uses the same logical column
+set as `trace.ad_events`, so the report templates in `analytics/queries/`
+can run against either relation. Identity and enrichment columns are nullable:
+older events do not have them, and Iceberg reads those fields as NULL. Keep
+this declaration aligned with `analytics/schemas/ad_events_iceberg.sql` and
+the V001-V004 table-version map in
+[`event_schema_versions.md`](event_schema_versions.md).
 
 ```sql
 CREATE TABLE trace.events (
@@ -147,20 +149,55 @@ CREATE TABLE trace.events (
   ip STRING,
   ua STRING,
   url STRING NOT NULL,
-  params MAP<STRING, STRING> NOT NULL,
   type STRING NOT NULL,
-  -- Identity: NULL on events written before the flusher captured these
+  -- V001 identity and normalized event fields
   session_id STRING,
   user_id STRING,
-  cookie_id STRING
+  cookie_id STRING,
+  network STRING,
+  campaign_id STRING,
+  campaign_name STRING,
+  creative_id STRING,
+  headline STRING,
+  image_id STRING,
+  item_id STRING,
+  params MAP<STRING, STRING>,
+  -- V002 referrer, attribution, and device fields
+  referrer STRING,
+  referrer_network STRING,
+  attribution_campaign_id STRING,
+  attribution_creative_id STRING,
+  attribution_touches INT,
+  attribution_days_to_convert INT,
+  device_type STRING,
+  device_os STRING,
+  device_browser STRING,
+  -- V003 engagement fields
+  scroll_depth_pct INT,
+  scroll_time_ms INT,
+  dwell_time_ms INT,
+  dwell_visible_pct INT,
+  viewport_width INT,
+  viewport_height INT,
+  -- V004 quality and enrichment fields
+  quality_score DOUBLE,
+  bot_probability DOUBLE,
+  fraud_score DOUBLE,
+  is_valid BOOLEAN,
+  is_verified BOOLEAN,
+  validation_reason STRING,
+  enriched_at TIMESTAMP,
+  enrichment_version STRING
 )
 PARTITIONED BY DAYS(ts)
 LOCATED AT 's3://my-trace-bucket/iceberg/events';
 ```
 
-Events older than the identity columns read as NULL there; see
-[Event Schema Versions](event_schema_versions.md) for how the raw Parquet
-generations map onto this table and how to query them together.
+Events older than each field group read as NULL there. For raw Parquet files,
+use the schema-version compatibility view; a direct `read_parquet` scan cannot
+unify the legacy JSON-string `params` column with the current MAP column. See
+[Event Schema Versions](event_schema_versions.md) for the supported file
+generations, table versions, and query rules.
 
 ### Partitioning Strategy
 

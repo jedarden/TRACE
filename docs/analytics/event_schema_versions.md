@@ -16,6 +16,12 @@ There are two version axes, and confusing them is the common source of
   schema for all rows; rows written before a migration read NULL in the
   added columns.
 
+The generic `trace.events` example in `iceberg.md` mirrors the same current
+column set and version annotations so the report templates can use either
+relation. The V001-V004 migration files target `trace.ad_events`; they are the
+version ledger for the production analytics table, not a second migration
+history for a separately managed `trace.events` table.
+
 ## File generations
 
 | Generation | Introduced | Columns | `params` physical type |

@@ -1153,21 +1153,19 @@ mod tests {
     // Drift guard: canonical list vs the DDL
     // ------------------------------------------------------------------
 
-    /// Column declarations inside the `trace.ad_events` CREATE TABLE block
-    /// of `analytics/schemas/ad_events_iceberg.sql`.
-    fn ad_events_ddl_columns() -> Vec<&'static str> {
-        let ddl = include_str!("../schemas/ad_events_iceberg.sql");
+    /// Column declarations inside one CREATE TABLE block.
+    fn ddl_table_fields(ddl: &'static str, declaration: &str) -> Vec<(&'static str, &'static str)> {
         let start = ddl
             .lines()
-            .position(|l| l.contains("CREATE TABLE IF NOT EXISTS trace.ad_events ("))
-            .expect("ad_events CREATE TABLE exists");
+            .position(|line| line.contains(declaration))
+            .unwrap_or_else(|| panic!("{} declaration exists", declaration));
         let end = ddl
             .lines()
             .skip(start)
             .position(|line| line.trim() == ")")
             .expect("ad_events table terminator");
 
-        let mut columns = Vec::new();
+        let mut fields = Vec::new();
         for line in ddl.lines().skip(start + 1).take(end) {
             let trimmed = line.trim();
             // Column lines: a bare lowercase identifier followed by a type
@@ -1194,10 +1192,32 @@ mod tests {
             .iter()
             .any(|t| rest.starts_with(t));
             if identifier_ok && is_type {
-                columns.push(first);
+                let sql_type = if rest.starts_with("MAP<") {
+                    "MAP<STRING, STRING>"
+                } else {
+                    rest.split_whitespace()
+                        .next()
+                        .expect("column type exists")
+                        .trim_end_matches(',')
+                };
+                fields.push((first, sql_type));
             }
         }
-        columns
+        fields
+    }
+
+    fn ddl_table_columns(ddl: &'static str, declaration: &str) -> Vec<&'static str> {
+        ddl_table_fields(ddl, declaration)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    fn ad_events_ddl_columns() -> Vec<&'static str> {
+        ddl_table_columns(
+            include_str!("../schemas/ad_events_iceberg.sql"),
+            "CREATE TABLE IF NOT EXISTS trace.ad_events (",
+        )
     }
 
     /// Pin `CANONICAL_COLUMNS` to the `trace.ad_events` DDL — the same
@@ -1235,6 +1255,54 @@ mod tests {
             canonical.len(),
             ddl_set.len(),
             "canonical list and DDL must agree on the full column set"
+        );
+    }
+
+    /// The generic table documented for consumers has to expose the same
+    /// nullable identity and enrichment fields as the analytics table. This
+    /// prevents query templates from compiling against one backend and
+    /// silently losing columns on the documented `trace.events` relation.
+    #[test]
+    fn generic_events_schema_matches_canonical_columns() {
+        let generic_fields = ddl_table_fields(
+            include_str!("../../docs/analytics/iceberg.md"),
+            "CREATE TABLE trace.events (",
+        );
+        let ad_events_fields = ddl_table_fields(
+            include_str!("../schemas/ad_events_iceberg.sql"),
+            "CREATE TABLE IF NOT EXISTS trace.ad_events (",
+        );
+        assert_eq!(
+            generic_fields.iter().copied().collect::<HashSet<_>>(),
+            ad_events_fields.iter().copied().collect::<HashSet<_>>(),
+            "generic trace.events must match trace.ad_events names and types"
+        );
+
+        let ddl_columns = ddl_table_columns(
+            include_str!("../../docs/analytics/iceberg.md"),
+            "CREATE TABLE trace.events (",
+        );
+        let canonical: HashSet<&str> = CANONICAL_COLUMNS.iter().map(|(n, _)| *n).collect();
+        let ddl_set: HashSet<&str> = ddl_columns.iter().copied().collect();
+
+        for (name, _) in CANONICAL_COLUMNS {
+            assert!(
+                ddl_set.contains(name),
+                "canonical column {} missing from the documented trace.events schema",
+                name
+            );
+        }
+        for col in &ddl_columns {
+            assert!(
+                canonical.contains(col),
+                "column {} in trace.events is absent from CANONICAL_COLUMNS",
+                col
+            );
+        }
+        assert_eq!(
+            canonical.len(),
+            ddl_set.len(),
+            "generic trace.events and canonical schemas must have the same column set"
         );
     }
 }
