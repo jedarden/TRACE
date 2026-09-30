@@ -101,6 +101,8 @@ pub struct IcebergCompactorConfig {
     pub tables: Vec<IcebergTableSpec>,
     /// Warehouse root as an s3:// URI (e.g. "s3://bucket/trace-events/iceberg")
     pub warehouse: String,
+    /// REST catalog configuration required to publish snapshots.
+    pub publisher: Option<trace_iceberg::publisher::PublisherConfig>,
 }
 
 impl Default for IcebergCompactorConfig {
@@ -112,6 +114,7 @@ impl Default for IcebergCompactorConfig {
             lookback_days: 7,
             tables: default_tables(),
             warehouse: "s3://my-trace-bucket/iceberg".to_string(),
+            publisher: None,
         }
     }
 }
@@ -279,6 +282,7 @@ pub async fn compact_iceberg_partition(
 
     // Merge and upload each group
     let mut uploaded: Vec<metadata::CompactedDataFile> = Vec::new();
+    let mut schema_for_publish: Option<Vec<u8>> = None;
     for (idx, keys) in output_files.iter().enumerate() {
         info!(
             "Merging group {}/{} ({} files)",
@@ -297,6 +301,10 @@ pub async fn compact_iceberg_partition(
         if merged_data.is_empty() {
             warn!("Group {} produced empty output, skipping", idx + 1);
             continue;
+        }
+
+        if schema_for_publish.is_none() {
+            schema_for_publish = Some(merged_data.clone());
         }
 
         // Generate output key with Iceberg partition structure
@@ -330,15 +338,40 @@ pub async fn compact_iceberg_partition(
     // dropping the originals, so a metadata failure never loses data.
     // Paths are recorded relative to the table prefix ("data/<partition>/...").
     let output_count = uploaded.len();
-    metadata::generate_iceberg_metadata(
-        s3.clone(),
-        &table.table_name,
-        &table.table_location(&config.warehouse),
-        &table.data_prefix(),
-        table.partition_value(partition),
-        uploaded,
+    let publisher = config.publisher.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "ICEBERG_CATALOG_URI and ICEBERG_WAREHOUSE are required to publish snapshots"
+        )
+    })?;
+    let schema_bytes = schema_for_publish
+        .as_deref()
+        .context("compaction produced no schema for Iceberg publication")?;
+    let day = chrono::NaiveDate::parse_from_str(table.partition_value(partition), "%Y-%m-%d")
+        .context("Iceberg partition must be a YYYY-MM-DD day")?;
+    let iceberg_objects = uploaded
+        .iter()
+        .map(|file| trace_iceberg::publisher::ParquetObject {
+            location: publisher.object_uri(&format!("{}/{}", table.data_prefix(), file.path)),
+            size_bytes: file.size_bytes as u64,
+            record_count: file.record_count as u64,
+            partition_day: Some(day),
+        })
+        .collect();
+    let published = trace_iceberg::publisher::append_parquet_files(
+        publisher,
+        table
+            .table_name
+            .rsplit('.')
+            .next()
+            .unwrap_or(&table.table_name),
+        schema_bytes,
+        iceberg_objects,
     )
     .await?;
+    info!(
+        "Published {} compacted objects as a snapshot for {}",
+        published, table.table_name
+    );
 
     // Delete original small files
     let original_keys: Vec<String> = files.iter().map(|f| f.key.clone()).collect();

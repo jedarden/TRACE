@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: flusher
-          image: ghcr.io/jedarden/trace-flusher:latest
+          image: ghcr.io/jedarden/trace-flusher:v0.1.0
           imagePullPolicy: Always
           env:
             - name: TRACE_LOG_DIR
@@ -36,6 +36,21 @@ spec:
                   key: region
             - name: TRACE_S3_PREFIX
               value: trace-events
+            - name: ICEBERG_CATALOG_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: trace-config
+                  key: iceberg-catalog-uri
+                  optional: true
+            - name: ICEBERG_WAREHOUSE
+              valueFrom:
+                configMapKeyRef:
+                  name: trace-config
+                  key: iceberg-warehouse
+                  optional: true
+            - name: TRACE_ICEBERG_PUBLISH
+              # Bootstrap existing Parquet before publishing new batches.
+              value: "false"
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:

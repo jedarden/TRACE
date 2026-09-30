@@ -1,16 +1,18 @@
 # Multi-stage build for TRACE flusher
-FROM rust:1.83-alpine AS builder
+FROM rust:1.97-alpine AS builder
 
-RUN apk add --no-cache musl-dev
+RUN apk add --no-cache build-base cmake perl
 
-WORKDIR /build
+WORKDIR /build/trace
 
-# Copy manifests
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+# The flusher depends on the shared Iceberg publisher crate.
+COPY iceberg/Cargo.toml ./iceberg/Cargo.toml
+COPY iceberg/src ./iceberg/src
+COPY flusher/Cargo.toml flusher/Cargo.lock ./flusher/
+COPY flusher/src ./flusher/src
 
 # Build release binary
-RUN cargo build --release
+RUN cargo build --release --manifest-path flusher/Cargo.toml
 
 # Runtime image
 FROM alpine:3.20

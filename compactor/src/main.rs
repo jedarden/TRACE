@@ -500,19 +500,50 @@ async fn main() -> Result<()> {
         };
 
         // Run Iceberg compaction
+        let publisher = trace_iceberg::publisher::PublisherConfig::from_env()?
+            .context("Iceberg compaction requires a REST catalog and warehouse")?;
         let iceberg_config = iceberg::IcebergCompactorConfig {
             lookback_days,
             warehouse,
+            publisher: Some(publisher),
             tables,
             ..Default::default()
         };
 
         info!("Starting Iceberg compaction mode");
-        if let Err(e) = iceberg::run_iceberg_compaction(s3, iceberg_config).await {
-            error!("Iceberg compaction failed: {}", e);
-            return Err(e);
+        if let Err(e) = iceberg::run_iceberg_compaction(s3.clone(), iceberg_config.clone()).await {
+            error!("Initial Iceberg compaction failed: {}", e);
         }
-        info!("Iceberg compaction completed successfully");
+        info!(
+            "TRACE Iceberg compactor running (next run in {} seconds)",
+            interval_seconds
+        );
+        let mut schedule = tokio::time::interval(std::time::Duration::from_secs(interval_seconds));
+        schedule.tick().await;
+        let ctrl_c = tokio::signal::ctrl_c();
+        tokio::pin!(ctrl_c);
+        let shutdown = shutdown_signal();
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                _ = schedule.tick() => {
+                    if let Err(e) = iceberg::run_iceberg_compaction(s3.clone(), iceberg_config.clone()).await {
+                        error!("Scheduled Iceberg compaction failed: {}", e);
+                    }
+                }
+                signal = &mut ctrl_c => {
+                    if let Err(e) = signal {
+                        warn!("Failed to listen for Ctrl-C: {}", e);
+                    }
+                    info!("Shutting down Iceberg compactor...");
+                    break;
+                }
+                _ = &mut shutdown => {
+                    info!("Received shutdown signal, stopping Iceberg compactor...");
+                    break;
+                }
+            }
+        }
     } else {
         // Run regular event compaction
         let config = CompactorConfig {

@@ -7,5 +7,5 @@ data:
   s3-bucket: "my-trace-bucket"
   s3-region: "us-east-1"
   s3-prefix: "trace-events"
-  iceberg-catalog-uri: "http://iceberg-rest:8181"
-  iceberg-warehouse: "s3://my-trace-bucket/iceberg"
+  iceberg-catalog-uri: "http://iceberg-rest.trace.svc.cluster.local:8181"
+  iceberg-warehouse: "s3://my-trace-bucket/trace-events/iceberg"

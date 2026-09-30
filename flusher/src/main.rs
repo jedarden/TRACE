@@ -117,16 +117,24 @@ struct S3Config {
 #[async_trait]
 trait S3Upload: Send + Sync {
     async fn upload(&self, key: &str, data: Vec<u8>) -> Result<()>;
+
+    /// Publish already-uploaded Parquet objects in one Iceberg snapshot.
+    /// Mocks and deployments without a catalog keep the Parquet-only path.
+    async fn publish_iceberg(&self, _objects: Vec<(String, Vec<u8>)>) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Real S3 implementation
 struct S3Client {
     client: Client,
     config: S3Config,
+    iceberg: Option<trace_iceberg::publisher::PublisherConfig>,
 }
 
 impl S3Client {
     async fn new(config: S3Config) -> Result<Self> {
+        let iceberg = trace_iceberg::publisher::PublisherConfig::from_env()?;
         let region = Region::new(config.region.clone());
 
         let client = if let Some(endpoint) = &config.endpoint_url {
@@ -150,7 +158,11 @@ impl S3Client {
             Client::new(&aws_config)
         };
 
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            iceberg,
+        })
     }
 }
 
@@ -176,6 +188,46 @@ impl S3Upload for S3Client {
             .context("S3 upload failed")?;
 
         info!("Uploaded to s3://{}/{}", self.config.bucket, full_key);
+        Ok(())
+    }
+
+    async fn publish_iceberg(&self, objects: Vec<(String, Vec<u8>)>) -> Result<()> {
+        let Some(config) = &self.iceberg else {
+            return Ok(());
+        };
+        if objects.is_empty() {
+            return Ok(());
+        }
+
+        let schema_bytes = objects[0].1.as_slice();
+        let mut iceberg_objects = Vec::with_capacity(objects.len());
+        for (key, data) in &objects {
+            let (schema, record_count) = trace_iceberg::types::schema_from_parquet(data)?;
+            let (first_schema, _) = trace_iceberg::types::schema_from_parquet(schema_bytes)?;
+            anyhow::ensure!(
+                schema.is_compatible_with(&first_schema),
+                "flusher batch contains incompatible Parquet schemas"
+            );
+            let partition_day = key
+                .split('/')
+                .find_map(|part| part.strip_prefix("date="))
+                .map(|date| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d"))
+                .transpose()?;
+            iceberg_objects.push(trace_iceberg::publisher::ParquetObject {
+                location: config.object_uri(key),
+                size_bytes: data.len() as u64,
+                record_count: record_count as u64,
+                partition_day,
+            });
+        }
+        let count = trace_iceberg::publisher::append_parquet_files(
+            config,
+            "ad_events",
+            schema_bytes,
+            iceberg_objects,
+        )
+        .await?;
+        info!("Published {} Parquet objects to trace.ad_events", count);
         Ok(())
     }
 }
@@ -889,6 +941,26 @@ async fn flush_batch(state: &FlusherState, reason: &str) -> Result<()> {
                 }
             }
         }
+    }
+
+    // S3 upload is the durable source of truth. Catalog failure is surfaced
+    // for alerting, while the uploaded objects remain available to the
+    // compactor's reconciliation pass.
+    let iceberg_objects: Vec<(String, Vec<u8>)> = entries
+        .values()
+        .flatten()
+        .filter(|entry| {
+            !upload_errors
+                .iter()
+                .any(|(failed, _)| failed.key == entry.key)
+        })
+        .map(|entry| (entry.key.clone(), entry.data.clone()))
+        .collect();
+    if let Err(error) = state.s3.publish_iceberg(iceberg_objects).await {
+        error!(
+            "Iceberg publication failed after Parquet upload; objects remain in S3 for reconciliation: {}",
+            error
+        );
     }
 
     // Delete source files for successful uploads

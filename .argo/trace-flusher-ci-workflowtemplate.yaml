@@ -80,13 +80,16 @@ spec:
     - name: cargo-lint
       activeDeadlineSeconds: 900
       container:
-        image: rust:1.83-slim
+        image: rust:1.97-slim
         command: [bash, -c]
         args:
           - |
             set -e
             cd /workspace/src/flusher
             export CARGO_TARGET_DIR=/workspace/target-lint
+            cargo fmt --all -- --check
+            cargo clippy --all-targets -- -D warnings
+            cd /workspace/src/iceberg
             cargo fmt --all -- --check
             cargo clippy --all-targets -- -D warnings
         volumeMounts:
@@ -103,7 +106,7 @@ spec:
     - name: cargo-build
       activeDeadlineSeconds: 1800
       container:
-        image: rust:1.83-slim
+        image: rust:1.97-slim
         command: [bash, -c]
         args:
           - |
@@ -147,7 +150,7 @@ spec:
 
             /kaniko/executor \
               --dockerfile=/workspace/src/flusher/Dockerfile \
-              --context=/workspace/src/flusher \
+              --context=/workspace/src \
               $DESTS \
               --cache=true \
               --cache-repo=${REGISTRY}/cache \
