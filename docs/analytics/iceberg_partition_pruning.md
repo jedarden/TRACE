@@ -4,9 +4,10 @@
 
 Partition pruning is a critical optimization technique that allows query engines to skip reading irrelevant partitions based on query predicates. Iceberg's hidden partitioning makes this transparent to users while maintaining performance.
 
-## How TRACE tables are actually laid out and read (verified 2026-09-16)
+## How TRACE tables are intended to be laid out and read (live status checked 2026-09-30)
 
-The pipeline writes **Hive-style partition directories of ZSTD Parquet** —
+The repository's materializer writes **Hive-style partition directories of
+ZSTD Parquet** —
 `started_at_day=YYYY-MM-DD/`, `ts_day=YYYY-MM-DD/`,
 `network=<n>/type=<t>/` — with partition values in the path. A directory tree
 of Parquet files is not itself an Iceberg table: `iceberg_scan` requires the
@@ -17,7 +18,8 @@ Parquet mode it reads the compacted data with
 one level:
 
 - **Filtering the Hive partition column** (`started_at_day`, `ts_day`,
-  `network`, …) prunes whole directories. Verified below.
+  `network`, …) prunes whole directories. The sessions result below is a
+  local Parquet-fixture validation, not a live-table measurement.
 - **Filtering an in-file column only** (`started_at`, `ts`) does **not** skip
   files on the DuckDB read path, even when every file's Parquet min/max
   excludes the range — measured `Total Files Read` equals the unfiltered
@@ -26,9 +28,9 @@ one level:
   table (Trino with the `day(started_at)` partition transform) would prune
   from the range predicate alone.
 
-So the practical rule against the as-built layout: **filter the partition
-column in addition to the timestamp.** The verified sessions examples below
-show both shapes.
+So the practical rule against the as-built layout is: **filter the partition
+column in addition to the timestamp.** The sessions examples below show both
+shapes and identify which results came from the local fixture.
 
 ## TRACE Partitioning Strategy
 
@@ -80,14 +82,29 @@ WHERE ts >= TIMESTAMP '2026-05-01 00:00:00'
   AND ts < TIMESTAMP '2026-05-08 00:00:00';
 ```
 
-### Sessions Table — verified against the live layout (2026-09-16)
+### Sessions Table — Parquet-mode fixture validation (live table unavailable)
 
-Measured on the as-built sessions Parquet view (10 day partitions
+The live catalog was checked read-only on 2026-09-30 before this section was
+updated. `iceberg_namespaces` contained one namespace (`default/native_ads`),
+but `iceberg_tables` contained zero rows and
+`WHERE table_name = 'sessions'` returned no row. There was therefore no live
+`trace.sessions` metadata, partition list, or warehouse data against which to
+run either predicate. The figures below are retained as a reproducible local
+fixture validation of the repository's intended Parquet layout; they are not
+production counts.
+
+Measured on a local as-built sessions Parquet fixture (10 day partitions
 `started_at_day=2026-09-01…2026-09-10`, one ZSTD Parquet file per day,
-240 rows/day; 138 MB / 20 M-row variant confirmed the same file counts),
+240 rows/day; the 138 MB / 20 M-row fixture variant confirmed the same file
+counts),
 DuckDB 1.5.2, `read_parquet('…/iceberg/sessions/data/**/*.parquet',
 hive_partitioning = true)`. "Files read" is `TABLE_SCAN → Total Files Read`
 from `EXPLAIN ANALYZE`; with one file per day it equals partitions scanned.
+
+| Validation scope | Total partitions | In-range partitions | GOOD scanned | BAD scanned | Conclusion |
+|---|---:|---:|---:|---:|---|
+| Local Parquet fixture, `[2026-09-03, 2026-09-06)` | 10 | 3 | 3 / 10 | 10 / 10 | The physical `started_at_day` predicate prunes; the timestamp-only predicate does not. |
+| Live `trace.sessions` catalog table | N/A | N/A | N/A | N/A | No table was registered when checked, so live validation is unavailable. |
 
 | Query | Files read | Rows out |
 |---|---|---|
@@ -101,20 +118,21 @@ from `EXPLAIN ANALYZE`; with one file per day it equals partitions scanned.
 
 Readings:
 
-- The timestamp-only range is **correct** (720 = exactly the rows in
-  `[09-03, 09-06)`) but scans every file: DuckDB opens each file's footer and
+- On the local fixture, the timestamp-only range is **correct** (720 = exactly
+  the rows in `[09-03, 09-06)`) but scans every file: DuckDB opens each file's footer and
   reads it, even though each file's `started_at` min/max is confined to a
   single day (`parquet_metadata` confirms `[day 00:00:00 .. day 23:54:00]`).
   The DATE_TRUNC and CAST forms behave the same at the file level while also
   evaluating an expression per row — still avoid them.
-- Filtering the **partition column** (`started_at_day`, exposed by
-  `hive_partitioning = true` and auto-cast to DATE) prunes exactly: equality
-  → 1 file, 3-day range → 3 files.
+- On the local fixture, filtering the **partition column** (`started_at_day`,
+  exposed by `hive_partitioning = true` and auto-cast to DATE) prunes exactly:
+  equality → 1 file, 3-day range → 3 files.
 - The belt-and-braces pattern (timestamp range for row filtering **plus**
   partition-column range for file pruning) is the recommended sessions query:
 
 ```sql
--- ✅ GOOD against parquet_sessions: partition column prunes files,
+-- ✅ GOOD in Parquet mode (validated on the local fixture): the partition
+--    column prunes files,
 --    the timestamp range keeps row filtering independent of the partitioning
 SELECT COUNT(*) AS sessions
 FROM parquet_sessions
@@ -123,8 +141,9 @@ WHERE started_at_day >= DATE '2026-09-03'
   AND started_at >= TIMESTAMP '2026-09-03 00:00:00'
   AND started_at <  TIMESTAMP '2026-09-06 00:00:00';
 
--- ❌ BAD against parquet_sessions: timestamp-only range reads every
---    partition on the DuckDB read path (10/10 files measured). Acceptable
+-- ❌ BAD in Parquet mode (validated on the local fixture): timestamp-only
+--    range reads every partition on the DuckDB read path (10/10 files).
+--    Acceptable
 --    only against a true Iceberg table under Trino, where the day(started_at)
 --    transform prunes from this predicate.
 SELECT COUNT(*) AS sessions
@@ -257,7 +276,8 @@ WHERE ts >= '2026-05-01' AND ts < '2026-05-08';
 
 ### Check Query Plan (DuckDB)
 
-Verified against DuckDB 1.5.2 (2026-09-16):
+Fixture validation with DuckDB 1.5.2 (live table unavailable; status checked
+2026-09-30):
 
 ```sql
 EXPLAIN ANALYZE
@@ -266,7 +286,8 @@ WHERE started_at_day >= DATE '2026-09-03'
   AND started_at_day <  DATE '2026-09-06';
 
 -- Look for the TABLE_SCAN node:
--- - "Total Files Read: 3"  (should match days/partitions in range;
+-- - "Total Files Read: 3"  (on the local fixture, this matches
+--   days/partitions in range;
 --   with one file per day partition, files read == partitions scanned)
 -- - "Filters:" — the predicates pushed into the scan
 -- - "Filename(s):" — the glob the scan started from
