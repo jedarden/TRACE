@@ -862,7 +862,53 @@ mod partition_pruning_tests {
             "unfiltered assets query must read all partitions"
         );
 
+        let compatibility_rows: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM parquet_assets", [], |row| row.get(0))
+            .expect("resolve compatibility assets view");
+        assert_eq!(compatibility_rows, 4);
+
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn test_iceberg_setup_registers_trace_assets_from_configured_table() {
+        let conn = Connection::open_in_memory().expect("open connection");
+        conn.execute_batch(
+            "CREATE TABLE iceberg_fixture (
+                 asset_id VARCHAR, network VARCHAR, type VARCHAR, content VARCHAR
+             );
+             INSERT INTO iceberg_fixture VALUES
+                 ('taboola:headline:fixture', 'taboola', 'headline', 'fixture content');
+             CREATE MACRO iceberg_scan(table_path, catalog_uri) AS TABLE
+                 SELECT * FROM iceberg_fixture
+                 WHERE table_path = 's3://trace-bucket/warehouse/trace/assets'
+                   AND catalog_uri = 'http://catalog.test';",
+        )
+        .expect("install local Iceberg scan fixture");
+
+        let db = DuckDBClient { conn };
+        let config = Config {
+            iceberg_catalog_uri: Some("http://catalog.test".to_string()),
+            iceberg_warehouse: Some("s3://trace-bucket/warehouse".to_string()),
+            ..parquet_config()
+        };
+        db.setup_iceberg_views(&config)
+            .expect("register Iceberg views");
+
+        let result = db
+            .execute_query(&format!("SELECT * FROM {}", db.assets_table_sql(&config)))
+            .expect("resolve configured trace.assets relation");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], "taboola:headline:fixture");
+        assert_eq!(result.rows[0][1], "taboola");
+        assert_eq!(result.rows[0][2], "headline");
+
+        let compatibility_rows: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM iceberg_assets", [], |row| row.get(0))
+            .expect("resolve compatibility Iceberg assets view");
+        assert_eq!(compatibility_rows, 1);
     }
 
     #[test]
