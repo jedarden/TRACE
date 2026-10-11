@@ -40,12 +40,12 @@ WITH session_events AS (
         COUNT(*) FILTER (WHERE type = 'dwell') AS dwells,
         -- Depth calculation
         COUNT(DISTINCT url) AS unique_pages,
-        -- Conversion indicator (customize this logic)
+        -- Capture explicit conversions here; depth-based conversions are
+        -- applied after this aggregation so the unique_pages alias is bound.
         MAX(CASE
             WHEN type = 'conversion' THEN 1
-            WHEN unique_pages >= 3 THEN 1  -- Depth-based conversion
             ELSE 0
-        END) AS converted
+        END) AS has_conversion
     FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
@@ -54,6 +54,15 @@ WITH session_events AS (
         AND {{ts_partition_filter}}
         AND session_id IS NOT NULL
     GROUP BY session_id
+),
+session_events_with_conversion AS (
+    SELECT
+        *,
+        CASE
+            WHEN has_conversion = 1 OR unique_pages >= 3 THEN 1
+            ELSE 0
+        END AS converted
+    FROM session_events
 ),
 funnel_stages AS (
     SELECT
@@ -74,7 +83,7 @@ funnel_stages AS (
         END) AS engaged,
         -- Stage 5: Converted
         SUM(CASE WHEN converted = 1 THEN 1 ELSE 0 END) AS conversions
-    FROM session_events
+    FROM session_events_with_conversion
     WHERE campaign_id IS NOT NULL
     GROUP BY 1, 2
 )
@@ -119,9 +128,8 @@ WITH session_creative AS (
         COUNT(DISTINCT url) AS unique_pages,
         MAX(CASE
             WHEN type = 'conversion' THEN 1
-            WHEN unique_pages >= 3 THEN 1
             ELSE 0
-        END) AS converted
+        END) AS has_conversion
     FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
@@ -131,6 +139,15 @@ WITH session_creative AS (
         AND session_id IS NOT NULL
         AND creative_id IS NOT NULL
     GROUP BY session_id, creative_id, headline, network
+),
+session_creative_with_conversion AS (
+    SELECT
+        *,
+        CASE
+            WHEN has_conversion = 1 OR unique_pages >= 3 THEN 1
+            ELSE 0
+        END AS converted
+    FROM session_creative
 ),
 creative_funnel AS (
     SELECT
@@ -142,8 +159,8 @@ creative_funnel AS (
         SUM(CASE WHEN scrolls > 0 THEN 1 ELSE 0 END) AS scrolled,
         SUM(CASE WHEN unique_pages >= 2 THEN 1 ELSE 0 END) AS multi_page,
         SUM(CASE WHEN converted = 1 THEN 1 ELSE 0 END) AS conversions,
-        AVG(EXTRACT(EPOCH FROM (MAX(ts) - MIN(ts)))) AS avg_duration_seconds
-    FROM session_creative
+        AVG(EXTRACT(EPOCH FROM (session_end - session_start))) AS avg_duration_seconds
+    FROM session_creative_with_conversion
     GROUP BY 1, 2, 3
 )
 SELECT
@@ -172,9 +189,11 @@ WITH user_journey AS (
         session_id,
         network,
         campaign_id,
-        -- Track event sequence to identify drop-off points
-        ARRAY_AGG(type ORDER BY ts) AS event_sequence,
-        ARRAY_AGG(url ORDER BY ts) AS url_sequence,
+        -- Retain the first event and stage-presence flags used to classify
+        -- drop-off points without materializing per-session event arrays.
+        FIRST(type ORDER BY ts) AS first_type,
+        MAX(CASE WHEN type = 'click' THEN 1 ELSE 0 END) AS has_click,
+        MAX(CASE WHEN type = 'scroll' THEN 1 ELSE 0 END) AS has_scroll,
         MIN(ts) AS first_event,
         MAX(ts) AS last_event,
         COUNT(*) AS event_count,
@@ -189,7 +208,7 @@ WITH user_journey AS (
         AND session_id IS NOT NULL
     GROUP BY session_id, network, campaign_id
 ),
-drop_off_points AS (
+drop_off_classification AS (
     SELECT
         campaign_id,
         network,
@@ -197,31 +216,56 @@ drop_off_points AS (
         -- Classify drop-off stage
         CASE
             WHEN event_count = 1 THEN 'no_engagement'
-            WHEN event_sequence[1] = 'pageview' AND NOT event_sequence ANYARRAY['click', 'scroll'] THEN 'view_only'
-            WHEN event_sequence ANYARRAY['click'] AND NOT event_sequence ANYARRAY['scroll'] THEN 'clicked_no_scroll'
-            WHEN event_sequence ANYARRAY['scroll'] AND unique_pages < 2 THEN 'single_page'
+            WHEN first_type = 'pageview' AND has_click = 0 AND has_scroll = 0 THEN 'view_only'
+            WHEN has_click = 1 AND has_scroll = 0 THEN 'clicked_no_scroll'
+            WHEN has_scroll = 1 AND unique_pages < 2 THEN 'single_page'
             WHEN unique_pages >= 2 AND converted = 0 THEN 'multi_page_no_convert'
             WHEN converted = 1 THEN 'converted'
             ELSE 'other'
         END AS drop_stage,
+        event_count,
+        unique_pages
+    FROM user_journey
+    WHERE campaign_id IS NOT NULL
+),
+drop_off_points AS (
+    SELECT
+        campaign_id,
+        network,
+        converted,
+        drop_stage,
         COUNT(*) AS sessions,
         ROUND(AVG(event_count), 1) AS avg_events,
         ROUND(AVG(unique_pages), 1) AS avg_pages
-    FROM user_journey
-    WHERE campaign_id IS NOT NULL
-    GROUP BY 1, 2, 3, 4
+    FROM drop_off_classification
+    GROUP BY campaign_id, network, converted, drop_stage
+),
+eligible_drop_off_points AS (
+    SELECT *
+    FROM drop_off_points
+    WHERE sessions >= 5
+),
+drop_off_totals AS (
+    SELECT
+        campaign_id,
+        network,
+        SUM(sessions) AS total_sessions
+    FROM eligible_drop_off_points
+    GROUP BY campaign_id, network
 )
 SELECT
-    campaign_id,
-    network,
-    drop_stage,
-    sessions,
-    ROUND(100.0 * sessions / SUM(sessions) OVER (PARTITION BY campaign_id, network), 1) AS stage_pct,
-    avg_events,
-    avg_pages
-FROM drop_off_points
-WHERE sessions >= 5
-ORDER BY campaign_id, network,
+    drop_points.campaign_id,
+    drop_points.network,
+    drop_points.drop_stage,
+    drop_points.sessions,
+    ROUND(100.0 * drop_points.sessions / NULLIF(drop_off_totals.total_sessions, 0), 1) AS stage_pct,
+    drop_points.avg_events,
+    drop_points.avg_pages
+FROM eligible_drop_off_points AS drop_points
+JOIN drop_off_totals
+    ON drop_points.campaign_id IS NOT DISTINCT FROM drop_off_totals.campaign_id
+    AND drop_points.network IS NOT DISTINCT FROM drop_off_totals.network
+ORDER BY drop_points.campaign_id, drop_points.network,
     CASE drop_stage
         WHEN 'no_engagement' THEN 1
         WHEN 'view_only' THEN 2
@@ -310,7 +354,7 @@ SELECT
     network,
     COUNT(DISTINCT session_id) AS total_sessions,
     -- Funnel stages
-    COUNT(DISTINCT session_id FILTER (
+    COUNT(DISTINCT session_id) FILTER (
         WHERE EXISTS (
             SELECT 1 FROM {{events_table}} e2
             WHERE e2.session_id = {{events_table}}.session_id
@@ -319,8 +363,8 @@ SELECT
                 AND {{ts_partition_filter}}
                 AND e2.type = 'click'
         )
-    )) AS sessions_with_click,
-    COUNT(DISTINCT session_id FILTER (
+    ) AS sessions_with_click,
+    COUNT(DISTINCT session_id) FILTER (
         WHERE EXISTS (
             SELECT 1 FROM {{events_table}} e2
             WHERE e2.session_id = {{events_table}}.session_id
@@ -329,9 +373,9 @@ SELECT
                 AND {{ts_partition_filter}}
                 AND e2.type = 'scroll'
         )
-    )) AS sessions_with_scroll,
+    ) AS sessions_with_scroll,
     -- Conversion count
-    COUNT(DISTINCT session_id FILTER (
+    COUNT(DISTINCT session_id) FILTER (
         WHERE EXISTS (
             SELECT 1 FROM {{events_table}} e2
             WHERE e2.session_id = {{events_table}}.session_id
@@ -347,10 +391,10 @@ SELECT
                     AND {{ts_partition_filter}}
             ) >= 3)
         )
-    )) AS conversions,
+    ) AS conversions,
     -- Daily conversion rate
     ROUND(
-        100.0 * COUNT(DISTINCT session_id FILTER (
+        100.0 * COUNT(DISTINCT session_id) FILTER (
             WHERE EXISTS (
                 SELECT 1 FROM {{events_table}} e2
                 WHERE e2.session_id = {{events_table}}.session_id
@@ -366,7 +410,7 @@ SELECT
                         AND {{ts_partition_filter}}
                 ) >= 3)
             )
-        )) / NULLIF(COUNT(DISTINCT session_id), 0),
+        ) / NULLIF(COUNT(DISTINCT session_id), 0),
         2
     ) AS daily_conversion_rate
 FROM {{events_table}}

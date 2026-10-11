@@ -30,9 +30,9 @@ sessions AS (
         COUNT(*) AS event_count,
         COUNT(DISTINCT url) AS unique_pages,
         EXTRACT(EPOCH FROM (MAX(ts) - MIN(ts)))::BIGINT AS duration_seconds,
-        FIRST_VALUE(url) OVER (PARTITION BY user_id, session_seq ORDER BY ts) AS landing_page,
-        FIRST_VALUE(network) OVER (PARTITION BY user_id, session_seq ORDER BY ts) AS source_network,
-        FIRST_VALUE(campaign_id) OVER (PARTITION BY user_id, session_seq ORDER BY ts) AS campaign,
+        FIRST(url ORDER BY ts) AS landing_page,
+        FIRST(network ORDER BY ts) AS source_network,
+        FIRST(campaign_id ORDER BY ts) AS campaign,
         ARRAY_AGG(DISTINCT type ORDER BY type) AS event_types
     FROM session_markers
     GROUP BY user_id, session_seq
