@@ -727,32 +727,6 @@ mod partition_pruning_tests {
         }
     }
 
-    /// Write one asset fixture file per Hive partition. The syncer includes
-    /// network/type in each row as well as in the directory names, matching
-    /// the production asset Parquet layout.
-    fn write_asset_partitions(root: &Path) {
-        for (network, asset_type) in [
-            ("taboola", "headline"),
-            ("taboola", "image"),
-            ("mgid", "headline"),
-            ("mgid", "image"),
-        ] {
-            let dir = root.join(format!("assets/network={}/type={}", network, asset_type));
-            fs::create_dir_all(&dir).expect("create asset partition dir");
-            let path = dir.join("part-00000.parquet");
-            let conn = Connection::open_in_memory().expect("open scratch connection");
-            conn.execute_batch(&format!(
-                "COPY (SELECT '{network}:{asset_type}' AS asset_id,
-                              '{network}' AS network,
-                              '{asset_type}' AS type,
-                              'fixture content' AS content)
-                 TO '{}' (FORMAT parquet);",
-                path.display()
-            ))
-            .expect("write asset partition file");
-        }
-    }
-
     /// `TABLE_SCAN -> Total Files Read` from EXPLAIN ANALYZE of `sql`.
     fn files_scanned(conn: &Connection, sql: &str) -> usize {
         let mut stmt = conn
@@ -910,8 +884,7 @@ mod partition_pruning_tests {
 
     #[test]
     fn test_asset_partition_predicates_prune_files_scanned() {
-        let root = scratch_dir("assets");
-        write_asset_partitions(&root);
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
 
         let conn = Connection::open_in_memory().expect("open connection");
         let db = DuckDBClient { conn };
@@ -987,8 +960,6 @@ mod partition_pruning_tests {
             .query_row("SELECT COUNT(*) FROM parquet_assets", [], |row| row.get(0))
             .expect("resolve compatibility assets view");
         assert_eq!(compatibility_rows, 4);
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
