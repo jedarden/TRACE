@@ -1124,22 +1124,84 @@ mod partition_pruning_tests {
 
         let db = DuckDBClient { conn };
         let config = parquet_config();
-        let params = ReportParams {
-            s3_path: None,
-            start_date: Some("2026-09-01".to_string()),
-            end_date: Some("2026-09-03".to_string()),
-        };
-        for report in crate::queries::list_reports() {
-            let sql = render_template_with_client(&report.sql_template, &params, &db, &config);
-            assert!(
-                !sql.contains("{{"),
-                "report '{}' left an unrendered placeholder:\n{}",
-                report.name,
-                sql
-            );
-            db.execute_query(&sql).unwrap_or_else(|error| {
-                panic!("report '{}' failed to execute: {error}", report.name)
-            });
+        let parameter_sets = [
+            ("default", ReportParams::default()),
+            (
+                "start-only",
+                ReportParams {
+                    s3_path: None,
+                    start_date: Some("2026-09-01".to_string()),
+                    end_date: None,
+                },
+            ),
+            (
+                "end-only",
+                ReportParams {
+                    s3_path: None,
+                    start_date: None,
+                    end_date: Some("2026-10-01".to_string()),
+                },
+            ),
+            (
+                "explicit",
+                ReportParams {
+                    s3_path: None,
+                    start_date: Some("2026-09-01".to_string()),
+                    end_date: Some("2026-09-03".to_string()),
+                },
+            ),
+        ];
+        for (window, params) in &parameter_sets {
+            for report in crate::queries::list_reports() {
+                let sql = render_template_with_client(&report.sql_template, params, &db, &config);
+                assert!(
+                    !sql.contains("{{"),
+                    "report '{}' left an unrendered placeholder for {window} dates:\n{}",
+                    report.name,
+                    sql
+                );
+                if *window == "default" && report.name == "daily_summary" {
+                    assert!(
+                        sql.contains("ts >= CAST(CURRENT_DATE - INTERVAL '30 days' AS TIMESTAMP)"),
+                        "default timestamp lower bound must remain an SQL expression:\n{}",
+                        sql
+                    );
+                    assert!(
+                        sql.contains("ts_day >= CAST(CURRENT_DATE - INTERVAL '30 days' AS DATE)"),
+                        "default partition lower bound must match the timestamp range:\n{}",
+                        sql
+                    );
+                    assert!(
+                        sql.contains("ts < CAST(CURRENT_DATE AS TIMESTAMP)")
+                            && sql.contains("ts_day < CAST(CURRENT_DATE AS DATE)"),
+                        "default upper bounds must match the timestamp range:\n{}",
+                        sql
+                    );
+                }
+                if *window == "default" && report.name == "daily_sessions" {
+                    assert!(
+                        sql.contains(
+                            "started_at >= CAST(CURRENT_DATE - INTERVAL '30 days' AS TIMESTAMP)"
+                        ) && sql.contains(
+                            "started_at_day >= CAST(CURRENT_DATE - INTERVAL '30 days' AS DATE)"
+                        ),
+                        "default session and started_at_day lower bounds must match:\n{}",
+                        sql
+                    );
+                    assert!(
+                        sql.contains("started_at < CAST(CURRENT_DATE AS TIMESTAMP)")
+                            && sql.contains("started_at_day < CAST(CURRENT_DATE AS DATE)"),
+                        "default session and started_at_day upper bounds must match:\n{}",
+                        sql
+                    );
+                }
+                db.execute_query(&sql).unwrap_or_else(|error| {
+                    panic!(
+                        "report '{}' failed to execute with {window} dates: {error}",
+                        report.name
+                    )
+                });
+            }
         }
     }
 

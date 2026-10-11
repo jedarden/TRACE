@@ -329,11 +329,23 @@ pub fn partition_predicate(column: Option<&str>, start: &str, end: &str) -> Stri
 /// by the default rolling window. Report templates splice both forms into
 /// the same partition predicate.
 fn partition_date_operand(value: &str) -> String {
-    if value.starts_with("CURRENT_DATE") || value.starts_with("DATE_ADD(") {
+    if is_sql_date_expression(value) {
         format!("CAST({} AS DATE)", value)
     } else {
         format!("'{}'::DATE", value)
     }
+}
+
+fn timestamp_date_operand(value: &str) -> String {
+    if is_sql_date_expression(value) {
+        format!("CAST({} AS TIMESTAMP)", value)
+    } else {
+        format!("'{}'::TIMESTAMP", value)
+    }
+}
+
+fn is_sql_date_expression(value: &str) -> bool {
+    value.starts_with("CURRENT_DATE") || value.starts_with("DATE_ADD(")
 }
 
 /// Lower-bound-only variant of [`partition_predicate`] for templates with a
@@ -389,7 +401,9 @@ pub fn render_template_with_client(
     sql = sql.replace("{{sessions_table}}", &sessions_table);
 
     // Replace date parameters, keeping the partition filters in sync with
-    // the timestamp ranges they mirror
+    // the timestamp ranges they mirror. Explicit dates become SQL literals;
+    // default rolling-window expressions must remain executable SQL instead
+    // of being nested inside a quoted timestamp literal.
     let start = params
         .start_date
         .clone()
@@ -407,6 +421,12 @@ pub fn render_template_with_client(
         "{{sessions_partition_filter}}",
         &partition_predicate(db.sessions_partition_column(config), &start, &end),
     );
+
+    sql = sql.replace(
+        "'{{start_date}}'::TIMESTAMP",
+        &timestamp_date_operand(&start),
+    );
+    sql = sql.replace("'{{end_date}}'::TIMESTAMP", &timestamp_date_operand(&end));
 
     // Expression-bound form for templates with fixed rolling windows:
     // {{ts_partition_filter:CURRENT_DATE - INTERVAL '7 days'}} filters the
