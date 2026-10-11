@@ -248,7 +248,17 @@ fn initialize_views(conn: &Connection, source: &str) {
 }
 
 fn manifest_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let current = std::env::current_dir().expect("read test working directory");
+
+    // Resolve from the invocation directory instead of baking a temporary
+    // git-archive path into a binary under the shared Cargo target cache.
+    if current.join("analytics/Cargo.toml").is_file() {
+        current.join("analytics")
+    } else if current.join("Cargo.toml").is_file() {
+        current
+    } else {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
 }
 
 fn strip_block_comments(sql: &str) -> String {
