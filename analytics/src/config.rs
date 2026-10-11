@@ -21,8 +21,9 @@ pub struct Config {
     /// TRACE_COMPAT_EVENT_VIEWS=1 when the events prefix holds files from
     /// more than one flusher generation
     /// (docs/analytics/event_schema_versions.md). Off by default — standard
-    /// reports use the Hive-partitioned `parquet_ad_events` view (`ts_day`),
-    /// while compatibility views derive `dt` and give up file pruning.
+    /// report queries always use the Hive-partitioned `parquet_ad_events`
+    /// view (`ts_day`); compatibility views derive `dt` and remain available
+    /// for direct queries that need mixed-generation raw events.
     pub compat_event_views: bool,
 }
 

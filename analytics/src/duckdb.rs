@@ -250,8 +250,9 @@ impl DuckDBClient {
     /// The two raw event views have one opt-in exception: with
     /// `compat_event_views` they come from `crate::events_compat` instead,
     /// trading day-directory pruning for the ability to span flusher
-    /// generations whose schemas differ. Reports use the canonical compacted
-    /// ad_events view below unless this compatibility mode is enabled.
+    /// generations whose schemas differ. Report templates always use the
+    /// canonical compacted ad_events view below, since its physical ts_day
+    /// partition is required for report file pruning.
     pub fn setup_parquet_views(&self, s3_path: &str, config: &Config) -> Result<()> {
         if config.compat_event_views {
             // Opt-in (TRACE_COMPAT_EVENT_VIEWS=1): the events prefix spans
@@ -337,6 +338,18 @@ impl DuckDBClient {
         }
     }
 
+    /// Get the event relation used by report templates. Reports read the
+    /// canonical compacted dataset in Parquet mode even when the optional raw
+    /// event compatibility views are enabled: those views derive `dt` and
+    /// cannot prune files by the physical `ts_day` partition.
+    pub fn report_events_table_sql(&self, config: &Config) -> String {
+        if config.is_iceberg_enabled() {
+            "iceberg_ad_events".to_string()
+        } else {
+            "parquet_ad_events".to_string()
+        }
+    }
+
     /// Get the SQL fragment for querying compacted events. Standard Parquet
     /// mode and Iceberg mode read canonical ad_events; the compatibility mode
     /// uses the raw compacted view to preserve its mixed-generation schema.
@@ -410,6 +423,17 @@ impl DuckDBClient {
     /// where the hidden `DAYS(ts)` transform lets a `ts` range prune files.
     pub fn events_partition_column(&self, config: &Config) -> Option<&'static str> {
         if config.is_iceberg_enabled() || config.compat_event_views {
+            None
+        } else {
+            Some("ts_day")
+        }
+    }
+
+    /// Physical event partition used by report templates. Unlike the
+    /// compatibility view selector above, report execution always reads the
+    /// canonical `ts_day`-partitioned relation in Parquet mode.
+    pub fn report_events_partition_column(&self, config: &Config) -> Option<&'static str> {
+        if config.is_iceberg_enabled() {
             None
         } else {
             Some("ts_day")
@@ -1391,7 +1415,19 @@ mod partition_pruning_tests {
         );
         assert!(sql.contains("AND TRUE"), "iceberg rendering:\n{}", sql);
         assert!(sql.contains("iceberg_sessions"));
+        assert!(sql.contains("started_at >= '2026-09-02'::TIMESTAMP"));
         assert!(!sql.contains("{{"), "unrendered placeholder:\n{}", sql);
+
+        let event_sql = crate::queries::render_template_with_client(
+            include_str!("../queries/daily_summary.sql"),
+            &params,
+            &db,
+            &config,
+        );
+        assert!(event_sql.contains("FROM iceberg_ad_events"));
+        assert!(event_sql.contains("ts >= '2026-09-02'::TIMESTAMP"));
+        assert!(event_sql.contains("AND TRUE"));
+        assert!(!event_sql.contains("parquet_ad_events"));
     }
 
     #[test]
@@ -1478,6 +1514,76 @@ mod partition_pruning_tests {
                 executable_partition_filters, expected_filter_count,
                 "report '{}' must render one {} predicate per table scan:\n{}",
                 report.name, expected_column, sql
+            );
+        }
+    }
+
+    #[test]
+    fn test_compat_mode_reports_keep_physical_event_pruning() {
+        let mut config = parquet_config();
+        config.compat_event_views = true;
+        let db = DuckDBClient {
+            conn: Connection::open_in_memory().expect("open connection"),
+        };
+
+        // The raw compatibility source remains available to direct queries,
+        // but report templates use the canonical Hive-partitioned relation.
+        assert_eq!(db.events_table_sql(&config), "parquet_events");
+        assert_eq!(db.events_partition_column(&config), None);
+        assert_eq!(db.report_events_table_sql(&config), "parquet_ad_events");
+        assert_eq!(db.report_events_partition_column(&config), Some("ts_day"));
+
+        let params = ReportParams {
+            s3_path: None,
+            start_date: Some("2026-09-02".to_string()),
+            end_date: Some("2026-09-03".to_string()),
+        };
+        for report in crate::queries::list_reports() {
+            let executable_template = report
+                .sql_template
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let event_scans = executable_template.matches("FROM {{events_table}}").count()
+                + executable_template.matches("JOIN {{events_table}}").count();
+            let session_scans = executable_template
+                .matches("FROM {{sessions_table}}")
+                .count()
+                + executable_template
+                    .matches("JOIN {{sessions_table}}")
+                    .count();
+            let sql = render_template_with_client(&report.sql_template, &params, &db, &config);
+            assert!(
+                !sql.contains("{{"),
+                "report '{}' left an unrendered compatibility-mode placeholder:\n{}",
+                report.name,
+                sql
+            );
+
+            let executable_sql = sql
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let event_partition_filters = executable_sql.matches("ts_day >=").count();
+            let session_partition_filters = executable_sql.matches("started_at_day >=").count();
+            assert_eq!(
+                event_partition_filters, event_scans,
+                "report '{}' must use the physical ts_day filter for each event scan:\n{}",
+                report.name, sql
+            );
+            assert_eq!(
+                session_partition_filters, session_scans,
+                "report '{}' must use the physical started_at_day filter for each session scan:\n{}",
+                report.name, sql
+            );
+            assert!(
+                !executable_sql.contains("FROM parquet_events")
+                    && !executable_sql.contains("JOIN parquet_events"),
+                "report '{}' must not use the derived-day compatibility view:\n{}",
+                report.name,
+                sql
             );
         }
     }

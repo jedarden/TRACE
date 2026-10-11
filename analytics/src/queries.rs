@@ -391,7 +391,7 @@ pub fn render_template_with_client(
     let mut sql = template.to_string();
 
     // Replace table references with appropriate Iceberg or Parquet views
-    let events_table = db.events_table_sql(config);
+    let events_table = db.report_events_table_sql(config);
     sql = sql.replace("{{events_table}}", &events_table);
 
     let assets_table = db.assets_table_sql(config);
@@ -415,7 +415,7 @@ pub fn render_template_with_client(
 
     sql = sql.replace(
         "{{ts_partition_filter}}",
-        &partition_predicate(db.events_partition_column(config), &start, &end),
+        &partition_predicate(db.report_events_partition_column(config), &start, &end),
     );
     sql = sql.replace(
         "{{sessions_partition_filter}}",
@@ -432,7 +432,7 @@ pub fn render_template_with_client(
     // {{ts_partition_filter:CURRENT_DATE - INTERVAL '7 days'}} filters the
     // partition column from that expression onward (TRUE under Iceberg, like
     // the plain form)
-    let events_col = db.events_partition_column(config);
+    let events_col = db.report_events_partition_column(config);
     sql = regex_replace_all(&sql, "{{ts_partition_filter:", |expr| {
         partition_lower_bound_predicate(events_col, expr)
     });
