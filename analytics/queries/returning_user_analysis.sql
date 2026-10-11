@@ -32,7 +32,7 @@ user_segments AS (
     FROM user_sessions_summary
 )
 SELECT
-    s.user_segment,
+    g.user_segment,
     COUNT(*) AS user_count,
     SUM(s.total_sessions) AS total_sessions,
     SUM(s.total_events) AS total_events,
@@ -41,9 +41,9 @@ SELECT
     AVG(s.total_unique_pages) AS avg_unique_pages
 FROM user_sessions_summary s
 INNER JOIN user_segments g ON s.user_id = g.user_id
-GROUP BY s.user_segment
+GROUP BY g.user_segment
 ORDER BY
-    CASE s.user_segment
+    CASE g.user_segment
         WHEN 'new' THEN 1
         WHEN 'returning_2' THEN 2
         WHEN 'returning_3_5' THEN 3

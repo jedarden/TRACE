@@ -44,10 +44,10 @@ creative_daily AS (
         COUNT(*) FILTER (WHERE type = 'pageview') AS views,
         COUNT(*) FILTER (WHERE type = 'click') AS clicks
     FROM {{events_table}}
-    WHERE ts >= CURRENT_DATE - INTERVAL '60 days'
+    WHERE ts >= DATE_ADD(CURRENT_DATE, INTERVAL '-60 days')
 
     -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
-        AND {{ts_partition_filter:CURRENT_DATE - INTERVAL '60 days'}}
+        AND {{ts_partition_filter:DATE_ADD(CURRENT_DATE, INTERVAL '-60 days')}}
         AND (
             creative_id IS NOT NULL
             OR params->>'tb_headline' IS NOT NULL
@@ -137,14 +137,24 @@ rolling_ctr AS (
 -- ----------------------------------------------------------------------------
 -- Step 5: Find peak CTR and days since peak for each creative
 -- ----------------------------------------------------------------------------
-peak_stats AS (
+creative_peaks AS (
     SELECT
         creative_key,
-        MAX(ctr_7d_avg) AS peak_ctr,
-        MIN(date) FILTER (WHERE ctr_7d_avg = MAX(ctr_7d_avg) OVER (PARTITION BY creative_key)) AS peak_date
+        MAX(ctr_7d_avg) AS peak_ctr
     FROM rolling_ctr
     WHERE ctr_7d_avg IS NOT NULL
     GROUP BY creative_key
+),
+peak_stats AS (
+    SELECT
+        peaks.creative_key,
+        peaks.peak_ctr,
+        MIN(metrics.date) AS peak_date
+    FROM rolling_ctr AS metrics
+    INNER JOIN creative_peaks AS peaks
+        ON metrics.creative_key = peaks.creative_key
+        AND metrics.ctr_7d_avg = peaks.peak_ctr
+    GROUP BY peaks.creative_key, peaks.peak_ctr
 ),
 
 -- ----------------------------------------------------------------------------
@@ -166,10 +176,10 @@ window_comparison AS (
     FROM rolling_ctr r1
     LEFT JOIN rolling_ctr r2
         ON r1.creative_key = r2.creative_key
-        AND r2.date = r1.date - INTERVAL '3 days'
+        AND r2.date = DATE_ADD(r1.date, INTERVAL '-3 days')
     INNER JOIN peak_stats p
         ON r1.creative_key = p.creative_key
-    WHERE r1.date = CURRENT_DATE - INTERVAL '1 day'  -- Yesterday's complete data
+    WHERE r1.date = CAST(DATE_ADD(CURRENT_DATE, INTERVAL '-1 day') AS DATE)  -- Yesterday's complete data
         AND r1.ctr_7d_avg IS NOT NULL
 ),
 
@@ -237,9 +247,9 @@ SELECT
     -- Otherwise: no immediate action needed
     CASE
         WHEN decline_pct > 20 THEN CURRENT_DATE
-        WHEN fatigue_score > 0.5 THEN CURRENT_DATE + INTERVAL '7 days'
-        WHEN fatigue_score > 0.3 THEN CURRENT_DATE + INTERVAL '14 days'
-        WHEN fatigue_score > 0.15 THEN CURRENT_DATE + INTERVAL '30 days'
+        WHEN fatigue_score > 0.5 THEN DATE_ADD(CURRENT_DATE, INTERVAL '7 days')
+        WHEN fatigue_score > 0.3 THEN DATE_ADD(CURRENT_DATE, INTERVAL '14 days')
+        WHEN fatigue_score > 0.15 THEN DATE_ADD(CURRENT_DATE, INTERVAL '30 days')
         ELSE NULL
     END AS recommended_rotation_date,
     -- Action recommendation
@@ -255,18 +265,3 @@ WHERE current_ctr_7d IS NOT NULL
     AND prior_ctr_7d IS NOT NULL
 ORDER BY fatigue_score DESC, decline_pct DESC
 LIMIT 50;
-
--- ----------------------------------------------------------------------------
--- Summary Statistics (all creatives)
--- ----------------------------------------------------------------------------
--- Run separately for overall fatigue health check
-
-SELECT
-    COUNT(DISTINCT creative_key) AS total_creatives_tracked,
-    COUNT(DISTINCT creative_key) FILTER (WHERE decline_pct > 20) AS urgent_fatigue_count,
-    COUNT(DISTINCT creative_key) FILTER (WHERE fatigue_score > 0.5) AS high_fatigue_count,
-    COUNT(DISTINCT creative_key) FILTER (WHERE fatigue_score > 0.3 AND fatigue_score <= 0.5) AS medium_fatigue_count,
-    ROUND(AVG(fatigue_score), 2) AS avg_fatigue_score,
-    ROUND(AVG(decline_pct), 1) AS avg_decline_pct,
-    ROUND(AVG(days_since_peak), 0) AS avg_days_since_peak
-FROM fatigue_metrics;

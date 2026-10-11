@@ -329,7 +329,7 @@ pub fn partition_predicate(column: Option<&str>, start: &str, end: &str) -> Stri
 /// by the default rolling window. Report templates splice both forms into
 /// the same partition predicate.
 fn partition_date_operand(value: &str) -> String {
-    if value == "CURRENT_DATE" || value.starts_with("CURRENT_DATE ") {
+    if value.starts_with("CURRENT_DATE") || value.starts_with("DATE_ADD(") {
         format!("CAST({} AS DATE)", value)
     } else {
         format!("'{}'::DATE", value)

@@ -5,10 +5,10 @@ WITH campaign_activity AS (
         MAX(ts) AS last_event,
         COUNT(*) AS total_events
     FROM {{events_table}}
-    WHERE ts >= CURRENT_DATE - INTERVAL '7 days'
+    WHERE ts >= DATE_ADD(CURRENT_DATE, INTERVAL '-7 days')
 
     -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
-        AND {{ts_partition_filter:CURRENT_DATE - INTERVAL '7 days'}}
+        AND {{ts_partition_filter:DATE_ADD(CURRENT_DATE, INTERVAL '-7 days')}}
     GROUP BY 1
 )
 SELECT
@@ -17,5 +17,5 @@ SELECT
     EXTRACT(DAY FROM CURRENT_TIMESTAMP - last_event) AS days_since_last_event,
     total_events
 FROM campaign_activity
-WHERE last_event < CURRENT_TIMESTAMP - INTERVAL '24 hours'
+WHERE last_event < DATE_ADD(CURRENT_TIMESTAMP, INTERVAL '-24 hours')
 ORDER BY 2 ASC;

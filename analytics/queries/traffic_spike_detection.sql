@@ -1,24 +1,30 @@
 -- Detect unusual traffic spikes
-WITH hourly_baseline AS (
+WITH hourly_metrics AS (
     SELECT
         DATE_TRUNC('hour', ts) AS hour,
-        COUNT(*) AS events,
-        AVG(COUNT(*)) OVER (
-            PARTITION BY EXTRACT(HOUR FROM ts)
-            ORDER BY DATE_TRUNC('day', ts)
-            ROWS BETWEEN 7 PRECEDING AND 1 PRECEDING
-        ) AS baseline_avg,
-        STDDEV(COUNT(*)) OVER (
-            PARTITION BY EXTRACT(HOUR FROM ts)
-            ORDER BY DATE_TRUNC('day', ts)
-            ROWS BETWEEN 7 PRECEDING AND 1 PRECEDING
-        ) AS baseline_stddev
+        COUNT(*) AS events
     FROM {{events_table}}
-    WHERE ts >= CURRENT_DATE - INTERVAL '14 days'
+    WHERE ts >= DATE_ADD(CURRENT_DATE, INTERVAL '-14 days')
 
     -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
-        AND {{ts_partition_filter:CURRENT_DATE - INTERVAL '14 days'}}
+        AND {{ts_partition_filter:DATE_ADD(CURRENT_DATE, INTERVAL '-14 days')}}
     GROUP BY 1
+),
+hourly_baseline AS (
+    SELECT
+        hour,
+        events,
+        AVG(events) OVER (
+            PARTITION BY EXTRACT(HOUR FROM hour)
+            ORDER BY DATE_TRUNC('day', hour)
+            ROWS BETWEEN 7 PRECEDING AND 1 PRECEDING
+        ) AS baseline_avg,
+        STDDEV(events) OVER (
+            PARTITION BY EXTRACT(HOUR FROM hour)
+            ORDER BY DATE_TRUNC('day', hour)
+            ROWS BETWEEN 7 PRECEDING AND 1 PRECEDING
+        ) AS baseline_stddev
+    FROM hourly_metrics
 )
 SELECT
     hour,

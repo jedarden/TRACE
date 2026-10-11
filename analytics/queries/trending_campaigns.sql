@@ -5,17 +5,17 @@ WITH daily_metrics AS (
         params->>'utm_campaign' AS campaign,
         COUNT(*) FILTER (WHERE type = 'click') AS clicks
     FROM {{events_table}}
-    WHERE ts >= CURRENT_DATE - INTERVAL '14 days'
+    WHERE ts >= DATE_ADD(CURRENT_DATE, INTERVAL '-14 days')
 
     -- partition-column conjunct: prunes day directories on the Parquet read path (docs/analytics/iceberg_partition_pruning.md)
-        AND {{ts_partition_filter:CURRENT_DATE - INTERVAL '14 days'}}
+        AND {{ts_partition_filter:DATE_ADD(CURRENT_DATE, INTERVAL '-14 days')}}
     GROUP BY 1, 2
 ),
 trends AS (
     SELECT
         campaign,
-        AVG(clicks) FILTER (WHERE date >= CURRENT_DATE - INTERVAL '7 days') AS recent_clicks,
-        AVG(clicks) FILTER (WHERE date < CURRENT_DATE - INTERVAL '7 days') AS prior_clicks
+        AVG(clicks) FILTER (WHERE date >= CAST(DATE_ADD(CURRENT_DATE, INTERVAL '-7 days') AS DATE)) AS recent_clicks,
+        AVG(clicks) FILTER (WHERE date < CAST(DATE_ADD(CURRENT_DATE, INTERVAL '-7 days') AS DATE)) AS prior_clicks
     FROM daily_metrics
     GROUP BY 1
 )

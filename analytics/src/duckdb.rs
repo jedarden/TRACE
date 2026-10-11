@@ -1000,6 +1000,64 @@ mod partition_pruning_tests {
     }
 
     #[test]
+    fn test_registered_report_templates_execute_after_rendering() {
+        let conn = Connection::open_in_memory().expect("open connection");
+        conn.execute_batch(
+            "CREATE TABLE parquet_ad_events (
+                 ts TIMESTAMP, ts_day DATE, ip VARCHAR, ua VARCHAR, url VARCHAR,
+                 type VARCHAR, session_id VARCHAR, user_id VARCHAR, cookie_id VARCHAR,
+                 network VARCHAR, campaign_id VARCHAR, campaign_name VARCHAR,
+                 creative_id VARCHAR, headline VARCHAR, image_id VARCHAR, item_id VARCHAR,
+                 params MAP(VARCHAR, VARCHAR), referrer VARCHAR, referrer_network VARCHAR,
+                 attribution_campaign_id VARCHAR, attribution_creative_id VARCHAR,
+                 attribution_touches INTEGER, attribution_days_to_convert INTEGER,
+                 device_type VARCHAR, device_os VARCHAR, device_browser VARCHAR,
+                 scroll_depth_pct INTEGER, scroll_time_ms BIGINT, dwell_time_ms BIGINT,
+                 dwell_visible_pct INTEGER, viewport_width INTEGER, viewport_height INTEGER,
+                 quality_score DOUBLE, bot_probability DOUBLE, fraud_score DOUBLE,
+                 is_valid BOOLEAN, is_verified BOOLEAN, validation_reason VARCHAR,
+                 enriched_at TIMESTAMP, enrichment_version VARCHAR
+             );
+             CREATE TABLE parquet_sessions (
+                 session_id VARCHAR, user_id VARCHAR, started_at TIMESTAMP,
+                 started_at_day DATE, ended_at TIMESTAMP, pageviews INTEGER,
+                 clicks INTEGER, scrolls INTEGER, dwells INTEGER, event_count INTEGER,
+                 entry_url VARCHAR, exit_url VARCHAR, network VARCHAR,
+                 campaign_id VARCHAR, campaign_name VARCHAR, creative_id VARCHAR,
+                 headline VARCHAR, converted BOOLEAN, conversion_value DOUBLE,
+                 device_type VARCHAR, device_os VARCHAR, referrer VARCHAR,
+                 duration_seconds INTEGER, bounce BOOLEAN, depth INTEGER
+             );
+             CREATE SCHEMA trace;
+             CREATE TABLE trace.assets (
+                 asset_id VARCHAR, network VARCHAR, type VARCHAR, content VARCHAR,
+                 creative_id VARCHAR, campaign_id VARCHAR, campaign_name VARCHAR
+             );",
+        )
+        .expect("create report fixture relations");
+
+        let db = DuckDBClient { conn };
+        let config = parquet_config();
+        let params = ReportParams {
+            s3_path: None,
+            start_date: Some("2026-09-01".to_string()),
+            end_date: Some("2026-09-03".to_string()),
+        };
+        for report in crate::queries::list_reports() {
+            let sql = render_template_with_client(&report.sql_template, &params, &db, &config);
+            assert!(
+                !sql.contains("{{"),
+                "report '{}' left an unrendered placeholder:\n{}",
+                report.name,
+                sql
+            );
+            db.execute_query(&sql).unwrap_or_else(|error| {
+                panic!("report '{}' failed to execute: {error}", report.name)
+            });
+        }
+    }
+
+    #[test]
     fn test_assets_table_sql_uses_partitioned_parquet_view() {
         let db = DuckDBClient {
             conn: Connection::open_in_memory().expect("open connection"),
