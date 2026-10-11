@@ -1616,6 +1616,24 @@ mod partition_pruning_tests {
             "rendered sessions report must read exactly 1 of 3 files"
         );
 
+        // The report's timestamp range remains as the equivalent row filter.
+        // Removing only the physical Hive conjunct must preserve its result
+        // while restoring the unfiltered three-file scan.
+        let sql_without_partition = sql
+            .lines()
+            .filter(|line| !line.contains("started_at_day >= '2026-09-02'::DATE"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let baseline = files_scanned(db.connection(), &sql_without_partition);
+        assert_eq!(
+            baseline, 3,
+            "timestamp-only sessions report must read all 3 files"
+        );
+        assert!(
+            pruned < baseline,
+            "started_at_day predicate must read fewer files than the timestamp-only baseline"
+        );
+
         // The report must also execute end to end over the materialized
         // session schema (this is what fails if the view and the DDL drift).
         db.connection()

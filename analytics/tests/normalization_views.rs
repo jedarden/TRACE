@@ -723,7 +723,89 @@ fn every_documented_view_reads_the_hive_partitioned_parquet_layout() {
         .expect("read Hive partition column in normalized_campaigns");
     assert_eq!(partition_days, 6);
 
+    // The normalized view is nested over the documented read_parquet source.
+    // An in-file timestamp range alone is the equivalent row filter but does
+    // not prune this Hive layout; the physical day conjunct must reduce the
+    // files opened by DuckDB.
+    let (day, next_day): (String, String) = conn
+        .query_row(
+            "SELECT CAST(MAX(ts_day) AS VARCHAR),
+                    CAST(MAX(ts_day) + INTERVAL '1 day' AS DATE)::VARCHAR
+             FROM normalized_campaigns",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read one fixture day for the pruning window");
+    let timestamp_filter =
+        format!("ts >= TIMESTAMP '{day} 00:00:00' AND ts < TIMESTAMP '{next_day} 00:00:00'");
+    let day_filter = format!("ts_day >= DATE '{day}' AND ts_day < DATE '{next_day}'");
+    let pruned_files = files_scanned(
+        &conn,
+        &format!(
+            "SELECT COUNT(*) FROM normalized_campaigns WHERE {timestamp_filter} AND {day_filter}"
+        ),
+    );
+    let baseline_files = files_scanned(
+        &conn,
+        &format!("SELECT COUNT(*) FROM normalized_campaigns WHERE {timestamp_filter}"),
+    );
+    assert_eq!(
+        pruned_files, 1,
+        "one day predicate should read one of six files"
+    );
+    assert_eq!(
+        baseline_files, 6,
+        "timestamp-only baseline should read all six files"
+    );
+    assert!(
+        pruned_files < baseline_files,
+        "the normalized Hive day predicate must prune files"
+    );
+
+    let pruned_rows: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM normalized_campaigns WHERE {timestamp_filter} AND {day_filter}"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .expect("count normalized rows with the physical day predicate");
+    let baseline_rows: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM normalized_campaigns WHERE {timestamp_filter}"),
+            [],
+            |row| row.get(0),
+        )
+        .expect("count normalized rows without the physical day predicate");
+    assert_eq!(
+        pruned_rows, baseline_rows,
+        "pruning must preserve query results"
+    );
+
     fs::remove_dir_all(root).expect("remove Parquet fixtures");
+}
+
+/// Return DuckDB's Parquet file count from an `EXPLAIN ANALYZE` result.
+fn files_scanned(conn: &Connection, sql: &str) -> usize {
+    let mut stmt = conn
+        .prepare(&format!("EXPLAIN ANALYZE {sql}"))
+        .expect("prepare EXPLAIN ANALYZE");
+    let plan: String = stmt
+        .query_map([], |row| row.get::<usize, String>(1))
+        .expect("query plan")
+        .map(|row| row.expect("plan row"))
+        .collect();
+    plan.lines()
+        .find_map(|line| {
+            let index = line.find("Total Files Read:")?;
+            line[index + "Total Files Read:".len()..]
+                .split_whitespace()
+                .next()?
+                .parse::<usize>()
+                .ok()
+        })
+        .unwrap_or_else(|| panic!("no 'Total Files Read' in plan:\n{plan}"))
 }
 
 fn temp_dir(label: &str) -> PathBuf {
