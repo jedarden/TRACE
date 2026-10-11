@@ -153,6 +153,14 @@ WHERE started_at >= '2026-09-03' AND started_at < '2026-09-06';
 
 ### Network-Based Queries on Assets Table
 
+The regression test `test_asset_partition_predicates_prune_files_scanned` in
+`analytics/src/duckdb.rs` builds a local Hive-partitioned fixture with one
+Parquet file for each `network`/`type` pair. `EXPLAIN ANALYZE` reads 2 of 4
+files for `network = 'taboola'`, compared with all 4 files for the unfiltered
+baseline, and the filtered query returns the two Taboola rows. This validates
+the network-pruning guidance below on the DuckDB Parquet read path; it is a
+local fixture result, not a measurement of the live Iceberg catalog.
+
 ```sql
 -- ✅ GOOD: Uses partition pruning on network
 SELECT * FROM trace.assets

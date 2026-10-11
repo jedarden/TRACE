@@ -861,6 +861,46 @@ mod partition_pruning_tests {
             all_files, 4,
             "unfiltered assets query must read all partitions"
         );
+        assert!(
+            network_only < all_files,
+            "network predicate must read fewer files than the unfiltered baseline"
+        );
+
+        let selected_rows = {
+            let mut stmt = db
+                .connection()
+                .prepare(
+                    "SELECT asset_id, network, type FROM trace.assets \
+                     WHERE network = 'taboola' ORDER BY asset_id",
+                )
+                .expect("prepare filtered assets query");
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .expect("query filtered assets")
+            .map(|row| row.expect("read filtered asset row"))
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            selected_rows,
+            vec![
+                (
+                    "taboola:headline".to_string(),
+                    "taboola".to_string(),
+                    "headline".to_string(),
+                ),
+                (
+                    "taboola:image".to_string(),
+                    "taboola".to_string(),
+                    "image".to_string(),
+                ),
+            ],
+            "network predicate must return every selected network row and no others"
+        );
 
         let compatibility_rows: i64 = db
             .connection()
