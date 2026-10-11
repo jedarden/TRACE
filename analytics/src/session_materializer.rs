@@ -111,11 +111,7 @@ pub fn default_events_source(config: &Config) -> String {
 /// columns in DDL order. `events_source` is the DuckDB relation raw events are
 /// read from (a `read_parquet(...)` call in production, a table name in
 /// tests). Gap thresholds come from the shared stitcher `SessionConfig`.
-pub fn sessionization_query(
-    day: NaiveDate,
-    events_source: &str,
-    config: &SessionConfig,
-) -> String {
+pub fn sessionization_query(day: NaiveDate, events_source: &str, config: &SessionConfig) -> String {
     let (window_start, window_end) = day_window(day);
     let max_session_seconds = config.max_session_hours * 3600;
 
@@ -250,8 +246,12 @@ pub async fn materialize_sessions(
 
     write_day_parquet(conn, day, &events_source, &local_path)?;
     let row_count = count_parquet_rows(conn, &local_path)?;
-    let bytes = std::fs::read(&local_path)
-        .with_context(|| format!("Failed to read materialized Parquet at {}", local_path.display()))?;
+    let bytes = std::fs::read(&local_path).with_context(|| {
+        format!(
+            "Failed to read materialized Parquet at {}",
+            local_path.display()
+        )
+    })?;
 
     let object_key = sessions_object_key(&config.s3_prefix, day);
     s3.put_object(&object_key, &bytes).await?;
@@ -292,10 +292,7 @@ fn write_day_parquet(
 
 /// Count the rows in a Parquet file via the same engine that wrote it
 fn count_parquet_rows(conn: &Connection, path: &PathBuf) -> Result<usize> {
-    let sql = format!(
-        "SELECT COUNT(*) FROM read_parquet('{}');",
-        path.display()
-    );
+    let sql = format!("SELECT COUNT(*) FROM read_parquet('{}');", path.display());
     let count: i64 = conn
         .prepare(&sql)?
         .query_map([], |row| row.get(0))?
@@ -320,10 +317,16 @@ mod tests {
     #[test]
     fn test_started_at_day_keys_by_utc_day() {
         // Mid-day timestamps map to their own day
-        assert_eq!(started_at_day(ts(2026, 9, 14, 10, 0, 0)), naive(2026, 9, 14));
+        assert_eq!(
+            started_at_day(ts(2026, 9, 14, 10, 0, 0)),
+            naive(2026, 9, 14)
+        );
 
         // The last second of a day still belongs to that day
-        assert_eq!(started_at_day(ts(2026, 9, 14, 23, 59, 59)), naive(2026, 9, 14));
+        assert_eq!(
+            started_at_day(ts(2026, 9, 14, 23, 59, 59)),
+            naive(2026, 9, 14)
+        );
 
         // Midnight rollover: the first second of a day belongs to the next
         assert_eq!(started_at_day(ts(2026, 9, 15, 0, 0, 0)), naive(2026, 9, 15));
@@ -336,7 +339,10 @@ mod tests {
         let utc = ts(2026, 9, 14, 23, 30, 0);
         let offset = chrono::FixedOffset::east_opt(2 * 3600).unwrap();
         let local = utc.with_timezone(&offset);
-        assert_eq!(local.format("%Y-%m-%d %H:%M").to_string(), "2026-09-15 01:30");
+        assert_eq!(
+            local.format("%Y-%m-%d %H:%M").to_string(),
+            "2026-09-15 01:30"
+        );
         assert_eq!(started_at_day(utc), naive(2026, 9, 14));
     }
 
@@ -429,7 +435,11 @@ mod tests {
 
     #[test]
     fn test_sessionization_query_projects_ddl_columns_in_order() {
-        let query = sessionization_query(naive(2026, 9, 14), "read_parquet('s3://b/p/events/**/*.parquet')", &SessionConfig::default());
+        let query = sessionization_query(
+            naive(2026, 9, 14),
+            "read_parquet('s3://b/p/events/**/*.parquet')",
+            &SessionConfig::default(),
+        );
 
         // Column source of truth: analytics/schemas/sessions_iceberg.sql
         let expected = [
@@ -539,10 +549,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         create_events_table(&conn);
 
-        let out_path = std::env::temp_dir().join(format!(
-            "trace-sessions-e2e-{}.parquet",
-            std::process::id()
-        ));
+        let out_path =
+            std::env::temp_dir().join(format!("trace-sessions-e2e-{}.parquet", std::process::id()));
         let _ = std::fs::remove_file(&out_path);
 
         write_day_parquet(&conn, naive(2026, 9, 14), "events", &out_path).unwrap();
@@ -602,7 +610,9 @@ mod tests {
             ))
             .unwrap();
         let actual_schema: Vec<(String, String)> = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();

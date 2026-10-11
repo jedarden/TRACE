@@ -329,11 +329,7 @@ impl SessionHierarchyBuilder {
             })
             .collect();
 
-        let unique_pages = events
-            .iter()
-            .map(|e| &e.url)
-            .collect::<HashSet<_>>()
-            .len() as i64;
+        let unique_pages = events.iter().map(|e| &e.url).collect::<HashSet<_>>().len() as i64;
 
         let duration_seconds = end_ts.signed_duration_since(start_ts).num_seconds();
 
@@ -397,20 +393,19 @@ impl SessionHierarchyBuilder {
             .map(|s| raw.ts.signed_duration_since(s.start_ts).num_days())
             .unwrap_or(0);
 
-        let first_touch = first_session.and_then(|s| s.attribution.as_ref()).map(|a| {
-            TouchpointData {
-                network: a.network.clone(),
-                campaign_id: a.campaign_id.clone(),
-                creative_id: a.creative_id.clone(),
-                ts: sessions.first().map(|s| s.start_ts).unwrap(),
-            }
-        });
+        let first_touch =
+            first_session
+                .and_then(|s| s.attribution.as_ref())
+                .map(|a| TouchpointData {
+                    network: a.network.clone(),
+                    campaign_id: a.campaign_id.clone(),
+                    creative_id: a.creative_id.clone(),
+                    ts: sessions.first().map(|s| s.start_ts).unwrap(),
+                });
 
         let last_touch = sessions
             .iter()
-            .filter(|s| {
-                s.start_ts <= raw.ts && s.end_ts >= raw.ts
-            })
+            .filter(|s| s.start_ts <= raw.ts && s.end_ts >= raw.ts)
             .last()
             .and_then(|s| s.attribution.as_ref())
             .map(|a| TouchpointData {

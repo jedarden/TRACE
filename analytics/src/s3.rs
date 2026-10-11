@@ -19,31 +19,23 @@ pub struct S3Client {
 impl S3Client {
     pub fn new(config: &Config) -> Result<Self> {
         let credentials = match (&config.s3_access_key_id, &config.s3_secret_access_key) {
-            (Some(key_id), Some(secret)) => Credentials::new(
-                Some(key_id),
-                Some(secret),
-                None,
-                None,
-                None,
-            )?,
+            (Some(key_id), Some(secret)) => {
+                Credentials::new(Some(key_id), Some(secret), None, None, None)?
+            }
             _ => Credentials::new(None, None, None, None, None)?,
         };
 
         let region = Region::Custom {
             region: config.s3_region.clone(),
-            endpoint: config.s3_endpoint.clone().unwrap_or_else(|| format!(
-                "s3.{}.amazonaws.com",
-                config.s3_region
-            )),
+            endpoint: config
+                .s3_endpoint
+                .clone()
+                .unwrap_or_else(|| format!("s3.{}.amazonaws.com", config.s3_region)),
         };
 
         // `with_path_style` returns a boxed Bucket — deref into the plain
         // struct field type.
-        let bucket = *Bucket::new(
-            &config.s3_bucket,
-            region,
-            credentials,
-        )?.with_path_style();
+        let bucket = *Bucket::new(&config.s3_bucket, region, credentials)?.with_path_style();
 
         Ok(Self { bucket })
     }
@@ -89,7 +81,8 @@ impl S3Client {
     pub async fn list_reports(&self, report_name: &str) -> Result<Vec<String>> {
         let prefix = format!("{}/reports/{}/", self.bucket.name(), report_name);
 
-        let pages = self.bucket
+        let pages = self
+            .bucket
             .list(prefix, None)
             .await
             .context("Failed to list reports from S3")?;

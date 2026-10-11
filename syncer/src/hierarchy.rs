@@ -252,16 +252,14 @@ mod tests {
                     ],
                 },
             ],
-            creatives: vec![
-                CreativeHierarchy {
-                    creative_id: "cr-3".to_string(),
-                    headline: None,
-                    image_url: None,
-                    landing_page_url: None,
-                    item_id: None,
-                    status: None,
-                },
-            ],
+            creatives: vec![CreativeHierarchy {
+                creative_id: "cr-3".to_string(),
+                headline: None,
+                image_url: None,
+                landing_page_url: None,
+                item_id: None,
+                status: None,
+            }],
         };
 
         // 1 direct creative + 2 in ad group = 3 total
@@ -274,30 +272,26 @@ mod tests {
             network: "googleads".to_string(),
             account_id: "acc-123".to_string(),
             account_name: None,
-            campaigns: vec![
-                CampaignHierarchy {
-                    campaign_id: "camp-1".to_string(),
-                    campaign_name: None,
+            campaigns: vec![CampaignHierarchy {
+                campaign_id: "camp-1".to_string(),
+                campaign_name: None,
+                status: None,
+                ad_groups: vec![AdGroupHierarchy {
+                    ad_group_id: "ag-1".to_string(),
+                    ad_group_name: None,
                     status: None,
-                    ad_groups: vec![AdGroupHierarchy {
-                        ad_group_id: "ag-1".to_string(),
-                        ad_group_name: None,
+                    targeting: None,
+                    creatives: vec![CreativeHierarchy {
+                        creative_id: "cr-1".to_string(),
+                        headline: None,
+                        image_url: None,
+                        landing_page_url: None,
+                        item_id: None,
                         status: None,
-                        targeting: None,
-                        creatives: vec![
-                            CreativeHierarchy {
-                                creative_id: "cr-1".to_string(),
-                                headline: None,
-                                image_url: None,
-                                landing_page_url: None,
-                                item_id: None,
-                                status: None,
-                            },
-                        ],
                     }],
-                    creatives: vec![],
-                },
-            ],
+                }],
+                creatives: vec![],
+            }],
             synced_at: Utc::now(),
         };
 

@@ -120,7 +120,10 @@ impl MetricsRegistry {
     }
 
     /// Add multiple metrics to the registry
-    pub async fn add_metrics_batch(&mut self, metrics: Vec<PerformanceMetrics>) -> anyhow::Result<()> {
+    pub async fn add_metrics_batch(
+        &mut self,
+        metrics: Vec<PerformanceMetrics>,
+    ) -> anyhow::Result<()> {
         for metric in metrics {
             self.add_metrics(metric).await?;
         }
@@ -270,7 +273,11 @@ impl HierarchyRegistry {
     }
 
     /// Load a hierarchy from the store
-    pub async fn load(&mut self, network: &str, account_id: &str) -> anyhow::Result<Option<AccountHierarchy>> {
+    pub async fn load(
+        &mut self,
+        network: &str,
+        account_id: &str,
+    ) -> anyhow::Result<Option<AccountHierarchy>> {
         if let Some(hierarchy) = self.store.load_hierarchy(network, account_id).await? {
             let key = hierarchy.key();
             let mut hierarchies = self.hierarchies.write().await;
