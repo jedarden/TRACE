@@ -407,7 +407,7 @@ pub fn render_template_with_client(
     let start = params
         .start_date
         .clone()
-        .unwrap_or_else(|| "CURRENT_DATE - INTERVAL '30 days'".to_string());
+        .unwrap_or_else(|| "DATE_ADD(CURRENT_DATE, INTERVAL '-30 days')".to_string());
     let end = params
         .end_date
         .clone()

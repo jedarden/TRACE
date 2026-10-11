@@ -1162,12 +1162,16 @@ mod partition_pruning_tests {
                 );
                 if *window == "default" && report.name == "daily_summary" {
                     assert!(
-                        sql.contains("ts >= CAST(CURRENT_DATE - INTERVAL '30 days' AS TIMESTAMP)"),
+                        sql.contains(
+                            "ts >= CAST(DATE_ADD(CURRENT_DATE, INTERVAL '-30 days') AS TIMESTAMP)"
+                        ),
                         "default timestamp lower bound must remain an SQL expression:\n{}",
                         sql
                     );
                     assert!(
-                        sql.contains("ts_day >= CAST(CURRENT_DATE - INTERVAL '30 days' AS DATE)"),
+                        sql.contains(
+                            "ts_day >= CAST(DATE_ADD(CURRENT_DATE, INTERVAL '-30 days') AS DATE)"
+                        ),
                         "default partition lower bound must match the timestamp range:\n{}",
                         sql
                     );
@@ -1181,9 +1185,9 @@ mod partition_pruning_tests {
                 if *window == "default" && report.name == "daily_sessions" {
                     assert!(
                         sql.contains(
-                            "started_at >= CAST(CURRENT_DATE - INTERVAL '30 days' AS TIMESTAMP)"
+                            "started_at >= CAST(DATE_ADD(CURRENT_DATE, INTERVAL '-30 days') AS TIMESTAMP)"
                         ) && sql.contains(
-                            "started_at_day >= CAST(CURRENT_DATE - INTERVAL '30 days' AS DATE)"
+                            "started_at_day >= CAST(DATE_ADD(CURRENT_DATE, INTERVAL '-30 days') AS DATE)"
                         ),
                         "default session and started_at_day lower bounds must match:\n{}",
                         sql
