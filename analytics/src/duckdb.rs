@@ -683,6 +683,26 @@ mod partition_pruning_tests {
         }
     }
 
+    /// Write one sessions Parquet file per Hive partition under the
+    /// materializer's `started_at_day=YYYY-MM-DD/` layout. The partition key
+    /// is in the path rather than the file, so the registered Hive view must
+    /// expose it for downstream file pruning.
+    fn write_session_partitions(root: &Path, days: &[&str]) {
+        for day in days {
+            let dir = root.join(format!("iceberg/sessions/data/started_at_day={day}"));
+            fs::create_dir_all(&dir).expect("create session partition dir");
+            let conn = Connection::open_in_memory().expect("open scratch connection");
+            conn.execute_batch(&format!(
+                "COPY (SELECT TIMESTAMP '{day} 10:00:00' AS started_at,
+                              'sess-{day}' AS session_id)
+                 TO '{}'
+                 (FORMAT parquet);",
+                dir.join("part-00000.parquet").display()
+            ))
+            .expect("write session partition file");
+        }
+    }
+
     /// Write one asset fixture file per Hive partition. The syncer includes
     /// network/type in each row as well as in the directory names, matching
     /// the production asset Parquet layout.
@@ -747,6 +767,42 @@ mod partition_pruning_tests {
             iceberg_warehouse: None,
             compat_event_views: false,
         }
+    }
+
+    #[test]
+    fn test_registered_parquet_views_preserve_physical_day_columns() {
+        let root = scratch_dir("registered-day-columns");
+        let days = ["2026-09-01", "2026-09-02"];
+        write_daily_partitions(&root, &days);
+        write_session_partitions(&root, &days);
+
+        let db = DuckDBClient {
+            conn: Connection::open_in_memory().expect("open connection"),
+        };
+        db.setup_parquet_views(&root.display().to_string(), &parquet_config())
+            .expect("register Hive-partitioned analytics views");
+
+        let event_day: String = db
+            .connection()
+            .query_row(
+                "SELECT ts_day::VARCHAR FROM parquet_ad_events WHERE session_id = 'sess-2026-09-02'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("normalized event view exposes the ts_day partition key");
+        assert_eq!(event_day, "2026-09-02");
+
+        let session_day: String = db
+            .connection()
+            .query_row(
+                "SELECT started_at_day::VARCHAR FROM parquet_sessions WHERE session_id = 'sess-2026-09-02'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("normalized session view exposes the started_at_day partition key");
+        assert_eq!(session_day, "2026-09-02");
+
+        fs::remove_dir_all(&root).ok();
     }
 
     fn day_window(day: &str, next_day: &str) -> String {

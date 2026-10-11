@@ -19,12 +19,18 @@ SET s3_use_ssl=true;
 ```
 
 Partition-pruned DuckDB examples below read the canonical compacted event
-files with `hive_partitioning = true`. Pair every `ts` range with the matching
-`ts_day` range; `ts` alone filters rows but does not skip Parquet files. When
-connected to the REST catalog, query the real `trace.ad_events` Iceberg table
-and use its `ts` range. The mixed-generation `parquet_events` compatibility
-view is for legacy raw event files and derives its day from `ts`, so it cannot
-prune files.
+files through the registered `parquet_ad_events` view. The view reads
+`s3://<TRACE_S3_BUCKET>/<TRACE_S3_PREFIX>/iceberg/ad_events/data/**/*.parquet`
+with Hive partitioning and retains the physical `ts_day` key. Pair every `ts`
+range with the matching `ts_day` range; `ts` alone filters rows but does not
+skip Parquet files. The registered `parquet_sessions` view similarly retains
+`started_at_day` from
+`s3://<TRACE_S3_BUCKET>/<TRACE_S3_PREFIX>/iceberg/sessions/data/**/*.parquet`.
+With the REST catalog, the service registers `iceberg_ad_events` and
+`iceberg_sessions`; timestamp ranges prune the Iceberg day transforms. The
+mixed-generation `parquet_events` and `parquet_events_compacted` compatibility
+views derive `dt` from `ts` across file generations and are explicitly
+unpruned.
 
 ### Basic Event Query
 
@@ -38,11 +44,12 @@ LIMIT 100;
 > A bare glob only works when every file under it has the same schema. The
 > raw `events/` prefix holds multiple flusher generations, and the first two
 > store `params` as a JSON string where the current one writes a MAP. Use the
-> `parquet_events` compatibility view for those raw files
-> (`analytics/schemas/events_compat_views.sql`, or
-> `events_compat::setup_compat_events_views` from the analytics crate); this
-> compatibility view does not expose a physical partition key. Normal reports
-> use canonical `parquet_ad_events` instead.
+> `parquet_events` compatibility view for those raw files when
+> `TRACE_COMPAT_EVENT_VIEWS=1` (registered by
+> `events_compat::setup_compat_events_views`); `parquet_events_compacted` uses
+> the same schema-normalizing path for compacted legacy files. Both derive
+> `dt` from `ts` and cannot prune day directories. Normal reports use
+> `parquet_ad_events` instead.
 
 ## Core Metrics
 
@@ -59,7 +66,7 @@ SELECT
         100.0 * clicks / NULLIF(views, 0),
         2
     ) AS ctr_pct
-FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+FROM parquet_ad_events
 WHERE ts >= CURRENT_DATE - INTERVAL '30 days'
     AND ts_day >= CAST(CURRENT_DATE - INTERVAL '30 days' AS DATE)
 GROUP BY 1, 2
@@ -76,7 +83,7 @@ SELECT
     type,
     COUNT(*) AS events,
     COUNT(DISTINCT session_id) AS unique_sessions
-FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+FROM parquet_ad_events
 WHERE ts >= CURRENT_DATE + INTERVAL '-30 days'
     AND ts_day >= CAST(CURRENT_DATE + INTERVAL '-30 days' AS DATE)
 GROUP BY 1, 2
@@ -119,7 +126,7 @@ SELECT
     EXTRACT(HOUR FROM ts) AS hour_of_day,
     type,
     COUNT(*) AS events
-FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+FROM parquet_ad_events
 WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
     AND ts_day >= CAST(CURRENT_DATE + INTERVAL '-7 days' AS DATE)
 GROUP BY 1, 2
@@ -139,7 +146,7 @@ WITH funnel AS (
         COUNT(*) FILTER (WHERE type = 'click') AS clicks,
         COUNT(*) FILTER (WHERE type = 'scroll') AS scrolls,
         COUNT(*) FILTER (WHERE type = 'dwell') AS dwells
-    FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+    FROM parquet_ad_events
     WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
         AND ts_day >= CAST(CURRENT_DATE + INTERVAL '-7 days' AS DATE)
     GROUP BY 1
@@ -177,7 +184,7 @@ SELECT
         NULLIF(COUNT(*) FILTER (WHERE type = 'click'), 0),
         2
     ) AS revenue_per_click
-FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+FROM parquet_ad_events
 WHERE ts >= CURRENT_DATE + INTERVAL '-30 days'
     AND ts_day >= CAST(CURRENT_DATE + INTERVAL '-30 days' AS DATE)
 GROUP BY 1, 2, 3
@@ -198,7 +205,7 @@ SELECT
     COUNT(DISTINCT params->>'utm_campaign') AS num_campaigns,
     MIN(ts) AS first_seen,
     MAX(ts) AS last_seen
-FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+FROM parquet_ad_events
 WHERE params->>'tb_headline' IS NOT NULL
     AND ts >= CURRENT_DATE + INTERVAL '-7 days'
     AND ts_day >= CAST(CURRENT_DATE + INTERVAL '-7 days' AS DATE)
@@ -217,7 +224,7 @@ SELECT
     COUNT(*) FILTER (WHERE type = 'click') AS clicks,
     COUNT(DISTINCT params->>'utm_campaign') AS num_campaigns,
     COUNT(DISTINCT params->>'tb_headline') AS num_headlines
-FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+FROM parquet_ad_events
 WHERE params->>'tb_image' IS NOT NULL
     AND ts >= CURRENT_DATE + INTERVAL '-14 days'
     AND ts_day >= CAST(CURRENT_DATE + INTERVAL '-14 days' AS DATE)
@@ -239,7 +246,7 @@ SELECT
         NULLIF(COUNT(*) FILTER (WHERE type = 'pageview'), 0),
         2
     ) AS ctr
-FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+FROM parquet_ad_events
 WHERE params->>'tb_headline' IS NOT NULL
     AND params->>'tb_image' IS NOT NULL
     AND ts >= CURRENT_DATE + INTERVAL '-7 days'
@@ -267,7 +274,7 @@ SELECT
     ) AS ctr,
     COUNT(DISTINCT params->>'utm_campaign') AS num_campaigns,
     COUNT(DISTINCT params->>'tb_headline') AS num_headlines
-FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+FROM parquet_ad_events
 WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
     AND ts_day >= CAST(CURRENT_DATE + INTERVAL '-7 days' AS DATE)
 GROUP BY 1
@@ -283,7 +290,7 @@ WITH creative_ids AS (
     SELECT
         params->>'tb_image' AS creative_id,
         'taboola' AS network
-    FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+    FROM parquet_ad_events
     WHERE params->>'tb_image' IS NOT NULL
         AND ts >= CURRENT_DATE - INTERVAL '30 days'
         AND ts_day >= CAST(CURRENT_DATE - INTERVAL '30 days' AS DATE)
@@ -292,7 +299,7 @@ WITH creative_ids AS (
     SELECT
         params->>'ob_creative' AS creative_id,
         'outbrain' AS network
-    FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+    FROM parquet_ad_events
     WHERE params->>'ob_creative' IS NOT NULL
         AND ts >= CURRENT_DATE - INTERVAL '30 days'
         AND ts_day >= CAST(CURRENT_DATE - INTERVAL '30 days' AS DATE)
@@ -318,7 +325,7 @@ WITH daily_metrics AS (
         DATE(ts) AS date,
         params->>'utm_campaign' AS campaign,
         COUNT(*) FILTER (WHERE type = 'click') AS clicks
-    FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+    FROM parquet_ad_events
     WHERE ts >= CURRENT_DATE + INTERVAL '-14 days'
         AND ts_day >= CAST(CURRENT_DATE + INTERVAL '-14 days' AS DATE)
     GROUP BY 1, 2
@@ -355,7 +362,7 @@ WITH creative_daily AS (
         params->>'tb_headline' AS headline,
         COUNT(*) FILTER (WHERE type = 'click') AS clicks,
         COUNT(*) FILTER (WHERE type = 'pageview') AS views
-    FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+    FROM parquet_ad_events
     WHERE ts >= CURRENT_DATE + INTERVAL '-30 days'
         AND ts_day >= CAST(CURRENT_DATE + INTERVAL '-30 days' AS DATE)
         AND params->>'tb_headline' IS NOT NULL
@@ -410,7 +417,7 @@ WITH session_metrics AS (
         MIN(ts) AS session_start,
         MAX(ts) AS session_end,
         EXTRACT(EPOCH FROM (MAX(ts) - MIN(ts))) / 60 AS session_duration_minutes
-    FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+    FROM parquet_ad_events
     WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
         AND ts_day >= CAST(CURRENT_DATE + INTERVAL '-7 days' AS DATE)
         AND session_id IS NOT NULL
@@ -441,7 +448,7 @@ WITH user_journeys AS (
         url,
         ts,
         ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY ts) AS step_number
-    FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+    FROM parquet_ad_events
     WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
         AND ts_day >= CAST(CURRENT_DATE + INTERVAL '-7 days' AS DATE)
         AND session_id IS NOT NULL
@@ -472,7 +479,7 @@ SELECT
     MIN(ts) AS first_seen,
     MAX(ts) AS last_seen,
     EXTRACT(DAY FROM (MAX(ts) - MIN(ts))) + 1 AS days_active
-FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+FROM parquet_ad_events
 WHERE ts >= CURRENT_DATE + INTERVAL '-30 days'
     AND ts_day >= CAST(CURRENT_DATE + INTERVAL '-30 days' AS DATE)
     AND user_id IS NOT NULL
@@ -492,7 +499,7 @@ WITH session_sources AS (
         params->>'utm_campaign' AS campaign,
         params->>'utm_medium' AS medium,
         MIN(ts) AS session_start
-    FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+    FROM parquet_ad_events
     WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
         AND ts_day >= CAST(CURRENT_DATE + INTERVAL '-7 days' AS DATE)
         AND session_id IS NOT NULL
@@ -523,7 +530,7 @@ WITH session_engagement AS (
         COUNT(*) FILTER (WHERE type = 'click') AS clicks,
         COUNT(*) FILTER (WHERE type = 'scroll') AS scrolls,
         EXTRACT(EPOCH FROM (MAX(ts) - MIN(ts))) / 60 AS duration_minutes
-    FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+    FROM parquet_ad_events
     WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
         AND ts_day >= CAST(CURRENT_DATE + INTERVAL '-7 days' AS DATE)
         AND session_id IS NOT NULL
@@ -573,7 +580,7 @@ WITH decorated_sessions AS (
         COUNT(*) AS events,
         MIN(ts) AS first_event,
         MAX(ts) AS last_event
-    FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+    FROM parquet_ad_events
     WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
         AND ts_day >= CAST(CURRENT_DATE + INTERVAL '-7 days' AS DATE)
         AND session_id IS NOT NULL
@@ -606,7 +613,7 @@ WITH session_events AS (
         ts,
         LAG(type) OVER (PARTITION BY session_id ORDER BY ts) AS prev_type,
         LAG(url) OVER (PARTITION BY session_id ORDER BY ts) AS prev_url
-    FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+    FROM parquet_ad_events
     WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
         AND ts_day >= CAST(CURRENT_DATE + INTERVAL '-7 days' AS DATE)
         AND session_id IS NOT NULL
@@ -633,7 +640,7 @@ WITH sessions AS (
         MIN(url) AS landing_url,
         COUNT(*) AS events,
         COUNT(*) FILTER (WHERE type = 'pageview') AS pageviews
-    FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+    FROM parquet_ad_events
     WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
         AND ts_day >= CAST(CURRENT_DATE + INTERVAL '-7 days' AS DATE)
         AND session_id IS NOT NULL
@@ -661,7 +668,7 @@ LIMIT 20;
 ```sql
 -- Query compacted daily partitions (faster)
 SELECT *
-FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+FROM parquet_ad_events
 WHERE ts_day >= DATE '2026-05-01'
   AND ts_day < DATE '2026-05-08'
   AND ts >= TIMESTAMP '2026-05-01 00:00:00'
@@ -706,7 +713,7 @@ WITH daily AS (
         COUNT(*) FILTER (WHERE type = 'pageview') AS views,
         COUNT(*) FILTER (WHERE type = 'click') AS clicks,
         COUNT(DISTINCT session_id) AS sessions
-    FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+    FROM parquet_ad_events
     WHERE ts >= CURRENT_DATE - INTERVAL '30 days'
       AND ts_day >= CAST(CURRENT_DATE - INTERVAL '30 days' AS DATE)
     GROUP BY 1, 2, 3
@@ -748,7 +755,7 @@ WITH hourly_baseline AS (
             ORDER BY DATE_TRUNC('day', ts)
             ROWS BETWEEN 7 PRECEDING AND 1 PRECEDING
         ) AS baseline_stddev
-    FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+    FROM parquet_ad_events
     WHERE ts >= CURRENT_DATE + INTERVAL '-14 days'
         AND ts_day >= CAST(CURRENT_DATE + INTERVAL '-14 days' AS DATE)
     GROUP BY 1
@@ -778,7 +785,7 @@ WITH campaign_activity AS (
         params->>'utm_campaign' AS campaign,
         MAX(ts) AS last_event,
         COUNT(*) AS total_events
-    FROM read_parquet('s3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet', hive_partitioning = true)
+    FROM parquet_ad_events
     WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
         AND ts_day >= CAST(CURRENT_DATE + INTERVAL '-7 days' AS DATE)
     GROUP BY 1

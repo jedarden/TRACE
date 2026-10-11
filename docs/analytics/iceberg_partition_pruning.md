@@ -32,6 +32,18 @@ So the practical rule against the as-built layout is: **filter the partition
 column in addition to the timestamp.** The sessions examples below show both
 shapes and identify which results came from the local fixture.
 
+In Parquet mode, the analytics service registers `parquet_ad_events` over
+`s3://<TRACE_S3_BUCKET>/<TRACE_S3_PREFIX>/iceberg/ad_events/data/**/*.parquet`
+and `parquet_sessions` over
+`s3://<TRACE_S3_BUCKET>/<TRACE_S3_PREFIX>/iceberg/sessions/data/**/*.parquet`,
+both with `hive_partitioning = true`. Their wildcard projections retain the
+directory keys `ts_day` and `started_at_day` for pruning. In catalog mode, the
+service registers `iceberg_ad_events` and `iceberg_sessions`; those views read
+the Iceberg tables and use timestamp predicates to prune hidden day
+transforms. The opt-in mixed-generation `parquet_events` and
+`parquet_events_compacted` compatibility views derive `dt` from `ts`, so they
+are unpruned even though their `dt` value can be filtered.
+
 ## TRACE Partitioning Strategy
 
 ### Ad Events Table
@@ -63,21 +75,18 @@ PARTITIONED BY (network, type)
 ### Event Time Queries
 
 ```sql
--- Parquet mode: hive_partitioning exposes the physical ts_day directory key.
+-- Parquet mode: parquet_ad_events exposes the physical ts_day directory key.
 SELECT COUNT(*) AS clicks
-FROM read_parquet(
-    's3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet',
-    hive_partitioning = true
-)
+FROM parquet_ad_events
 WHERE ts_day >= DATE '2026-05-01'
   AND ts_day < DATE '2026-05-08'
   AND ts >= TIMESTAMP '2026-05-01 00:00:00'
   AND ts < TIMESTAMP '2026-05-08 00:00:00';
 -- Only reads the ts_day=2026-05-01 through ts_day=2026-05-07 directories.
 
--- True Iceberg mode: its hidden day(ts) transform prunes from ts directly.
+-- Catalog mode: iceberg_ad_events prunes its hidden day(ts) transform from ts.
 SELECT COUNT(*) AS clicks
-FROM trace.ad_events
+FROM iceberg_ad_events
 WHERE ts >= TIMESTAMP '2026-05-01 00:00:00'
   AND ts < TIMESTAMP '2026-05-08 00:00:00';
 ```
@@ -96,10 +105,10 @@ production counts.
 Measured on a local as-built sessions Parquet fixture (10 day partitions
 `started_at_day=2026-09-01…2026-09-10`, one ZSTD Parquet file per day,
 240 rows/day; the 138 MB / 20 M-row fixture variant confirmed the same file
-counts),
-DuckDB 1.5.2, `read_parquet('…/iceberg/sessions/data/**/*.parquet',
-hive_partitioning = true)`. "Files read" is `TABLE_SCAN → Total Files Read`
-from `EXPLAIN ANALYZE`; with one file per day it equals partitions scanned.
+counts), DuckDB 1.5.2, `parquet_sessions`, the service view over
+`iceberg/sessions/data/**/*.parquet` with `hive_partitioning = true`.
+"Files read" is `TABLE_SCAN → Total Files Read` from `EXPLAIN ANALYZE`; with
+one file per day it equals partitions scanned.
 
 | Validation scope | Total partitions | In-range partitions | GOOD scanned | BAD scanned | Conclusion |
 |---|---:|---:|---:|---:|---|
@@ -143,12 +152,16 @@ WHERE started_at_day >= DATE '2026-09-03'
 
 -- ❌ BAD in Parquet mode (validated on the local fixture): timestamp-only
 --    range reads every partition on the DuckDB read path (10/10 files).
---    Acceptable
---    only against a true Iceberg table under Trino, where the day(started_at)
---    transform prunes from this predicate.
 SELECT COUNT(*) AS sessions
 FROM parquet_sessions
 WHERE started_at >= '2026-09-03' AND started_at < '2026-09-06';
+
+-- Catalog mode uses the registered Iceberg view and prunes its hidden
+-- day(started_at) transform from the timestamp range.
+SELECT COUNT(*) AS sessions
+FROM iceberg_sessions
+WHERE started_at >= TIMESTAMP '2026-09-03 00:00:00'
+  AND started_at < TIMESTAMP '2026-09-06 00:00:00';
 ```
 
 ### Network-Based Queries on Assets Table
@@ -185,10 +198,7 @@ WHERE network = 'taboola' OR network = 'outbrain';
 SELECT
     campaign_id,
     COUNT(*) AS clicks
-FROM read_parquet(
-    's3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet',
-    hive_partitioning = true
-)
+FROM parquet_ad_events
 WHERE ts_day >= DATE '2026-05-01'
   AND ts_day < DATE '2026-05-08'
   AND ts >= TIMESTAMP '2026-05-01 00:00:00'
@@ -203,32 +213,29 @@ GROUP BY campaign_id;
 ### 1. Always Use Date Ranges for Time Filters
 
 ```sql
--- True Iceberg table: timestamp ranges prune the hidden day(ts) transform.
+-- Catalog mode: timestamp ranges prune the hidden day(ts) transform.
 SELECT *
-FROM trace.ad_events
+FROM iceberg_ad_events
 WHERE ts >= '2026-05-01'
   AND ts < '2026-05-08';
 
 -- Current Parquet layout: include ts_day to skip files.
 SELECT *
-FROM read_parquet(
-    's3://my-trace-bucket/trace-events/iceberg/ad_events/data/**/*.parquet',
-    hive_partitioning = true
-)
+FROM parquet_ad_events
 WHERE ts_day >= DATE '2026-05-01'
   AND ts_day < DATE '2026-05-08'
   AND ts >= TIMESTAMP '2026-05-01 00:00:00'
   AND ts < TIMESTAMP '2026-05-08 00:00:00';
 
--- On Iceberg, use a closed-open timestamp range rather than DATE_TRUNC.
+-- Catalog mode: use a closed-open timestamp range rather than DATE_TRUNC.
 SELECT *
-FROM trace.ad_events
+FROM iceberg_ad_events
 WHERE ts >= DATE_TRUNC('day', CURRENT_DATE + INTERVAL '-7 days')
   AND ts < DATE_TRUNC('day', CURRENT_DATE);
 
 -- ❌ AVOID: DATE equality on timestamp
 SELECT *
-FROM trace.ad_events
+FROM iceberg_ad_events
 WHERE DATE(ts) = '2026-05-01';
 ```
 
@@ -248,10 +255,10 @@ WHERE network IN ('taboola', 'outbrain');
 ### 3. Use Subqueries to Push Down Predicates
 
 ```sql
--- True Iceberg table: the timestamp predicate prunes the hidden transform.
+-- Catalog mode: the timestamp predicate prunes the hidden transform.
 WITH recent_campaigns AS (
     SELECT DISTINCT campaign_id
-    FROM trace.ad_events
+    FROM iceberg_ad_events
     WHERE ts >= CURRENT_DATE + INTERVAL '-7 days'
       AND network = 'taboola'
 )
@@ -260,7 +267,7 @@ SELECT
     c.campaign_name,
     COUNT(*) AS total_clicks
 FROM recent_campaigns c
-JOIN trace.ad_events e
+JOIN iceberg_ad_events e
     ON c.campaign_id = e.campaign_id
 WHERE e.ts >= CURRENT_DATE + INTERVAL '-7 days'
   AND e.network = 'taboola'
@@ -361,11 +368,24 @@ ORDER BY partition DESC;
 
 **Fix**:
 ```sql
--- Instead of:
-WHERE DATE(ts) = '2026-05-01'
+-- Parquet: instead of this timestamp-only predicate (which reads all files):
+SELECT COUNT(*)
+FROM parquet_ad_events
+WHERE DATE(ts) = DATE '2026-05-01';
 
--- Use:
-WHERE ts >= '2026-05-01' AND ts < '2026-05-02'
+-- Pair the row filter with its physical partition range:
+SELECT COUNT(*)
+FROM parquet_ad_events
+WHERE ts_day >= DATE '2026-05-01'
+  AND ts_day < DATE '2026-05-02'
+  AND ts >= TIMESTAMP '2026-05-01 00:00:00'
+  AND ts < TIMESTAMP '2026-05-02 00:00:00';
+
+-- In catalog mode, the timestamp range alone prunes the hidden day(ts) transform.
+SELECT COUNT(*)
+FROM iceberg_ad_events
+WHERE ts >= TIMESTAMP '2026-05-01 00:00:00'
+  AND ts < TIMESTAMP '2026-05-02 00:00:00';
 ```
 
 ### Issue: OR conditions prevent pruning
@@ -378,9 +398,9 @@ WHERE ts >= '2026-05-01' AND ts < '2026-05-02'
 WHERE network IN ('taboola', 'outbrain')
 
 -- Or UNION ALL for better control:
-SELECT * FROM trace.ad_events WHERE network = 'taboola'
+SELECT * FROM iceberg_ad_events WHERE network = 'taboola'
 UNION ALL
-SELECT * FROM trace.ad_events WHERE network = 'outbrain'
+SELECT * FROM iceberg_ad_events WHERE network = 'outbrain'
 ```
 
 ## Additional Resources
