@@ -747,6 +747,63 @@ mod tests {
         assert_eq!(raw.body, None, "pixels carry no body");
     }
 
+    /// The dedicated pageview pixel route has the same response and raw
+    /// capture contract as GET /collect, including the bare path and the
+    /// still-encoded query string.
+    #[tokio::test]
+    async fn contract_get_pageview_pixel_returns_gif_and_logs_event_contents() {
+        let (state, dir) = test_state();
+        let query = "url=https%3A%2F%2Fexample.com%2Foffer%3Futm_source%3Dtaboola&type=pageview&sid=sess-42";
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/p?{query}"))
+            .header("user-agent", "TRACE pixel contract test")
+            .header("referer", "https://example.com/previous")
+            .header("x-forwarded-for", "203.0.113.7, 10.0.0.1")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = send(&state, req).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/gif"
+        );
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .as_ref(),
+            PIXEL_GIF,
+            "pageview pixels return the documented transparent GIF"
+        );
+
+        let logged = read_all_logged_requests(&state, &dir).await;
+        assert_eq!(logged.len(), 1, "one accepted pixel produces one raw event");
+        let raw = &logged[0];
+        assert_eq!(raw.method, "GET");
+        assert_eq!(raw.path, "/p", "the path excludes the query string");
+        assert_eq!(raw.query_params.as_deref(), Some(query));
+        assert_eq!(raw.body, None, "pixel GETs have no logged body");
+        assert_eq!(
+            raw.headers.user_agent.as_deref(),
+            Some("TRACE pixel contract test")
+        );
+        assert_eq!(
+            raw.headers.referer.as_deref(),
+            Some("https://example.com/previous")
+        );
+        assert_eq!(
+            raw.client_ip.as_deref(),
+            Some("203.0.113.7"),
+            "client IP is the first X-Forwarded-For hop"
+        );
+    }
+
     /// Arbitrary and repeated query parameters remain unchanged when a real
     /// pixel request passes through the collector and is persisted to JSONL.
     /// The flusher's Parquet round-trip for the same query is covered in
@@ -783,11 +840,54 @@ mod tests {
             res.headers().get(header::CONTENT_TYPE).unwrap(),
             "image/gif"
         );
+        assert_eq!(
+            res.into_body().collect().await.unwrap().to_bytes().as_ref(),
+            PIXEL_GIF,
+            "a bare pageview pixel returns the same documented GIF"
+        );
 
         let logged = read_all_logged_requests(&state, &dir).await;
         assert_eq!(logged.len(), 1);
+        assert_eq!(logged[0].method, "GET");
         assert_eq!(logged[0].path, "/p");
         assert_eq!(logged[0].query_params, None);
+        assert_eq!(logged[0].body, None);
+    }
+
+    /// The API is append-only: if the same pixel request reaches the router
+    /// more than once, each accepted delivery gets a raw log line.
+    #[tokio::test]
+    async fn contract_repeated_pageview_pixel_sends_are_logged_each_time() {
+        let (state, dir) = test_state();
+        let query = "url=https%3A%2F%2Fexample.com%2Foffer&type=pageview&sid=sess-42";
+
+        for _ in 0..2 {
+            let response = send(&state, get(&format!("/p?{query}"))).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "image/gif"
+            );
+            assert_eq!(
+                response
+                    .into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+                    .as_ref(),
+                PIXEL_GIF
+            );
+        }
+
+        let logged = read_all_logged_requests(&state, &dir).await;
+        assert_eq!(logged.len(), 2, "one line per delivered pixel, no dedupe");
+        assert!(logged.iter().all(|raw| {
+            raw.method == "GET"
+                && raw.path == "/p"
+                && raw.query_params.as_deref() == Some(query)
+                && raw.body.is_none()
+        }));
     }
 
     /// Malformed JSON is accepted with 204 and stored raw — parsing is a
