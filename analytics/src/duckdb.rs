@@ -953,6 +953,53 @@ mod partition_pruning_tests {
     }
 
     #[test]
+    fn test_last_touch_attribution_executes_and_credits_conversion_context() {
+        let conn = Connection::open_in_memory().expect("open connection");
+        conn.execute_batch(
+            "CREATE TABLE parquet_ad_events (
+                 ts TIMESTAMP,
+                 ts_day DATE,
+                 session_id VARCHAR,
+                 type VARCHAR,
+                 params MAP(VARCHAR, VARCHAR)
+             );
+             INSERT INTO parquet_ad_events VALUES
+                 (TIMESTAMP '2026-09-02 10:00:00', DATE '2026-09-02', 's1', 'pageview',
+                  MAP {'utm_source': 'taboola', 'utm_campaign': 'c1', 'network': 'taboola', 'campaign_id': 'c1', 'creative_id': 'cr1'}),
+                 (TIMESTAMP '2026-09-02 10:01:00', DATE '2026-09-02', 's1', 'click',
+                  MAP {'utm_source': 'taboola', 'utm_campaign': 'c1', 'network': 'taboola', 'campaign_id': 'c1', 'creative_id': 'cr1'}),
+                 (TIMESTAMP '2026-09-02 10:02:00', DATE '2026-09-02', 's1', 'conversion',
+                  MAP {'utm_source': 'taboola', 'utm_campaign': 'c1', 'network': 'taboola', 'campaign_id': 'c1', 'creative_id': 'cr1', 'revenue': '12.5'});",
+        )
+        .expect("seed last-touch attribution fixtures");
+
+        let db = DuckDBClient { conn };
+        let sql = render_template_with_client(
+            include_str!("../queries/attribution_last_touch.sql"),
+            &ReportParams {
+                s3_path: None,
+                start_date: Some("2026-09-01".to_string()),
+                end_date: Some("2026-09-03".to_string()),
+            },
+            &db,
+            &parquet_config(),
+        );
+        assert!(!sql.contains("{{"), "unrendered placeholder:\n{}", sql);
+
+        let result = db
+            .execute_query(&sql)
+            .expect("execute last-touch attribution report");
+        assert_eq!(result.rows.len(), 1);
+        let row = &result.rows[0];
+        assert_eq!(row[0], "taboola");
+        assert_eq!(row[2], "c1");
+        assert_eq!(row[5], "taboola");
+        assert_eq!(row[6], "1");
+        assert_eq!(row[7], "1");
+        assert_eq!(row[8], "12.50");
+    }
+
+    #[test]
     fn test_assets_table_sql_uses_partitioned_parquet_view() {
         let db = DuckDBClient {
             conn: Connection::open_in_memory().expect("open connection"),

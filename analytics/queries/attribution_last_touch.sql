@@ -14,7 +14,8 @@ WITH session_touches AS (
         params->>'creative_id' AS creative_id,
         params->>'revenue' AS revenue,
         ts,
-        LEAD(type) OVER (PARTITION BY session_id ORDER BY ts) AS next_type
+        LEAD(type) OVER (PARTITION BY session_id ORDER BY ts) AS next_type,
+        LAG(type) OVER (PARTITION BY session_id ORDER BY ts) AS prev_type
     FROM {{events_table}}
     WHERE ts >= '{{start_date}}'::TIMESTAMP
         AND ts < '{{end_date}}'::TIMESTAMP
@@ -37,7 +38,7 @@ conversion_touches AS (
         revenue,
         ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY ts DESC) AS touch_rank
     FROM session_touches
-    WHERE next_type = 'conversion' OR (type = 'conversion' AND LAG(type) OVER (PARTITION BY session_id ORDER BY ts) IS NOT NULL)
+    WHERE next_type = 'conversion' OR (type = 'conversion' AND prev_type IS NOT NULL)
 ),
 last_touch_attributed AS (
     SELECT
