@@ -41,6 +41,17 @@ echo "=== browser client tests ==="
 npm test --prefix client
 
 if [[ "$MODE" == "full" ]]; then
+  # Cargo's local test fallback runs in a systemd scope, where Nix's dynamic
+  # library search path may not be available to DuckDB-linked test binaries.
+  # Ask the active GCC installation for its C++ runtime and pass that path to
+  # the test processes so they can load libstdc++.so.6.
+  if command -v g++ >/dev/null 2>&1; then
+    libstdcxx_path="$(g++ -print-file-name=libstdc++.so.6)"
+    if [[ -f "$libstdcxx_path" ]]; then
+      export LD_LIBRARY_PATH="$(dirname "$libstdcxx_path")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
+  fi
+
   for package in "${RUST_PACKAGES[@]}"; do
     echo "=== $package: tests ==="
     cargo test --manifest-path "$package/Cargo.toml"
