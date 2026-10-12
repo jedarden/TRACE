@@ -107,6 +107,12 @@ HTTP trace layer may still emit a server-side access diagnostic. The
 framework-generated error responses use `Content-Type: text/plain;
 charset=utf-8`.
 
+On ingestion paths, only the methods listed in the endpoint table are
+accepted. In particular, `HEAD` returns `405` and is not logged. This is
+explicit because Axum's convenience `get()` router also accepts `HEAD`;
+counting a bodyless metadata probe as a pageview (or labeling it as `GET`)
+would corrupt the event stream.
+
 Two caveats clients should know about:
 
 - **A successful ingestion response means "accepted into the in-memory

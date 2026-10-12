@@ -45,7 +45,7 @@ struct RawRequest {
     ts: String,
     /// HTTP method (GET or POST)
     method: String,
-    /// Full request path including query string
+    /// Request path without the query string (captured separately below)
     path: String,
     /// Request headers (filtered)
     headers: RawHeaders,
@@ -257,18 +257,23 @@ async fn health() -> &'static str {
 fn build_app(state: CollectorState) -> axum::Router {
     axum::Router::new()
         .route("/e", axum::routing::post(collect_post))
-        .route("/p", axum::routing::get(collect_get))
+        .route(
+            "/p",
+            axum::routing::on(axum::routing::MethodFilter::GET, collect_get),
+        )
         .route(
             "/c",
-            axum::routing::get(collect_conversion_get).post(collect_conversion_post),
+            axum::routing::on(axum::routing::MethodFilter::GET, collect_conversion_get)
+                .post(collect_conversion_post),
         )
         .route(
             "/i",
-            axum::routing::get(collect_impression_get).post(collect_impression_post),
+            axum::routing::on(axum::routing::MethodFilter::GET, collect_impression_get)
+                .post(collect_impression_post),
         )
         .route(
             "/collect",
-            axum::routing::get(collect_get).post(collect_post),
+            axum::routing::on(axum::routing::MethodFilter::GET, collect_get).post(collect_post),
         )
         .route("/health", axum::routing::get(health))
         .layer(DefaultBodyLimit::max(MAX_EVENT_BODY_BYTES))
@@ -965,7 +970,9 @@ mod tests {
     }
 
     /// Methods an endpoint does not route are 405, and the request is
-    /// never logged — rejected requests have no side effects.
+    /// never logged — rejected requests have no side effects. In
+    /// particular, HEAD must not inherit Axum's implicit GET handling and
+    /// create a pageview or misreport the request method in the log.
     #[tokio::test]
     async fn contract_wrong_method_returns_405_and_is_not_logged() {
         let (state, dir) = test_state();
@@ -976,6 +983,26 @@ mod tests {
             Request::builder()
                 .method(Method::PUT)
                 .uri("/collect")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method(Method::HEAD)
+                .uri("/collect")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method(Method::HEAD)
+                .uri("/p")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method(Method::HEAD)
+                .uri("/c")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method(Method::HEAD)
+                .uri("/i")
                 .body(Body::empty())
                 .unwrap(),
         ] {
