@@ -446,6 +446,17 @@ mod tests {
     /// Flush the buffered writer and return every logged request, in
     /// write order. Contract tests log more than one request per file.
     async fn read_all_logged_requests(state: &CollectorState, dir: &TempDir) -> Vec<RawRequest> {
+        let content = read_all_logged_content(state, dir).await;
+        content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// Flush the writer and return the JSONL contents for assertions about
+    /// fields that must never be persisted.
+    async fn read_all_logged_content(state: &CollectorState, dir: &TempDir) -> String {
         state.log_writer.lock().await.flush().unwrap();
 
         let mut log_path = None;
@@ -458,12 +469,7 @@ mod tests {
         }
         let log_path = log_path.expect("no raw log file written");
 
-        let content = fs::read_to_string(log_path).unwrap();
-        content
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect()
+        fs::read_to_string(log_path).unwrap()
     }
 
     /// Send one request through the real router built by `build_app` — the
@@ -617,6 +623,7 @@ mod tests {
         let res = send(&state, req).await;
 
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert!(res.headers().is_empty(), "204 response sets no headers");
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         assert!(bytes.is_empty(), "204 must carry no body");
 
@@ -662,6 +669,66 @@ mod tests {
         assert_eq!(logged[0].method, "POST");
         assert_eq!(logged[0].path, "/e");
         assert_eq!(logged[0].body.as_deref(), Some(body));
+    }
+
+    /// The documented header allowlist is applied at the router boundary:
+    /// selected headers are captured, while cookies, idempotency keys, and
+    /// unrelated headers are not persisted.
+    #[tokio::test]
+    async fn contract_post_captures_only_documented_headers() {
+        let (state, dir) = test_state();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/collect")
+            .header("content-type", "application/json")
+            .header("user-agent", "TraceTag contract test")
+            .header("referer", "https://example.com/previous")
+            .header("x-forwarded-for", "203.0.113.7, 10.0.0.1")
+            .header("x-real-ip", "192.0.2.5")
+            .header("accept-language", "en-US,en;q=0.9")
+            .header("accept-encoding", "gzip, br")
+            .header("cookie", "session=must-not-be-stored")
+            .header("idempotency-key", "must-not-be-stored")
+            .header("x-private-test", "must-not-be-stored")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let response = send(&state, req).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let logged = read_all_logged_requests(&state, &dir).await;
+        assert_eq!(logged.len(), 1);
+        let raw = &logged[0];
+        assert_eq!(
+            raw.headers.user_agent.as_deref(),
+            Some("TraceTag contract test")
+        );
+        assert_eq!(
+            raw.headers.referer.as_deref(),
+            Some("https://example.com/previous")
+        );
+        assert_eq!(
+            raw.headers.x_forwarded_for.as_deref(),
+            Some("203.0.113.7, 10.0.0.1")
+        );
+        assert_eq!(raw.headers.x_real_ip.as_deref(), Some("192.0.2.5"));
+        assert_eq!(
+            raw.headers.accept_language.as_deref(),
+            Some("en-US,en;q=0.9")
+        );
+        assert_eq!(raw.headers.accept_encoding.as_deref(), Some("gzip, br"));
+        assert_eq!(raw.client_ip.as_deref(), Some("203.0.113.7"));
+
+        let content = read_all_logged_content(&state, &dir).await;
+        for forbidden in [
+            "content-type",
+            "cookie",
+            "idempotency-key",
+            "x-private-test",
+            "must-not-be-stored",
+        ] {
+            assert!(!content.contains(forbidden), "log must omit {forbidden}");
+        }
     }
 
     /// Content-Type is never inspected: the tag labels its payloads
@@ -739,6 +806,18 @@ mod tests {
             "image/gif",
             "pixel response must be image/gif"
         );
+        for absent_header in [
+            "cache-control",
+            "expires",
+            "pragma",
+            "access-control-allow-origin",
+            "access-control-allow-credentials",
+        ] {
+            assert!(
+                !res.headers().contains_key(absent_header),
+                "pixel responses do not set {absent_header}"
+            );
+        }
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(
             &bytes[..],
@@ -866,6 +945,38 @@ mod tests {
         assert_eq!(logged[0].body, None);
     }
 
+    /// GET /c is a conversion pixel route with the same GIF response and raw
+    /// query capture contract as the other pixel endpoints.
+    #[tokio::test]
+    async fn contract_get_conversion_pixel_returns_gif_and_logs_query() {
+        let (state, dir) = test_state();
+        let query = "conversion_type=purchase&revenue=49.99&transaction_id=order-42";
+        let response = send(&state, get(&format!("/c?{query}"))).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/gif"
+        );
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .as_ref(),
+            PIXEL_GIF
+        );
+
+        let logged = read_all_logged_requests(&state, &dir).await;
+        assert_eq!(logged.len(), 1);
+        assert_eq!(logged[0].method, "GET");
+        assert_eq!(logged[0].path, "/c");
+        assert_eq!(logged[0].query_params.as_deref(), Some(query));
+        assert_eq!(logged[0].body, None);
+    }
+
     /// The API is append-only: if the same pixel request reaches the router
     /// more than once, each accepted delivery gets a raw log line.
     #[tokio::test]
@@ -945,6 +1056,19 @@ mod tests {
         let res = send(&state, post("/collect", vec![0xff, 0xfe, 0x00, 0x01])).await;
 
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            res.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        assert!(
+            !res.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .is_empty(),
+            "400 UTF-8 rejection has a plain-text body"
+        );
 
         let logged = read_all_logged_requests(&state, &dir).await;
         assert!(
@@ -962,6 +1086,19 @@ mod tests {
         let over = "x".repeat(MAX_EVENT_BODY_BYTES + 1);
         let res = send(&state, post("/collect", over)).await;
         assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            res.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        assert!(
+            !res.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .is_empty(),
+            "413 size rejection has a plain-text body"
+        );
         assert!(
             read_all_logged_requests(&state, &dir).await.is_empty(),
             "oversized requests must never reach the log"
@@ -987,6 +1124,11 @@ mod tests {
             get("/e"),                 // /e is POST-only
             Request::builder()
                 .method(Method::PUT)
+                .uri("/collect")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method(Method::OPTIONS)
                 .uri("/collect")
                 .body(Body::empty())
                 .unwrap(),
@@ -1062,6 +1204,19 @@ mod tests {
         let res = send(&state, get("/definitely-not-an-endpoint")).await;
 
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            res.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        assert!(
+            !res.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .is_empty(),
+            "404 framework rejection has a plain-text body"
+        );
         assert!(
             read_all_logged_requests(&state, &dir).await.is_empty(),
             "rejected requests must never reach the log"
@@ -1086,15 +1241,21 @@ mod tests {
 
     /// Retry semantics: ingestion is append-only and at-least-once. A
     /// client that retries an already-delivered event (sendBeacon replay,
-    /// postback retry) produces one additional log line per delivery —
-    /// there is no idempotency key and no dedupe at the collector.
+    /// postback retry) produces one additional log line per delivery. The
+    /// same Idempotency-Key header on each request is ignored.
     #[tokio::test]
     async fn contract_duplicate_sends_are_logged_once_each() {
         let (state, dir) = test_state();
 
         let body = r#"{"type":"conversion","conversion_type":"purchase","revenue":"19.99","sid":"sess-77"}"#;
         for _ in 0..3 {
-            let res = send(&state, post("/c", body.to_string())).await;
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/collect")
+                .header("idempotency-key", "order-42")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let res = send(&state, req).await;
             assert_eq!(res.status(), StatusCode::NO_CONTENT);
         }
 

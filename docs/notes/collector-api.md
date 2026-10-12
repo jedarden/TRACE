@@ -4,8 +4,9 @@ The complete request/response contract for the TRACE collector's ingestion
 surface — `POST /collect`, the pixel endpoints, their aliases, status codes,
 body size limit, malformed-input behavior, and retry/idempotency semantics.
 The conformance tests live in `collector/src/main.rs` (`contract_*` tests in
-`mod tests`); every claim below that affects a client is pinned by one of
-them. Conversion-specific semantics (`/c` defaults, revenue handling) are in
+`mod tests`) and pin its wire-level behavior. Retry guidance also describes
+browser and transport behavior that is outside the collector's router.
+Conversion-specific semantics (`/c` defaults, revenue handling) are in
 [`conversion-capture.md`](conversion-capture.md); impression semantics
 (`/i` defaults, `imp_id` dedup) in
 [`impression-capture.md`](impression-capture.md).
@@ -28,18 +29,20 @@ text).
 
 | Path | Methods | Purpose | Success response |
 |---|---|---|---|
-| `/collect` | GET, HEAD, POST | Combined endpoint — the JS tag's default `data-collector` target | GET: 200 GIF; HEAD: 200 headers only; POST: 204 |
-| `/e` | POST | JS-tag events (pageview, scroll, heartbeat, click, …) | 204 |
+| `/collect` | GET, HEAD, POST | Combined endpoint — default for `client/trace.js`; configure `client/tag.js` here to use one URL for JS POSTs and pixel GETs | GET: 200 GIF; HEAD: 200 headers only; POST: 204 |
+| `/e` | POST | Event endpoint and default for the minimal `client/tag.js` (pageview, scroll, heartbeat, click, …) | 204 |
 | `/p` | GET, HEAD | Pageview pixel | GET: 200 GIF; HEAD: 200 headers only |
 | `/c` | GET, HEAD, POST | Conversion pixel / server-to-server postback | GET: 200 GIF; HEAD: 200 headers only; POST: 204 |
 | `/i` | GET, HEAD, POST | Impression pixel / server-to-server postback | GET: 200 GIF; HEAD: 200 headers only; POST: 204 |
 | `/health` | GET, HEAD | Liveness probe | GET: 200, body `OK`; HEAD: 200 headers only; neither is logged |
 
-`/collect` exists so deployments need one URL for both ingestion paths; `/e`
-and `/p` are aliases whose only difference is the flusher's default event
-type when the request carries no explicit `type` (`/p` and `GET /collect`
-default to `pageview`, `/e` and `POST /collect` to `unknown`, `/c` to
-`conversion`, `/i` to `impression`).
+`/collect` exists so deployments can use one URL for both ingestion paths.
+The full `client/trace.js` tag defaults `data-collector` to `/collect`, while
+the minimal `client/tag.js` tag defaults it to `/e`. Configure the minimal
+tag to `/collect` when its URL should also serve pixels. If a request has no
+explicit event `type`, the flusher defaults `/p` and `GET /collect` to
+`pageview`, `/e` and `POST /collect` to `unknown`, `/c` to `conversion`, and
+`/i` to `impression`.
 
 ## Request contract
 
@@ -245,6 +248,10 @@ framework-generated rejections included), not the handlers directly:
 ```bash
 cd collector && cargo test contract
 ```
+
+The browser sandbox test in `client/test/tag.test.mjs` also pins the minimal
+tag's default `/e` target and its `data-collector` override; it inspects the
+beacon URL and payload without making a network request.
 
 They pin: 204/empty for POSTs, the exact GIF bytes and `image/gif` type for
 pixels, verbatim body/query recording, the filtered-header set, XFF

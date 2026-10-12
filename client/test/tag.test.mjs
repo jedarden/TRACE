@@ -1,9 +1,9 @@
 /**
- * Tests for the minimal tag (tag.js): scroll depth event emission.
+ * Tests for the minimal tag (tag.js): collector selection and scroll events.
  *
  * tag.js is a browser IIFE, so each test builds a DOM/Window sandbox,
  * evaluates the tag source inside it, drives scroll positions through
- * the mocked window, and inspects the payloads handed to sendBeacon.
+ * the mocked window, and inspects the URL and payloads handed to sendBeacon.
  *
  * Run: npm test  (from client/) — node --test discovers test/*.test.mjs
  */
@@ -16,6 +16,11 @@ import { loadTag, sleep } from './helpers/tag-sandbox.mjs';
 function scrollEvents(sent) {
   return sent.filter((e) => e.payload.type === 'scroll').map((e) => e.payload);
 }
+
+test('collector endpoint defaults to /e and honors data-collector', () => {
+  assert.equal(loadTag().sent[0].url, '/e');
+  assert.equal(loadTag({ collectorUrl: '/collect' }).sent[0].url, '/collect');
+});
 
 test('pageview fires on load, no scroll events until scrolling', async () => {
   const tag = loadTag();

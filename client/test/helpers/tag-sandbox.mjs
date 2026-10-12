@@ -2,8 +2,9 @@
  * Shared browser sandbox for evaluating tag.js in tests.
  *
  * tag.js is a browser IIFE, so each test builds a DOM/Window sandbox,
- * evaluates the tag source inside it, and inspects the payloads handed to
- * sendBeacon. The sandbox never uses real network, storage, or timers > 100ms.
+ * evaluates the tag source inside it, and inspects the URLs and payloads
+ * handed to sendBeacon. The sandbox never uses real network, storage, or
+ * timers > 100ms.
  */
 
 import { readFileSync } from 'node:fs';
@@ -18,14 +19,20 @@ export const TAG_SOURCE = readFileSync(TAG_PATH, 'utf8');
 /**
  * Build a browser-ish sandbox, evaluate tag.js in it, and return handles.
  */
-export function loadTag({ scrollHeight = 5000, innerHeight = 1000 } = {}) {
+export function loadTag({
+  scrollHeight = 5000,
+  innerHeight = 1000,
+  collectorUrl = null,
+} = {}) {
   const sent = [];
   const windowListeners = {};
   const documentListeners = {};
   const store = new Map();
 
   const document = {
-    currentScript: { getAttribute: () => null },
+    currentScript: {
+      getAttribute: (name) => (name === 'data-collector' ? collectorUrl : null),
+    },
     readyState: 'complete', // init() runs immediately, no DOMContentLoaded wait
     referrer: 'https://referrer.example/',
     title: 'Test Page',
