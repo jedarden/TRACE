@@ -28,12 +28,12 @@ text).
 
 | Path | Methods | Purpose | Success response |
 |---|---|---|---|
-| `/collect` | GET, POST | Combined endpoint — the JS tag's default `data-collector` target | GET: 200 GIF; POST: 204 |
+| `/collect` | GET, HEAD, POST | Combined endpoint — the JS tag's default `data-collector` target | GET: 200 GIF; HEAD: 200 headers only; POST: 204 |
 | `/e` | POST | JS-tag events (pageview, scroll, heartbeat, click, …) | 204 |
-| `/p` | GET | Pageview pixel | 200 GIF |
-| `/c` | GET, POST | Conversion pixel / server-to-server postback | GET: 200 GIF; POST: 204 |
-| `/i` | GET, POST | Impression pixel / server-to-server postback | GET: 200 GIF; POST: 204 |
-| `/health` | GET | Liveness probe | 200, body `OK`, nothing logged |
+| `/p` | GET, HEAD | Pageview pixel | GET: 200 GIF; HEAD: 200 headers only |
+| `/c` | GET, HEAD, POST | Conversion pixel / server-to-server postback | GET: 200 GIF; HEAD: 200 headers only; POST: 204 |
+| `/i` | GET, HEAD, POST | Impression pixel / server-to-server postback | GET: 200 GIF; HEAD: 200 headers only; POST: 204 |
+| `/health` | GET, HEAD | Liveness probe | GET: 200, body `OK`; HEAD: 200 headers only; neither is logged |
 
 `/collect` exists so deployments need one URL for both ingestion paths; `/e`
 and `/p` are aliases whose only difference is the flusher's default event
@@ -93,25 +93,24 @@ default to `pageview`, `/e` and `POST /collect` to `unknown`, `/c` to
 | Status | When | Body | Logged? |
 |---|---|---|---|
 | `200` | `GET /collect`, `/p`, `/c`, or `/i` | Exact 35-byte 1×1 transparent GIF89a; route sets `Content-Type: image/gif` and no cache/CORS headers | yes |
+| `200` | `HEAD /collect`, `/p`, `/c`, or `/i` | Empty body; same `Content-Type: image/gif` as GET | **no** |
+| `200` | `HEAD /health` | Empty body; `Content-Type: text/plain; charset=utf-8` | **no** |
 | `204` | `POST /collect`, `/e`, `/c`, or `/i` | Empty; the route sets no application response headers | yes |
 | `200` | `GET /health` | `OK`, with `Content-Type: text/plain; charset=utf-8`; not an ingestion response | **no** |
 | `400` | POST body is not valid UTF-8 | Framework-generated plain-text error body | **no** |
 | `404` | unknown path | Framework-generated plain-text error body | **no** |
-| `405` | method not routed for that path (e.g. `POST /p`, `GET /e`, `PUT /collect`, `OPTIONS /collect`) | Framework-generated plain-text error body | **no** |
+| `405` | method not routed for that path (e.g. `POST /p`, `GET /e`, `PUT /collect`, `OPTIONS /collect`) | Empty framework-generated body | **no** |
 | `413` | POST body exceeds 2 MiB | Framework-generated plain-text error body | **no** |
 
 The raw event log contains only accepted ingestion requests. Rejected
 requests never reach a collector handler, and health checks never call the
 raw-log writer. A 4xx therefore has no raw-log side effect, although the
 HTTP trace layer may still emit a server-side access diagnostic. The
-framework-generated error responses use `Content-Type: text/plain;
-charset=utf-8`.
-
-On ingestion paths, only the methods listed in the endpoint table are
-accepted. In particular, `HEAD` returns `405` and is not logged. This is
-explicit because Axum's convenience `get()` router also accepts `HEAD`;
-counting a bodyless metadata probe as a pageview (or labeling it as `GET`)
-would corrupt the event stream.
+framework-generated `400`, `404`, and `413` responses use
+`Content-Type: text/plain; charset=utf-8`; method rejections have an empty
+body. `HEAD` on a GET path returns the same content type as its GET response
+with the body suppressed and never reaches the raw-log writer, so metadata
+probes do not count as pageviews or other events.
 
 Two caveats clients should know about:
 
@@ -251,5 +250,6 @@ They pin: 204/empty for POSTs, the exact GIF bytes and `image/gif` type for
 pixels, verbatim body/query recording, the filtered-header set, XFF
 first-hop IP resolution, content-type indifference, malformed-JSON
 acceptance, empty-body acceptance, 400 for non-UTF-8, the inclusive 2 MiB
-limit, 405/404 with no log side effects, `/health`, the `/i` impression
-pixel and postback, and one-line-per-delivery duplicate semantics.
+limit, `HEAD` metadata probes without log side effects, 405/404 with no log
+side effects, `/health`, the `/i` impression pixel and postback, and
+one-line-per-delivery duplicate semantics.

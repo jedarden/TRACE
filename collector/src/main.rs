@@ -148,6 +148,12 @@ impl IntoResponse for PixelResponse {
     }
 }
 
+/// HEAD probes return pixel headers without recording an ingestion event.
+/// Axum removes the response body for HEAD requests.
+async fn collect_head() -> PixelResponse {
+    PixelResponse
+}
+
 /// GET /p - Query string endpoint (pixel tracking)
 async fn collect_get(
     State(state): State<CollectorState>,
@@ -257,23 +263,24 @@ async fn health() -> &'static str {
 fn build_app(state: CollectorState) -> axum::Router {
     axum::Router::new()
         .route("/e", axum::routing::post(collect_post))
-        .route(
-            "/p",
-            axum::routing::on(axum::routing::MethodFilter::GET, collect_get),
-        )
+        .route("/p", axum::routing::get(collect_get).head(collect_head))
         .route(
             "/c",
-            axum::routing::on(axum::routing::MethodFilter::GET, collect_conversion_get)
+            axum::routing::get(collect_conversion_get)
+                .head(collect_head)
                 .post(collect_conversion_post),
         )
         .route(
             "/i",
-            axum::routing::on(axum::routing::MethodFilter::GET, collect_impression_get)
+            axum::routing::get(collect_impression_get)
+                .head(collect_head)
                 .post(collect_impression_post),
         )
         .route(
             "/collect",
-            axum::routing::on(axum::routing::MethodFilter::GET, collect_get).post(collect_post),
+            axum::routing::get(collect_get)
+                .head(collect_head)
+                .post(collect_post),
         )
         .route("/health", axum::routing::get(health))
         .layer(DefaultBodyLimit::max(MAX_EVENT_BODY_BYTES))
@@ -970,9 +977,7 @@ mod tests {
     }
 
     /// Methods an endpoint does not route are 405, and the request is
-    /// never logged — rejected requests have no side effects. In
-    /// particular, HEAD must not inherit Axum's implicit GET handling and
-    /// create a pageview or misreport the request method in the log.
+    /// never logged — rejected requests have no side effects.
     #[tokio::test]
     async fn contract_wrong_method_returns_405_and_is_not_logged() {
         let (state, dir) = test_state();
@@ -985,34 +990,67 @@ mod tests {
                 .uri("/collect")
                 .body(Body::empty())
                 .unwrap(),
-            Request::builder()
-                .method(Method::HEAD)
-                .uri("/collect")
-                .body(Body::empty())
-                .unwrap(),
-            Request::builder()
-                .method(Method::HEAD)
-                .uri("/p")
-                .body(Body::empty())
-                .unwrap(),
-            Request::builder()
-                .method(Method::HEAD)
-                .uri("/c")
-                .body(Body::empty())
-                .unwrap(),
-            Request::builder()
-                .method(Method::HEAD)
-                .uri("/i")
-                .body(Body::empty())
-                .unwrap(),
         ] {
             let res = send(&state, req).await;
             assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+            assert!(
+                res.into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+                    .is_empty(),
+                "method rejection responses have an empty body"
+            );
         }
 
         assert!(
             read_all_logged_requests(&state, &dir).await.is_empty(),
             "rejected requests must never reach the log"
+        );
+    }
+
+    /// HEAD on a GET ingestion route is a metadata probe: it returns pixel
+    /// headers with no body and must not create an analytics event. The
+    /// health endpoint has the same bodyless probe semantics.
+    #[tokio::test]
+    async fn contract_head_returns_headers_without_logging() {
+        let (state, dir) = test_state();
+
+        for (path, content_type) in [
+            ("/collect", "image/gif"),
+            ("/p", "image/gif"),
+            ("/c", "image/gif"),
+            ("/i", "image/gif"),
+            ("/health", "text/plain; charset=utf-8"),
+        ] {
+            let req = Request::builder()
+                .method(Method::HEAD)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            let res = send(&state, req).await;
+
+            assert_eq!(res.status(), StatusCode::OK, "HEAD {path}");
+            assert_eq!(
+                res.headers().get(header::CONTENT_TYPE).unwrap(),
+                content_type,
+                "HEAD {path} must retain the GET content type"
+            );
+            assert!(
+                res.into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+                    .is_empty(),
+                "HEAD {path} must not return a response body"
+            );
+        }
+
+        assert!(
+            read_all_logged_requests(&state, &dir).await.is_empty(),
+            "HEAD probes must not pollute the ingestion log"
         );
     }
 
