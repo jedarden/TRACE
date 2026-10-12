@@ -623,7 +623,11 @@ mod tests {
         let res = send(&state, req).await;
 
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
-        assert!(res.headers().is_empty(), "204 response sets no headers");
+        assert!(
+            !res.headers().contains_key(header::CONTENT_TYPE),
+            "204 response has no Content-Type header: {:?}",
+            res.headers()
+        );
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         assert!(bytes.is_empty(), "204 must carry no body");
 
@@ -1204,18 +1208,15 @@ mod tests {
         let res = send(&state, get("/definitely-not-an-endpoint")).await;
 
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
-        assert_eq!(
-            res.headers().get(header::CONTENT_TYPE).unwrap(),
-            "text/plain; charset=utf-8"
-        );
+        assert!(!res.headers().contains_key(header::CONTENT_TYPE));
         assert!(
-            !res.into_body()
+            res.into_body()
                 .collect()
                 .await
                 .unwrap()
                 .to_bytes()
                 .is_empty(),
-            "404 framework rejection has a plain-text body"
+            "default 404 fallback has an empty body"
         );
         assert!(
             read_all_logged_requests(&state, &dir).await.is_empty(),

@@ -98,10 +98,10 @@ explicit event `type`, the flusher defaults `/p` and `GET /collect` to
 | `200` | `GET /collect`, `/p`, `/c`, or `/i` | Exact 35-byte 1×1 transparent GIF89a; route sets `Content-Type: image/gif` and no cache/CORS headers | yes |
 | `200` | `HEAD /collect`, `/p`, `/c`, or `/i` | Empty body; same `Content-Type: image/gif` as GET | **no** |
 | `200` | `HEAD /health` | Empty body; `Content-Type: text/plain; charset=utf-8` | **no** |
-| `204` | `POST /collect`, `/e`, `/c`, or `/i` | Empty; the route sets no application response headers | yes |
+| `204` | `POST /collect`, `/e`, `/c`, or `/i` | Empty; no `Content-Type` header | yes |
 | `200` | `GET /health` | `OK`, with `Content-Type: text/plain; charset=utf-8`; not an ingestion response | **no** |
 | `400` | POST body is not valid UTF-8 | Framework-generated plain-text error body | **no** |
-| `404` | unknown path | Framework-generated plain-text error body | **no** |
+| `404` | unknown path | Empty default fallback body; no `Content-Type` header | **no** |
 | `405` | method not routed for that path (e.g. `POST /p`, `GET /e`, `PUT /collect`, `OPTIONS /collect`) | Empty framework-generated body | **no** |
 | `413` | POST body exceeds 2 MiB | Framework-generated plain-text error body | **no** |
 
@@ -109,9 +109,9 @@ The raw event log contains only accepted ingestion requests. Rejected
 requests never reach a collector handler, and health checks never call the
 raw-log writer. A 4xx therefore has no raw-log side effect, although the
 HTTP trace layer may still emit a server-side access diagnostic. The
-framework-generated `400`, `404`, and `413` responses use
-`Content-Type: text/plain; charset=utf-8`; method rejections have an empty
-body. `HEAD` on a GET path returns the same content type as its GET response
+framework-generated `400` and `413` responses use
+`Content-Type: text/plain; charset=utf-8`; the default `404` fallback and
+method rejections have empty bodies and no `Content-Type` header. `HEAD` on a GET path returns the same content type as its GET response
 with the body suppressed and never reaches the raw-log writer, so metadata
 probes do not count as pageviews or other events.
 
