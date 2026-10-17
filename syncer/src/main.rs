@@ -406,6 +406,8 @@ mod tests {
     use crate::creative::CreativeMetadata;
     use s3_store::{AssetStore, CampaignStore, MockCreativeStore};
 
+    type ParquetObjects = std::sync::Arc<tokio::sync::RwLock<Vec<(String, Vec<u8>)>>>;
+
     #[derive(Clone, Default)]
     struct MemoryHierarchyStore(
         std::sync::Arc<tokio::sync::RwLock<Vec<hierarchy::AccountHierarchy>>>,
@@ -448,7 +450,7 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct PartitionedCampaignStore {
-        objects: std::sync::Arc<tokio::sync::RwLock<Vec<(String, Vec<u8>)>>>,
+        objects: ParquetObjects,
         published: std::sync::Arc<tokio::sync::RwLock<Vec<campaigns::CampaignRecord>>>,
         publication_count: std::sync::Arc<tokio::sync::RwLock<usize>>,
         fail_publication: std::sync::Arc<tokio::sync::RwLock<bool>>,
@@ -528,7 +530,7 @@ mod tests {
     /// stubbed out.
     #[derive(Clone)]
     struct PartitionedCaptureStore {
-        objects: std::sync::Arc<tokio::sync::RwLock<Vec<(String, Vec<u8>)>>>,
+        objects: ParquetObjects,
     }
 
     impl PartitionedCaptureStore {
