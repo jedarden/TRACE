@@ -8,6 +8,7 @@ use chrono::DateTime;
 use parquet::arrow::arrow_writer::ArrowWriter;
 
 use crate::assets::AssetRecord;
+use crate::campaigns::CampaignRecord;
 use crate::creative::{CreativeMetadata, PerformanceMetrics};
 use crate::hierarchy::AccountHierarchy;
 
@@ -47,6 +48,18 @@ pub trait AssetStore: Send + Sync {
 
     /// Load all asset dimension rows across every partition
     async fn load_assets(&self) -> anyhow::Result<Vec<AssetRecord>>;
+}
+
+/// Storage for the current campaign dimension, partitioned by network.
+#[async_trait]
+pub trait CampaignStore: Send + Sync {
+    async fn store_campaigns(&self, campaigns: Vec<CampaignRecord>) -> anyhow::Result<()>;
+    async fn load_campaigns(&self) -> anyhow::Result<Vec<CampaignRecord>>;
+    async fn publish_campaign_revisions(
+        &self,
+        revisions: Vec<CampaignRecord>,
+        config: &trace_iceberg::publisher::PublisherConfig,
+    ) -> anyhow::Result<()>;
 }
 
 /// Trait for hierarchy storage
@@ -101,6 +114,208 @@ pub(crate) fn assets_partition_files(
     }
 
     Ok(files)
+}
+
+pub(crate) fn campaigns_partition_key(key_prefix: &str, network: &str) -> String {
+    format!(
+        "{}/iceberg/campaigns/data/network={}/campaigns.parquet",
+        key_prefix, network
+    )
+}
+
+pub(crate) fn campaigns_partition_files(
+    key_prefix: &str,
+    campaigns: Vec<CampaignRecord>,
+) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    let mut by_network: std::collections::HashMap<String, Vec<CampaignRecord>> =
+        std::collections::HashMap::new();
+    for campaign in campaigns {
+        by_network
+            .entry(campaign.network.clone())
+            .or_default()
+            .push(campaign);
+    }
+    by_network
+        .into_iter()
+        .map(|(network, rows)| {
+            Ok((
+                campaigns_partition_key(key_prefix, &network),
+                campaigns_to_parquet(rows)?,
+            ))
+        })
+        .collect()
+}
+
+/// Immutable objects only: never use the mutable `campaigns.parquet` key in
+/// an Iceberg manifest. Each invocation gets fresh UUID names per network.
+pub(crate) fn campaign_revision_files(
+    key_prefix: &str,
+    revisions: Vec<CampaignRecord>,
+) -> anyhow::Result<Vec<(String, Vec<u8>, String)>> {
+    let mut by_network: std::collections::HashMap<String, Vec<CampaignRecord>> =
+        std::collections::HashMap::new();
+    for revision in revisions {
+        by_network
+            .entry(revision.network.clone())
+            .or_default()
+            .push(revision);
+    }
+    by_network
+        .into_iter()
+        .map(|(network, rows)| {
+            let key = format!(
+                "{}/iceberg/campaigns/data/network={}/revision-{}.parquet",
+                key_prefix,
+                network,
+                uuid::Uuid::new_v4()
+            );
+            Ok((key, campaigns_to_parquet(rows)?, network))
+        })
+        .collect()
+}
+
+fn campaign_revision_object(
+    config: &trace_iceberg::publisher::PublisherConfig,
+    key_prefix: &str,
+    key: &str,
+    bytes: &[u8],
+    network: &str,
+) -> anyhow::Result<trace_iceberg::publisher::ParquetObject> {
+    let (_, record_count) = trace_iceberg::types::schema_from_parquet(bytes)?;
+    let relative_key = key
+        .strip_prefix(&format!("{}/", key_prefix))
+        .ok_or_else(|| anyhow::anyhow!("Campaign revision key is outside S3 prefix"))?;
+    anyhow::ensure!(
+        relative_key.starts_with(&format!(
+            "iceberg/campaigns/data/network={network}/revision-"
+        )) && relative_key.ends_with(".parquet"),
+        "Iceberg campaign object must reference an immutable network revision"
+    );
+    Ok(trace_iceberg::publisher::ParquetObject {
+        location: config.object_uri(relative_key),
+        size_bytes: bytes.len() as u64,
+        record_count: record_count as u64,
+        partition_day: None,
+        partition_network: Some(network.to_owned()),
+    })
+}
+
+pub(crate) fn campaigns_to_parquet(campaigns: Vec<CampaignRecord>) -> anyhow::Result<Vec<u8>> {
+    use arrow::array::{StringArray, TimestampMillisecondArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("campaign_id", DataType::Utf8, false),
+        Field::new("network", DataType::Utf8, false),
+        Field::new("campaign_name", DataType::Utf8, true),
+        Field::new("status", DataType::Utf8, true),
+        Field::new("account_id", DataType::Utf8, false),
+        Field::new("account_name", DataType::Utf8, true),
+        Field::new(
+            "synced_at",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(
+                campaigns
+                    .iter()
+                    .map(|c| c.campaign_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                campaigns
+                    .iter()
+                    .map(|c| c.network.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                campaigns
+                    .iter()
+                    .map(|c| c.campaign_name.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                campaigns
+                    .iter()
+                    .map(|c| c.status.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                campaigns
+                    .iter()
+                    .map(|c| c.account_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                campaigns
+                    .iter()
+                    .map(|c| c.account_name.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(TimestampMillisecondArray::from(
+                campaigns
+                    .iter()
+                    .map(|c| c.synced_at.timestamp_millis())
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+    let mut buffer = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), None)?;
+    writer.write(&batch)?;
+    writer.close()?;
+    Ok(buffer)
+}
+
+pub(crate) fn parquet_to_campaigns(data: &[u8]) -> anyhow::Result<Vec<CampaignRecord>> {
+    use arrow::array::{Array, StringArray, TimestampMillisecondArray};
+    use bytes::Bytes;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(data))?.build()?;
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let string_col = |index: usize| -> anyhow::Result<&StringArray> {
+            batch
+                .column(index)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Campaign Parquet column {} must be UTF-8", index))
+        };
+        let ids = string_col(0)?;
+        let networks = string_col(1)?;
+        let names = string_col(2)?;
+        let statuses = string_col(3)?;
+        let account_ids = string_col(4)?;
+        let account_names = string_col(5)?;
+        let synced_at = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .ok_or_else(|| anyhow::anyhow!("Campaign Parquet synced_at must be a timestamp"))?;
+        for i in 0..batch.num_rows() {
+            rows.push(CampaignRecord {
+                campaign_id: ids.value(i).to_owned(),
+                network: networks.value(i).to_owned(),
+                campaign_name: names.is_valid(i).then(|| names.value(i).to_owned()),
+                status: statuses.is_valid(i).then(|| statuses.value(i).to_owned()),
+                account_id: account_ids.value(i).to_owned(),
+                account_name: account_names
+                    .is_valid(i)
+                    .then(|| account_names.value(i).to_owned()),
+                synced_at: DateTime::from_timestamp_millis(synced_at.value(i))
+                    .ok_or_else(|| anyhow::anyhow!("Campaign synced_at is out of range"))?,
+            });
+        }
+    }
+    Ok(rows)
 }
 
 /// Convert asset dimension rows to Parquet format
@@ -338,6 +553,10 @@ impl S3CreativeStore {
     /// Get the S3 prefix covering every assets partition
     fn assets_prefix(&self) -> String {
         format!("{}/assets/", self.key_prefix)
+    }
+
+    fn campaigns_prefix(&self) -> String {
+        format!("{}/iceberg/campaigns/data/", self.key_prefix)
     }
 
     /// Convert performance metrics to Parquet format
@@ -891,6 +1110,108 @@ impl AssetStore for S3CreativeStore {
 }
 
 #[async_trait]
+impl CampaignStore for S3CreativeStore {
+    async fn store_campaigns(&self, campaigns: Vec<CampaignRecord>) -> anyhow::Result<()> {
+        for (key, parquet_data) in campaigns_partition_files(&self.key_prefix, campaigns)? {
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .body(ByteStream::from(parquet_data))
+                .send()
+                .await?;
+            tracing::info!("Stored campaigns partition to s3://{}/{}", self.bucket, key);
+        }
+        Ok(())
+    }
+
+    async fn load_campaigns(&self) -> anyhow::Result<Vec<CampaignRecord>> {
+        let prefix = self.campaigns_prefix();
+        let mut continuation_token: Option<String> = None;
+        let mut campaigns = Vec::new();
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&prefix);
+            if let Some(token) = continuation_token.as_deref() {
+                request = request.continuation_token(token);
+            }
+            let response = request.send().await?;
+            for object in response.contents() {
+                let Some(key) = object.key() else {
+                    continue;
+                };
+                if !key.ends_with("/campaigns.parquet") {
+                    continue;
+                }
+                let object = self
+                    .client
+                    .get_object()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .send()
+                    .await?;
+                let data = object.body.collect().await?.into_bytes();
+                campaigns.extend(parquet_to_campaigns(&data)?);
+            }
+            continuation_token = response.next_continuation_token().map(str::to_owned);
+            if continuation_token.is_none() {
+                break;
+            }
+        }
+        tracing::info!(
+            "Loaded {} campaigns from s3://{}/{}",
+            campaigns.len(),
+            self.bucket,
+            prefix
+        );
+        Ok(campaigns)
+    }
+
+    async fn publish_campaign_revisions(
+        &self,
+        revisions: Vec<CampaignRecord>,
+        config: &trace_iceberg::publisher::PublisherConfig,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            config.bucket == self.bucket
+                && config.prefix.trim_matches('/') == self.key_prefix.trim_matches('/'),
+            "Iceberg publisher bucket/prefix must match campaign S3 store"
+        );
+        let files = campaign_revision_files(&self.key_prefix, revisions)?;
+        if files.is_empty() {
+            return Ok(());
+        }
+        let mut objects = Vec::with_capacity(files.len());
+        for (key, bytes, network) in &files {
+            let object = campaign_revision_object(config, &self.key_prefix, key, bytes, network)?;
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .body(ByteStream::from(bytes.clone()))
+                .send()
+                .await?;
+            objects.push(object);
+        }
+        let published = trace_iceberg::publisher::append_parquet_files(
+            config,
+            "campaigns",
+            &files[0].1,
+            objects,
+        )
+        .await?;
+        tracing::info!(
+            "Published {} immutable campaign Parquet objects to trace.campaigns",
+            published
+        );
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl HierarchyStore for S3CreativeStore {
     async fn store_hierarchy(&self, hierarchy: &AccountHierarchy) -> anyhow::Result<()> {
         let json_data = serde_json::to_vec_pretty(hierarchy)?;
@@ -1090,6 +1411,109 @@ mod tests {
             "test-prefix/assets/network=taboola/type=headline/assets.parquet"
         );
         assert_eq!(create_test_store().assets_prefix(), "test-prefix/assets/");
+    }
+
+    #[test]
+    fn campaign_parquet_is_partitioned_by_network_and_roundtrips_fields() {
+        let now = Utc::now().trunc_subsecs(3);
+        let row = |network: &str, name: Option<&str>| CampaignRecord {
+            network: network.into(),
+            campaign_id: "same-id".into(),
+            campaign_name: name.map(str::to_owned),
+            status: Some("active".into()),
+            account_id: "account-1".into(),
+            account_name: None,
+            synced_at: now,
+        };
+        let files = campaigns_partition_files(
+            "trace-events",
+            vec![row("taboola", Some("Named")), row("mgid", None)],
+        )
+        .unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|(key, _)| key
+            == "trace-events/iceberg/campaigns/data/network=taboola/campaigns.parquet"));
+        assert!(files
+            .iter()
+            .any(|(key, _)| key
+                == "trace-events/iceberg/campaigns/data/network=mgid/campaigns.parquet"));
+
+        let taboola = files
+            .iter()
+            .find(|(key, _)| key.contains("network=taboola"))
+            .map(|(_, data)| parquet_to_campaigns(data).unwrap())
+            .unwrap();
+        assert_eq!(taboola, vec![row("taboola", Some("Named"))]);
+
+        let mgid = files
+            .iter()
+            .find(|(key, _)| key.contains("network=mgid"))
+            .map(|(_, data)| parquet_to_campaigns(data).unwrap())
+            .unwrap();
+        assert_eq!(mgid, vec![row("mgid", None)]);
+    }
+
+    #[test]
+    fn campaign_revision_keys_are_unique_and_never_use_mutable_key() {
+        let row = CampaignRecord {
+            network: "taboola".into(),
+            campaign_id: "campaign-1".into(),
+            campaign_name: Some("Campaign".into()),
+            status: Some("active".into()),
+            account_id: "account-1".into(),
+            account_name: Some("Account".into()),
+            synced_at: Utc::now().trunc_subsecs(3),
+        };
+        let first = campaign_revision_files("trace-events", vec![row.clone()]).unwrap();
+        let second = campaign_revision_files("trace-events", vec![row]).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_ne!(first[0].0, second[0].0);
+        assert!(first[0]
+            .0
+            .starts_with("trace-events/iceberg/campaigns/data/network=taboola/revision-"));
+        assert!(first[0].0.ends_with(".parquet"));
+        assert_ne!(
+            first[0].0,
+            campaigns_partition_key("trace-events", "taboola")
+        );
+        assert_eq!(first[0].2, "taboola");
+        assert_eq!(
+            trace_iceberg::types::schema_from_parquet(&first[0].1)
+                .unwrap()
+                .1,
+            1
+        );
+        let config = trace_iceberg::publisher::PublisherConfig {
+            catalog_uri: "http://catalog.invalid".into(),
+            warehouse: "s3://test-bucket/trace-events/iceberg".into(),
+            bucket: "test-bucket".into(),
+            prefix: "trace-events".into(),
+            region: "us-east-1".into(),
+            endpoint: None,
+            access_key_id: None,
+            secret_access_key: None,
+        };
+        let object = campaign_revision_object(
+            &config,
+            "trace-events",
+            &first[0].0,
+            &first[0].1,
+            &first[0].2,
+        )
+        .unwrap();
+        assert_eq!(object.location, format!("s3://test-bucket/{}", first[0].0));
+        assert_eq!(object.record_count, 1);
+        assert_eq!(object.partition_network.as_deref(), Some("taboola"));
+        assert!(object.partition_day.is_none());
+        assert!(campaign_revision_object(
+            &config,
+            "trace-events",
+            &campaigns_partition_key("trace-events", "taboola"),
+            &first[0].1,
+            "taboola"
+        )
+        .is_err());
     }
 
     #[test]

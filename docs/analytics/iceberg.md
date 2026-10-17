@@ -1,6 +1,6 @@
 # Apache Iceberg Integration for TRACE
 
-> **Schema Definition**: The canonical Iceberg table schema for ad events is defined in `analytics/schemas/ad_events_iceberg.sql`. This file summarizes the main ad_events table, dimension tables for campaigns/creatives, and helper views for common analytics queries.
+> **Schema Definition**: The canonical Iceberg table schema for ad events is defined in `analytics/schemas/ad_events_iceberg.sql`. It includes the ad_events table, the campaigns dimension, and helper views. Creative headlines, images, and landing pages are stored in `trace.assets` (`analytics/schemas/assets_iceberg.sql`).
 
 ## Overview
 
@@ -129,9 +129,18 @@ LOCATED AT 's3://my-trace-bucket/iceberg/ad_events';
 ```
 
 See `analytics/schemas/ad_events_iceberg.sql` for the complete schema including:
-- Dimension tables for campaigns and creatives
+- The `trace.campaigns` dimension, keyed by `(network, campaign_id)`, populated from the ad API hierarchy sync. Its `campaign_name`, `status`, account fields, and `synced_at` are available in `trace.campaigns` for joins to ad events on both key columns. Run the syncer with `--hierarchy` to populate it.
+- Creative assets in `trace.assets` (`analytics/schemas/assets_iceberg.sql`); there is no separate `trace.creatives` table.
 - Helper views for common analytics queries
 - Migration notes from existing Parquet data
+
+In Parquet mode, `trace.campaigns` reads the current hierarchy snapshot under
+`iceberg/campaigns/data/network=<network>/`. The catalog bootstrap copies that
+snapshot into Iceberg. See [catalog bootstrap](iceberg_catalog_migration.md)
+for the publication cutover and compactor status.
+Before the first hierarchy sync, the Parquet view is empty so reports can run.
+Restart a long-lived analytics web process after that first sync so it registers
+the newly created campaign files.
 
 ### Events Table (Generic)
 

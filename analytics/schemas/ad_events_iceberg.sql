@@ -117,45 +117,31 @@ ALTER TABLE trace.ad_events SET TPROPERTIES (
 );
 
 -- ----------------------------------------------------------------------------
--- Secondary Table: Campaign Dimension (Optional)
+-- Secondary Table: Campaign Dimension
 -- ----------------------------------------------------------------------------
--- Dimension table for campaign metadata enriched from network APIs
+-- Immutable campaign metadata revisions from the ingested account hierarchy.
+-- DuckDB's trace.campaigns view selects the newest synced_at revision per
+-- (network, campaign_id); join to ad_events on both key columns.
+-- The API hierarchy currently supplies the fields below. Budget, targeting,
+-- and lifecycle dates are omitted until the syncer actually ingests them.
 
 CREATE TABLE IF NOT EXISTS trace.campaigns (
     campaign_id STRING NOT NULL,
     network STRING NOT NULL,
     campaign_name STRING,
-    status STRING,  -- active, paused, deleted
-    created_at TIMESTAMP,
-    updated_at TIMESTAMP,
-    budget_daily DOUBLE,
-    budget_total DOUBLE,
-    targeting_country STRING,
-    targeting_platform STRING,  -- desktop, mobile, all
-    -- Additional metadata as JSON
-    metadata MAP<STRING, STRING>
+    status STRING,
+    account_id STRING NOT NULL,
+    account_name STRING,
+    synced_at TIMESTAMP NOT NULL
 )
 PARTITIONED BY (network)
-LOCATED AT 's3://my-trace-bucket/iceberg/campaigns';
+LOCATED AT 's3://my-trace-bucket/iceberg/trace/campaigns';
 
 -- ----------------------------------------------------------------------------
--- Secondary Table: Creatives Dimension (Optional)
+-- Creative assets
 -- ----------------------------------------------------------------------------
--- Dimension table for creative asset metadata
-
-CREATE TABLE IF NOT EXISTS trace.creatives (
-    creative_id STRING NOT NULL,
-    network STRING NOT NULL,
-    headline STRING,
-    image_url STRING,
-    thumbnail_url STRING,
-    landing_page_url STRING,
-    created_at TIMESTAMP,
-    -- Additional metadata as JSON
-    metadata MAP<STRING, STRING>
-)
-PARTITIONED BY (network)
-LOCATED AT 's3://my-trace-bucket/iceberg/creatives';
+-- Synced headlines, images, and landing pages live in trace.assets.
+-- See analytics/schemas/assets_iceberg.sql; creative_id is its join key.
 
 -- ============================================================================
 -- Helper Views for Common Queries

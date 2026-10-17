@@ -25,7 +25,7 @@ spec:
 
     - name: checkout
       script:
-        image: alpine/git:latest
+        image: alpine/git:2.43.0
         command: [sh, -c]
         source: |
           set -e
@@ -35,33 +35,33 @@ spec:
 
     - name: fmt-check
       script:
-        image: rust:1.83-alpine
+        image: rust:1.97-alpine
         command: [sh, -c]
         source: |
           set -e
           cd /workspace/syncer
-          apk add --no-cache musl-dev
+          apk add --no-cache build-base cmake perl
           rustc --version
           cargo fmt --check
 
     - name: clippy
       script:
-        image: rust:1.83-alpine
+        image: rust:1.97-alpine
         command: [sh, -c]
         source: |
           set -e
           cd /workspace/syncer
-          apk add --no-cache musl-dev
+          apk add --no-cache build-base cmake perl
           cargo clippy --all-targets --all-features -- -D warnings
 
     - name: build
       script:
-        image: rust:1.83-alpine
+        image: rust:1.97-alpine
         command: [sh, -c]
         source: |
           set -e
           cd /workspace/syncer
-          apk add --no-cache musl-dev
+          apk add --no-cache build-base cmake perl
           cargo build --release
           ls -lh target/release/trace-syncer
 
@@ -72,10 +72,11 @@ spec:
         source: |
           set -e
           cd /workspace
+          TAG="$(git rev-parse --short=12 HEAD)"
           /kaniko/executor \
             --dockerfile syncer/Dockerfile \
             --context dir:///workspace \
-            --destination ghcr.io/jedarden/trace-syncer:latest \
+            --destination ghcr.io/jedarden/trace-syncer:${TAG} \
             --cache=true \
             --cache-repo ghcr.io/jedarden/trace-syncer-cache
 

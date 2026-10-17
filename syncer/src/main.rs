@@ -1,5 +1,6 @@
 mod api_client;
 mod assets;
+mod campaigns;
 mod creative;
 mod hierarchy;
 mod registry;
@@ -15,6 +16,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use api_client::{ApiClient, ApiSyncResult, HierarchySyncResult, MetricsSyncResult};
 use assets::AssetRegistry;
+use campaigns::CampaignRegistry;
 use registry::{CreativeRegistry, HierarchyRegistry, MetricsRegistry};
 use s3_store::{HierarchyStore, S3CreativeStore};
 
@@ -84,6 +86,7 @@ async fn main() -> Result<()> {
     let mut metrics_registry = MetricsRegistry::new(store.clone());
     let mut hierarchy_registry = HierarchyRegistry::new(store.clone());
     let mut asset_registry = AssetRegistry::new(store.clone());
+    let mut campaign_registry = CampaignRegistry::new(store.clone());
 
     // Load previously synced assets so first_seen history survives restarts
     match asset_registry.load().await {
@@ -95,6 +98,15 @@ async fn main() -> Result<()> {
     let sync_creatives = args.mode == "creatives" || args.mode == "both";
     let sync_metrics = args.mode == "metrics" || args.mode == "both";
     let sync_hierarchy = args.hierarchy;
+    let campaign_publisher = if sync_hierarchy {
+        trace_iceberg::publisher::PublisherConfig::from_env()?
+    } else {
+        None
+    };
+    if sync_hierarchy {
+        let count = campaign_registry.load().await?;
+        info!("Loaded {} existing campaigns from previous syncs", count);
+    }
 
     // Determine metrics date range
     let days_back = if args.yesterday { 1 } else { args.days_back };
@@ -174,7 +186,13 @@ async fn main() -> Result<()> {
             run_metrics_sync(&mut metrics_registry, &mut clients, start_date, end_date).await?;
         }
         if sync_hierarchy {
-            run_hierarchy_sync(&mut hierarchy_registry, &mut clients).await?;
+            run_hierarchy_sync(
+                &mut hierarchy_registry,
+                &mut campaign_registry,
+                &mut clients,
+                campaign_publisher.as_ref(),
+            )
+            .await?;
         }
     } else {
         // Continuous sync mode
@@ -189,7 +207,13 @@ async fn main() -> Result<()> {
                 run_metrics_sync(&mut metrics_registry, &mut clients, start_date, end_date).await?;
             }
             if sync_hierarchy {
-                run_hierarchy_sync(&mut hierarchy_registry, &mut clients).await?;
+                run_hierarchy_sync(
+                    &mut hierarchy_registry,
+                    &mut campaign_registry,
+                    &mut clients,
+                    campaign_publisher.as_ref(),
+                )
+                .await?;
             }
             timer.tick().await;
         }
@@ -318,7 +342,9 @@ async fn run_metrics_sync(
 
 async fn run_hierarchy_sync(
     registry: &mut HierarchyRegistry,
+    campaign_registry: &mut CampaignRegistry,
     clients: &mut [Box<dyn ApiClient>],
+    publisher: Option<&trace_iceberg::publisher::PublisherConfig>,
 ) -> Result<()> {
     info!("Starting hierarchy sync...");
 
@@ -341,6 +367,7 @@ async fn run_hierarchy_sync(
                 for hierarchy in hierarchies {
                     registry.add_hierarchy(hierarchy.clone()).await?;
                     registry.persist_hierarchy(&hierarchy).await?;
+                    campaign_registry.sync_from_hierarchy(&hierarchy);
                 }
             }
             Err(e) => {
@@ -352,6 +379,17 @@ async fn run_hierarchy_sync(
                 total_errors += 1;
             }
         }
+    }
+
+    if total_fetched > 0 {
+        info!(
+            "Publishing revisions and persisting {} campaign dimension rows to S3...",
+            campaign_registry.len()
+        );
+        if let Some(config) = publisher {
+            campaign_registry.publish_revisions(config).await?;
+        }
+        campaign_registry.persist().await?;
     }
 
     info!(
@@ -366,7 +404,88 @@ async fn run_hierarchy_sync(
 mod tests {
     use super::*;
     use crate::creative::CreativeMetadata;
-    use s3_store::{AssetStore, MockCreativeStore};
+    use s3_store::{AssetStore, CampaignStore, MockCreativeStore};
+
+    #[derive(Clone, Default)]
+    struct MemoryHierarchyStore(
+        std::sync::Arc<tokio::sync::RwLock<Vec<hierarchy::AccountHierarchy>>>,
+    );
+
+    #[async_trait::async_trait]
+    impl HierarchyStore for MemoryHierarchyStore {
+        async fn store_hierarchy(
+            &self,
+            hierarchy: &hierarchy::AccountHierarchy,
+        ) -> anyhow::Result<()> {
+            self.0.write().await.push(hierarchy.clone());
+            Ok(())
+        }
+
+        async fn load_hierarchy(
+            &self,
+            network: &str,
+            account_id: &str,
+        ) -> anyhow::Result<Option<hierarchy::AccountHierarchy>> {
+            Ok(self
+                .0
+                .read()
+                .await
+                .iter()
+                .find(|h| h.network == network && h.account_id == account_id)
+                .cloned())
+        }
+
+        async fn list_hierarchies(&self) -> anyhow::Result<Vec<(String, String)>> {
+            Ok(self
+                .0
+                .read()
+                .await
+                .iter()
+                .map(|h| (h.network.clone(), h.account_id.clone()))
+                .collect())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct PartitionedCampaignStore {
+        objects: std::sync::Arc<tokio::sync::RwLock<Vec<(String, Vec<u8>)>>>,
+        published: std::sync::Arc<tokio::sync::RwLock<Vec<campaigns::CampaignRecord>>>,
+        publication_count: std::sync::Arc<tokio::sync::RwLock<usize>>,
+        fail_publication: std::sync::Arc<tokio::sync::RwLock<bool>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CampaignStore for PartitionedCampaignStore {
+        async fn store_campaigns(
+            &self,
+            campaigns: Vec<campaigns::CampaignRecord>,
+        ) -> anyhow::Result<()> {
+            *self.objects.write().await =
+                s3_store::campaigns_partition_files("trace-events", campaigns)?;
+            Ok(())
+        }
+
+        async fn load_campaigns(&self) -> anyhow::Result<Vec<campaigns::CampaignRecord>> {
+            let mut rows = Vec::new();
+            for (_, data) in self.objects.read().await.iter() {
+                rows.extend(s3_store::parquet_to_campaigns(data)?);
+            }
+            Ok(rows)
+        }
+
+        async fn publish_campaign_revisions(
+            &self,
+            rows: Vec<campaigns::CampaignRecord>,
+            _config: &trace_iceberg::publisher::PublisherConfig,
+        ) -> anyhow::Result<()> {
+            if *self.fail_publication.read().await {
+                anyhow::bail!("catalog unavailable");
+            }
+            *self.published.write().await = rows;
+            *self.publication_count.write().await += 1;
+            Ok(())
+        }
+    }
 
     /// In-memory asset store capturing what run_sync persists
     ///
@@ -447,6 +566,7 @@ mod tests {
     struct StubClient {
         network: String,
         creatives: Vec<CreativeMetadata>,
+        hierarchies: Vec<hierarchy::AccountHierarchy>,
         fail_fetch: bool,
     }
 
@@ -455,6 +575,7 @@ mod tests {
             Self {
                 network: network.to_string(),
                 creatives,
+                hierarchies: vec![],
                 fail_fetch: false,
             }
         }
@@ -463,6 +584,7 @@ mod tests {
             Self {
                 network: network.to_string(),
                 creatives: vec![],
+                hierarchies: vec![],
                 fail_fetch: true,
             }
         }
@@ -492,8 +614,11 @@ mod tests {
         }
 
         async fn fetch_hierarchy(&mut self) -> Result<HierarchySyncResult> {
+            if self.fail_fetch {
+                return Err(anyhow::anyhow!("{} API unavailable", self.network));
+            }
             Ok(HierarchySyncResult {
-                hierarchies: vec![],
+                hierarchies: self.hierarchies.clone(),
                 next_page_token: None,
             })
         }
@@ -522,6 +647,159 @@ mod tests {
             item_id: Some(format!("item-{creative_id}")),
             synced_at: chrono::Utc::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn hierarchy_sync_persists_campaigns_as_partitioned_parquet() {
+        let hierarchy = |network: &str| hierarchy::AccountHierarchy {
+            network: network.into(),
+            account_id: format!("{network}-account"),
+            account_name: Some(format!("{network} account")),
+            campaigns: vec![hierarchy::CampaignHierarchy {
+                campaign_id: "shared-id".into(),
+                campaign_name: Some(format!("{network} campaign")),
+                status: Some("active".into()),
+                ad_groups: vec![],
+                creatives: vec![],
+            }],
+            synced_at: chrono::Utc::now(),
+        };
+        let mut taboola = StubClient::new("taboola", vec![]);
+        taboola.hierarchies = vec![hierarchy("taboola")];
+        let mut mgid = StubClient::new("mgid", vec![]);
+        mgid.hierarchies = vec![hierarchy("mgid")];
+        let mut clients: Vec<Box<dyn ApiClient>> = vec![
+            Box::new(StubClient::failing("outbrain")),
+            Box::new(taboola),
+            Box::new(mgid),
+        ];
+        let hierarchy_store = MemoryHierarchyStore::default();
+        let mut hierarchy_registry = HierarchyRegistry::new(hierarchy_store.clone());
+        let campaign_store = PartitionedCampaignStore::default();
+        let mut campaign_registry = CampaignRegistry::new(campaign_store.clone());
+        let publisher = trace_iceberg::publisher::PublisherConfig {
+            catalog_uri: "http://catalog.invalid".into(),
+            warehouse: "s3://test-bucket/trace-events/iceberg".into(),
+            bucket: "test-bucket".into(),
+            prefix: "trace-events".into(),
+            region: "us-east-1".into(),
+            endpoint: None,
+            access_key_id: None,
+            secret_access_key: None,
+        };
+
+        run_hierarchy_sync(
+            &mut hierarchy_registry,
+            &mut campaign_registry,
+            &mut clients,
+            Some(&publisher),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(hierarchy_store.0.read().await.len(), 2);
+        assert_eq!(campaign_store.published.read().await.len(), 2);
+        assert_eq!(*campaign_store.publication_count.read().await, 1);
+        run_hierarchy_sync(
+            &mut hierarchy_registry,
+            &mut campaign_registry,
+            &mut clients,
+            Some(&publisher),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *campaign_store.publication_count.read().await,
+            1,
+            "unchanged hierarchies should not append another revision"
+        );
+        let mut keys: Vec<String> = campaign_store
+            .objects
+            .read()
+            .await
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "trace-events/iceberg/campaigns/data/network=mgid/campaigns.parquet",
+                "trace-events/iceberg/campaigns/data/network=taboola/campaigns.parquet",
+            ]
+        );
+        let rows = campaign_store.load_campaigns().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.campaign_id == "shared-id"
+            && row.status.as_deref() == Some("active")
+            && row.account_name.as_deref() == Some(format!("{} account", row.network).as_str())));
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.network == "taboola")
+                .unwrap()
+                .campaign_name
+                .as_deref(),
+            Some("taboola campaign")
+        );
+
+        let mut restarted = CampaignRegistry::new(campaign_store);
+        assert_eq!(restarted.load().await.unwrap(), 2);
+        assert_eq!(restarted.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_campaign_publication_does_not_advance_mutable_snapshot() {
+        let hierarchy = hierarchy::AccountHierarchy {
+            network: "taboola".into(),
+            account_id: "account-1".into(),
+            account_name: Some("Account".into()),
+            campaigns: vec![hierarchy::CampaignHierarchy {
+                campaign_id: "campaign-1".into(),
+                campaign_name: Some("Campaign".into()),
+                status: Some("active".into()),
+                ad_groups: vec![],
+                creatives: vec![],
+            }],
+            synced_at: chrono::Utc::now(),
+        };
+        let mut client = StubClient::new("taboola", vec![]);
+        client.hierarchies = vec![hierarchy];
+        let mut clients: Vec<Box<dyn ApiClient>> = vec![Box::new(client)];
+        let mut hierarchy_registry = HierarchyRegistry::new(MemoryHierarchyStore::default());
+        let campaign_store = PartitionedCampaignStore::default();
+        let mut campaign_registry = CampaignRegistry::new(campaign_store.clone());
+        let publisher = trace_iceberg::publisher::PublisherConfig {
+            catalog_uri: "http://catalog.invalid".into(),
+            warehouse: "s3://test-bucket/trace-events/iceberg".into(),
+            bucket: "test-bucket".into(),
+            prefix: "trace-events".into(),
+            region: "us-east-1".into(),
+            endpoint: None,
+            access_key_id: None,
+            secret_access_key: None,
+        };
+        *campaign_store.fail_publication.write().await = true;
+        assert!(run_hierarchy_sync(
+            &mut hierarchy_registry,
+            &mut campaign_registry,
+            &mut clients,
+            Some(&publisher)
+        )
+        .await
+        .is_err());
+        assert!(campaign_store.objects.read().await.is_empty());
+
+        *campaign_store.fail_publication.write().await = false;
+        run_hierarchy_sync(
+            &mut hierarchy_registry,
+            &mut campaign_registry,
+            &mut clients,
+            Some(&publisher),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*campaign_store.publication_count.read().await, 1);
+        assert_eq!(campaign_store.load_campaigns().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

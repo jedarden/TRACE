@@ -5,12 +5,18 @@
 //! efficient files suitable for Iceberg tables.
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 // Import from crate root (declared in main.rs)
 use crate::{merge_parquet_files, metadata, S3Client, S3Ops};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IcebergPartitionKind {
+    Day,
+    Network,
+}
 
 /// One Iceberg table covered by the compaction job
 #[derive(Clone, Debug)]
@@ -24,7 +30,9 @@ pub struct IcebergTableSpec {
     /// (e.g. "started_at_day=") — used to group files and to recover the
     /// bare partition value for Iceberg metadata
     pub partition_prefix: String,
-    /// Target file size after compaction (bytes) — from the table's DDL
+    /// How the partition value is represented in Iceberg manifests.
+    pub partition_kind: IcebergPartitionKind,
+    /// Target file size after compaction (bytes)
     pub target_file_size_bytes: usize,
 }
 
@@ -35,6 +43,7 @@ impl IcebergTableSpec {
             table_name: "trace.ad_events".to_string(),
             source_prefix: "iceberg/ad_events/data".to_string(),
             partition_prefix: "ts_day=".to_string(),
+            partition_kind: IcebergPartitionKind::Day,
             target_file_size_bytes: 512 * 1024 * 1024, // 512MB from ad_events_iceberg.sql
         }
     }
@@ -46,7 +55,20 @@ impl IcebergTableSpec {
             table_name: "trace.sessions".to_string(),
             source_prefix: "iceberg/sessions/data".to_string(),
             partition_prefix: "started_at_day=".to_string(),
+            partition_kind: IcebergPartitionKind::Day,
             target_file_size_bytes: 256 * 1024 * 1024, // 256MB from sessions_iceberg.sql
+        }
+    }
+
+    /// trace.campaigns — identity partitions on network
+    /// (PARTITIONED BY (network), see analytics/schemas/ad_events_iceberg.sql)
+    pub fn campaigns() -> Self {
+        Self {
+            table_name: "trace.campaigns".to_string(),
+            source_prefix: "iceberg/campaigns/data".to_string(),
+            partition_prefix: "network=".to_string(),
+            partition_kind: IcebergPartitionKind::Network,
+            target_file_size_bytes: 256 * 1024 * 1024,
         }
     }
 
@@ -79,11 +101,71 @@ impl IcebergTableSpec {
             .strip_prefix(&self.partition_prefix)
             .unwrap_or(partition)
     }
+
+    fn publication_partition(
+        &self,
+        partition: &str,
+    ) -> Result<(Option<chrono::NaiveDate>, Option<String>)> {
+        let value = partition
+            .strip_prefix(&self.partition_prefix)
+            .with_context(|| {
+                format!(
+                    "{} partition must begin with {}",
+                    self.table_name, self.partition_prefix
+                )
+            })?;
+        anyhow::ensure!(
+            !value.is_empty(),
+            "{} partition value is empty",
+            self.table_name
+        );
+        match self.partition_kind {
+            IcebergPartitionKind::Day => {
+                let day = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                    .context("Iceberg partition must be a YYYY-MM-DD day")?;
+                Ok((Some(day), None))
+            }
+            IcebergPartitionKind::Network => Ok((None, Some(value.to_string()))),
+        }
+    }
+
+    fn is_compaction_candidate(&self, key: &str) -> bool {
+        if !key.ends_with(".parquet") {
+            return false;
+        }
+        // The syncer's campaigns.parquet is replaced in place for reloads;
+        // revision-*.parquet is already published to the Iceberg catalog.
+        // Neither can be consumed or deleted by compaction.
+        if self.table_name == "trace.campaigns" {
+            let basename = key.rsplit('/').next().unwrap_or(key);
+            return basename != "campaigns.parquet" && !basename.starts_with("revision-");
+        }
+        true
+    }
+
+    fn compacted_output_key(&self, partition: &str, run_id: uuid::Uuid, index: usize) -> String {
+        format!(
+            "{}/{}/compacted-{}-{:05}.parquet",
+            self.source_prefix, partition, run_id, index
+        )
+    }
+}
+
+fn is_registered_data_file(
+    key: &str,
+    publisher: &trace_iceberg::publisher::PublisherConfig,
+    registered: &HashSet<String>,
+) -> bool {
+    registered.contains(&publisher.object_uri(key))
 }
 
 /// All tables the compaction job covers by default
 pub fn default_tables() -> Vec<IcebergTableSpec> {
-    vec![IcebergTableSpec::ad_events(), IcebergTableSpec::sessions()]
+    vec![
+        IcebergTableSpec::ad_events(),
+        IcebergTableSpec::sessions(),
+        IcebergTableSpec::campaigns(),
+    ]
 }
 
 /// Iceberg-specific compaction configuration
@@ -97,7 +179,7 @@ pub struct IcebergCompactorConfig {
     pub max_input_files: usize,
     /// Lookback days for compaction
     pub lookback_days: i64,
-    /// Tables to compact (ad_events and sessions by default)
+    /// Tables to compact (ad_events, sessions, and campaigns by default)
     pub tables: Vec<IcebergTableSpec>,
     /// Warehouse root as an s3:// URI (e.g. "s3://bucket/trace-events/iceberg")
     pub warehouse: String,
@@ -186,10 +268,30 @@ pub async fn find_small_files(
 
     // List all Parquet files in the source prefix
     let keys = s3.list_objects(&table.source_prefix).await?;
+    let registered_campaign_files = if table.table_name == "trace.campaigns" {
+        let publisher = config
+            .publisher
+            .as_ref()
+            .context("campaign compaction requires an Iceberg catalog publisher")?;
+        Some(
+            trace_iceberg::publisher::registered_data_file_locations(publisher, "campaigns")
+                .await
+                .context("cannot verify registered campaign data files")?,
+        )
+    } else {
+        None
+    };
 
     for key in keys {
-        if !key.ends_with(".parquet") {
+        if !table.is_compaction_candidate(&key) {
             continue;
+        }
+        if let Some(registered) = &registered_campaign_files {
+            let publisher = config.publisher.as_ref().expect("checked above");
+            if is_registered_data_file(&key, publisher, registered) {
+                debug!("Skipping catalog-registered campaign data file: {}", key);
+                continue;
+            }
         }
 
         match get_file_metadata(&s3, &key, &table.partition_prefix).await {
@@ -250,6 +352,9 @@ pub async fn compact_iceberg_partition(
     files: Vec<ParquetFileMeta>,
     config: &IcebergCompactorConfig,
 ) -> Result<()> {
+    // Validate before uploading anything: a malformed directory cannot be
+    // represented in the table's Iceberg partition spec.
+    let (partition_day, partition_network) = table.publication_partition(partition)?;
     let total_input_size: usize = files.iter().map(|f| f.size_bytes).sum();
     let avg_file_size = total_input_size / files.len().max(1);
 
@@ -283,6 +388,7 @@ pub async fn compact_iceberg_partition(
     // Merge and upload each group
     let mut uploaded: Vec<metadata::CompactedDataFile> = Vec::new();
     let mut schema_for_publish: Option<Vec<u8>> = None;
+    let run_id = uuid::Uuid::new_v4();
     for (idx, keys) in output_files.iter().enumerate() {
         info!(
             "Merging group {}/{} ({} files)",
@@ -308,11 +414,8 @@ pub async fn compact_iceberg_partition(
         }
 
         // Generate output key with Iceberg partition structure
-        // Format: iceberg/<table>/data/<partition>=YYYY-MM-DD/compacted-XXXXX.parquet
-        let output_key = format!(
-            "{}/{}/compacted-{:05}.parquet",
-            table.source_prefix, partition, idx
-        );
+        // Format: iceberg/<table>/data/<partition>/compacted-XXXXX.parquet
+        let output_key = table.compacted_output_key(partition, run_id, idx);
 
         let output_size = merged_data.len();
         s3.put_object(&output_key, merged_data).await?;
@@ -346,15 +449,14 @@ pub async fn compact_iceberg_partition(
     let schema_bytes = schema_for_publish
         .as_deref()
         .context("compaction produced no schema for Iceberg publication")?;
-    let day = chrono::NaiveDate::parse_from_str(table.partition_value(partition), "%Y-%m-%d")
-        .context("Iceberg partition must be a YYYY-MM-DD day")?;
     let iceberg_objects = uploaded
         .iter()
         .map(|file| trace_iceberg::publisher::ParquetObject {
             location: publisher.object_uri(&format!("{}/{}", table.data_prefix(), file.path)),
             size_bytes: file.size_bytes as u64,
             record_count: file.record_count as u64,
-            partition_day: Some(day),
+            partition_day,
+            partition_network: partition_network.clone(),
         })
         .collect();
     let published = trace_iceberg::publisher::append_parquet_files(
@@ -474,7 +576,7 @@ mod tests {
         assert_eq!(config.max_input_files, 1000);
         assert_eq!(config.lookback_days, 7);
 
-        // The compaction job must cover both event and session tables
+        // The compaction job must cover all configured Iceberg tables.
         let names: Vec<&str> = config
             .tables
             .iter()
@@ -482,6 +584,7 @@ mod tests {
             .collect();
         assert!(names.contains(&"trace.ad_events"), "tables: {:?}", names);
         assert!(names.contains(&"trace.sessions"), "tables: {:?}", names);
+        assert!(names.contains(&"trace.campaigns"), "tables: {:?}", names);
     }
 
     #[test]
@@ -489,12 +592,91 @@ mod tests {
         let spec = IcebergTableSpec::sessions();
         assert_eq!(spec.source_prefix, "iceberg/sessions/data");
         assert_eq!(spec.partition_prefix, "started_at_day=");
+        assert_eq!(spec.partition_kind, IcebergPartitionKind::Day);
         assert_eq!(spec.target_file_size_bytes, 256 * 1024 * 1024);
         assert_eq!(spec.data_prefix(), "iceberg/sessions");
         assert_eq!(
             spec.table_location("s3://bucket/trace-events/iceberg"),
             "s3://bucket/trace-events/iceberg/sessions"
         );
+    }
+
+    #[test]
+    fn test_campaigns_table_spec_and_network_partition() {
+        let spec = IcebergTableSpec::campaigns();
+        assert_eq!(spec.source_prefix, "iceberg/campaigns/data");
+        assert_eq!(spec.partition_prefix, "network=");
+        assert_eq!(spec.partition_kind, IcebergPartitionKind::Network);
+        assert_eq!(spec.target_file_size_bytes, 256 * 1024 * 1024);
+        assert_eq!(spec.data_prefix(), "iceberg/campaigns");
+        assert_eq!(
+            spec.table_location("s3://bucket/trace-events/iceberg"),
+            "s3://bucket/trace-events/iceberg/campaigns"
+        );
+        assert_eq!(
+            extract_partition(
+                "iceberg/campaigns/data/network=taboola/part-00000.parquet",
+                &spec.partition_prefix
+            ),
+            "network=taboola"
+        );
+        assert_eq!(spec.partition_value("network=taboola"), "taboola");
+        assert_eq!(
+            spec.publication_partition("network=taboola").unwrap(),
+            (None, Some("taboola".to_string()))
+        );
+        assert!(spec.publication_partition("network=").is_err());
+        assert!(spec.publication_partition("ts_day=2026-09-14").is_err());
+        assert!(!spec
+            .is_compaction_candidate("iceberg/campaigns/data/network=taboola/campaigns.parquet"));
+        assert!(!spec.is_compaction_candidate(
+            "iceberg/campaigns/data/network=taboola/revision-00000000-0000-4000-8000-000000000001.parquet"
+        ));
+        assert!(spec.is_compaction_candidate(
+            "iceberg/campaigns/data/network=taboola/campaigns-20261016-01.parquet"
+        ));
+        assert!(
+            !spec.is_compaction_candidate("iceberg/campaigns/data/network=taboola/metadata.json")
+        );
+        assert!(IcebergTableSpec::sessions().is_compaction_candidate(
+            "iceberg/sessions/data/started_at_day=2026-09-14/campaigns.parquet"
+        ));
+        let first_run = uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let second_run = uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
+        assert_eq!(
+            spec.compacted_output_key("network=taboola", first_run, 0),
+            "iceberg/campaigns/data/network=taboola/compacted-00000000-0000-4000-8000-000000000001-00000.parquet"
+        );
+        assert_ne!(
+            spec.compacted_output_key("network=taboola", first_run, 0),
+            spec.compacted_output_key("network=taboola", second_run, 0)
+        );
+
+        let publisher = trace_iceberg::publisher::PublisherConfig {
+            catalog_uri: "http://catalog".to_string(),
+            warehouse: "s3://bucket/trace-events/iceberg".to_string(),
+            bucket: "bucket".to_string(),
+            prefix: "trace-events".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            access_key_id: None,
+            secret_access_key: None,
+        };
+        let registered = HashSet::from([publisher.object_uri(&spec.compacted_output_key(
+            "network=taboola",
+            first_run,
+            0,
+        ))]);
+        assert!(is_registered_data_file(
+            &spec.compacted_output_key("network=taboola", first_run, 0),
+            &publisher,
+            &registered
+        ));
+        assert!(!is_registered_data_file(
+            "iceberg/campaigns/data/network=taboola/legacy.parquet",
+            &publisher,
+            &registered
+        ));
     }
 
     #[test]

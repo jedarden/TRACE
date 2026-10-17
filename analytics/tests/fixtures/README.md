@@ -14,3 +14,9 @@ Parquet file for each of these Hive partitions:
 Each row also stores its network, type, and the fixed content value
 `fixture content`. The test registers these files through the local Hive
 Parquet view; it does not use the Iceberg catalog or remote storage.
+
+`iceberg/campaigns/data/` contains three network-partitioned Parquet files
+for `test_campaign_partition_prunes_files_and_preserves_network_key`. Two
+networks deliberately share `campaign_id = shared-1` with different names
+and account IDs, so the fixture checks that campaign joins use both network
+and ID. The Taboola file also includes a paused campaign with no traffic.

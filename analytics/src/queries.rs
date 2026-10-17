@@ -55,7 +55,9 @@ pub fn list_reports() -> Vec<Report> {
         },
         Report {
             name: "ctr_by_campaign".to_string(),
-            description: "Click-through rate by campaign".to_string(),
+            description:
+                "Click-through rate by campaign, including unsynced and zero-traffic campaigns"
+                    .to_string(),
             category: ReportCategory::Daily,
             sql_template: include_str!("../queries/ctr_by_campaign.sql").to_string(),
             default_params: HashMap::new(),
@@ -396,6 +398,9 @@ pub fn render_template_with_client(
 
     let assets_table = db.assets_table_sql(config);
     sql = sql.replace("{{assets_table}}", &assets_table);
+
+    let campaigns_table = db.campaigns_table_sql(config);
+    sql = sql.replace("{{campaigns_table}}", &campaigns_table);
 
     let sessions_table = db.sessions_table_sql(config);
     sql = sql.replace("{{sessions_table}}", &sessions_table);

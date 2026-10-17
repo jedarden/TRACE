@@ -15,7 +15,7 @@ pub struct MigratedTable {
     pub snapshot_count: u64,
 }
 
-/// Copy event, session, and asset Parquet views to an attached REST catalog.
+/// Copy event, session, asset, and campaign Parquet views to an attached REST catalog.
 /// Existing catalog tables are accepted only when their row count matches the
 /// current Parquet source, making a completed CTAS safe to verify after a
 /// retry without appending duplicate history.
@@ -48,6 +48,7 @@ pub fn migrate_existing_files(conn: &Connection, config: &Config) -> Result<Vec<
         ),
         ("sessions", vec!["parquet_sessions"]),
         ("assets", vec!["parquet_assets"]),
+        ("campaigns", vec!["parquet_campaigns"]),
     ];
     ensure_event_views_disjoint(conn)?;
 
@@ -80,6 +81,21 @@ pub fn migrate_existing_files(conn: &Connection, config: &Config) -> Result<Vec<
             |row| row.get(0),
         )?;
         if exists > 0 {
+            if *table == "campaigns" {
+                let columns: i64 = conn.query_row(
+                    "SELECT count(*) FROM information_schema.columns
+                     WHERE table_catalog = 'trace_iceberg' AND table_schema = 'trace'
+                       AND table_name = 'campaigns'
+                       AND column_name IN ('campaign_id', 'network', 'campaign_name',
+                                           'status', 'account_id', 'account_name', 'synced_at')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                anyhow::ensure!(
+                    columns == 7,
+                    "existing trace.campaigns lacks the hierarchy dimension columns; migrate its old optional schema before publishing revisions"
+                );
+            }
             let source_count = count_query(
                 conn,
                 &format!("SELECT count(*) FROM ({source}) AS migration_source"),
@@ -99,8 +115,13 @@ pub fn migrate_existing_files(conn: &Connection, config: &Config) -> Result<Vec<
     let mut migrated = Vec::new();
     for (table, source, already_migrated) in sources {
         if !already_migrated {
+            let partition_clause = if table == "campaigns" {
+                " PARTITIONED BY (network)"
+            } else {
+                ""
+            };
             conn.execute_batch(&format!(
-                "CREATE TABLE trace_iceberg.trace.{table} AS {source};"
+                "CREATE TABLE trace_iceberg.trace.{table}{partition_clause} AS {source};"
             ))
             .with_context(|| format!("migrate existing Parquet into trace.{table}"))?;
         }

@@ -4,9 +4,12 @@
 //! Apache Iceberg implementation writes Avro manifests and commits a new
 //! snapshot using the REST catalog's optimistic concurrency protocol.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use chrono::NaiveDate;
 use futures_util::StreamExt;
 use iceberg_catalog_rest::{
@@ -15,8 +18,10 @@ use iceberg_catalog_rest::{
 use iceberg_rust::{
     spec::{
         DataContentType, DataFileBuilder, DataFileFormat, FormatVersion, ListType, Literal,
-        MapType, NestedField, PrimitiveType, Schema, Struct, Transform, Type, UnboundPartitionSpec,
+        MapType, MappedField, NameMapping, NestedField, PrimitiveType, Schema, Struct, Transform,
+        Type, UnboundPartitionSpec, DEFAULT_SCHEMA_NAME_MAPPING,
     },
+    table::Table,
     transaction::{ApplyTransactionAction, Transaction},
     Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent,
 };
@@ -93,11 +98,47 @@ pub struct ParquetObject {
     pub record_count: u64,
     /// UTC day represented by the table's `day(timestamp)` transform.
     pub partition_day: Option<NaiveDate>,
+    /// Network represented by the campaigns table's identity transform.
+    pub partition_network: Option<String>,
+}
+
+/// Return the data-file URIs currently referenced by an existing table.
+/// Callers must not mutate or delete these objects outside an Iceberg rewrite.
+pub async fn registered_data_file_locations(
+    config: &PublisherConfig,
+    table_name: &str,
+) -> Result<HashSet<String>> {
+    let catalog = rest_catalog(config).await?;
+    let ident = TableIdent::new(
+        NamespaceIdent::new("trace".to_string()),
+        table_name.to_string(),
+    );
+    if !catalog.table_exists(&ident).await? {
+        return Ok(HashSet::new());
+    }
+    let table = catalog.load_table(&ident).await?;
+    data_file_locations(&table).await
+}
+
+async fn data_file_locations(table: &iceberg_rust::table::Table) -> Result<HashSet<String>> {
+    let mut paths = HashSet::new();
+    let mut stream = table
+        .scan()
+        .build()
+        .context("build scan for existing Iceberg files")?
+        .plan_files()
+        .await
+        .context("list existing Iceberg files")?;
+    while let Some(task) = stream.next().await {
+        paths.insert(task?.data_file_path);
+    }
+    Ok(paths)
 }
 
 /// Append existing Parquet data files to a catalog table and commit a snapshot.
 ///
-/// TRACE's event and session files have matching day partition directories.
+/// TRACE's event and session files have day partition directories; campaign
+/// files have network partition directories.
 /// The table schema is derived from the producer's actual Parquet footer so
 /// the catalog schema tracks the files that are appended.
 pub async fn append_parquet_files(
@@ -118,8 +159,10 @@ pub async fn append_parquet_files(
         .and_then(|name| trace_schema.fields.iter().find(|field| field.name == name))
         .map(|field| field.id);
 
-    if partition_column.is_some() && source_partition_id.is_none() {
-        bail!("table {table_name} requires a partition timestamp column");
+    if let Some(column) = partition_column {
+        if source_partition_id.is_none() {
+            bail!("table {table_name} requires partition source column {column}");
+        }
     }
 
     let catalog = rest_catalog(config).await?;
@@ -133,8 +176,11 @@ pub async fn append_parquet_files(
 
     let ident = TableIdent::new(namespace.clone(), table_name.to_string());
     let table = if catalog.table_exists(&ident).await? {
-        let existing = catalog.load_table(&ident).await?;
+        let mut existing = catalog.load_table(&ident).await?;
         ensure_schema_compatible(&trace_schema, existing.metadata().current_schema())?;
+        if table_name == "campaigns" {
+            existing = ensure_campaign_name_mapping(&catalog, existing, &trace_schema).await?;
+        }
         existing
     } else {
         let partition_spec = match (partition_column, source_partition_id) {
@@ -143,9 +189,9 @@ pub async fn append_parquet_files(
                     .add_partition_field(
                         source_id,
                         partition_field_name(table_name).unwrap(),
-                        Transform::Day,
+                        partition_transform(table_name).unwrap(),
                     )
-                    .context("build Iceberg day partition spec")?
+                    .context("build Iceberg partition spec")?
                     .build(),
             ),
             _ => None,
@@ -183,36 +229,14 @@ pub async fn append_parquet_files(
 
     let spec = table.metadata().default_partition_spec();
     let spec_id = spec.spec_id();
-    let mut existing_paths = std::collections::HashSet::new();
-    let mut stream = table
-        .scan()
-        .build()
-        .context("build scan for existing Iceberg files")?
-        .plan_files()
-        .await
-        .context("list existing Iceberg files")?;
-    while let Some(task) = stream.next().await {
-        existing_paths.insert(task?.data_file_path);
-    }
+    let existing_paths = data_file_locations(&table).await?;
 
     let mut data_files = Vec::with_capacity(objects.len());
     for object in objects {
         if existing_paths.contains(&object.location) {
             continue;
         }
-        let partition = if spec.fields().is_empty() {
-            Struct::empty()
-        } else {
-            let day = object
-                .partition_day
-                .context("day-partitioned Iceberg object is missing partition_day")?;
-            let days_since_epoch = day
-                .signed_duration_since(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
-                .num_days();
-            let days_since_epoch = i32::try_from(days_since_epoch)
-                .context("partition day is outside Iceberg date range")?;
-            Struct::from_iter([Some(Literal::date(days_since_epoch))])
-        };
+        let partition = object_partition(table_name, spec.fields(), &object)?;
 
         let file = DataFileBuilder::default()
             .content(DataContentType::Data)
@@ -250,6 +274,7 @@ fn partition_column(table_name: &str) -> Option<&'static str> {
     match table_name {
         "ad_events" => Some("ts"),
         "sessions" => Some("started_at"),
+        "campaigns" => Some("network"),
         _ => None,
     }
 }
@@ -258,8 +283,121 @@ fn partition_field_name(table_name: &str) -> Option<&'static str> {
     match table_name {
         "ad_events" => Some("ts_day"),
         "sessions" => Some("started_at_day"),
+        "campaigns" => Some("network"),
         _ => None,
     }
+}
+
+fn partition_transform(table_name: &str) -> Option<Transform> {
+    match table_name {
+        "ad_events" | "sessions" => Some(Transform::Day),
+        "campaigns" => Some(Transform::Identity),
+        _ => None,
+    }
+}
+
+fn object_partition(
+    table_name: &str,
+    fields: &[iceberg_rust::spec::PartitionField],
+    object: &ParquetObject,
+) -> Result<Struct> {
+    if table_name == "campaigns" {
+        ensure!(
+            fields.len() == 1
+                && fields[0].name == "network"
+                && fields[0].transform == Transform::Identity,
+            "campaigns table must be identity-partitioned by network"
+        );
+        let network = object
+            .partition_network
+            .as_deref()
+            .context("network-partitioned Iceberg object is missing partition_network")?;
+        ensure!(!network.is_empty(), "campaign network partition is empty");
+        return Ok(Struct::from_iter([Some(Literal::string(network))]));
+    }
+    if fields.is_empty() {
+        return Ok(Struct::empty());
+    }
+    let day = object
+        .partition_day
+        .context("day-partitioned Iceberg object is missing partition_day")?;
+    let days_since_epoch = day
+        .signed_duration_since(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+        .num_days();
+    let days_since_epoch =
+        i32::try_from(days_since_epoch).context("partition day is outside Iceberg date range")?;
+    Ok(Struct::from_iter([Some(Literal::date(days_since_epoch))]))
+}
+
+fn mapped_field(field: &NestedField) -> MappedField {
+    let children = match field.field_type.as_ref() {
+        Type::Struct(value) => value
+            .fields()
+            .iter()
+            .map(|child| mapped_field(child.as_ref()))
+            .collect(),
+        Type::Map(value) => vec![
+            mapped_field(value.key_field.as_ref()),
+            mapped_field(value.value_field.as_ref()),
+        ],
+        Type::List(value) => vec![mapped_field(value.element_field.as_ref())],
+        Type::Primitive(_) => Vec::new(),
+    };
+    MappedField::new(Some(field.id), vec![field.name.clone()], children)
+}
+
+fn mapping_from_existing_schema(schema: &Schema) -> NameMapping {
+    NameMapping::new(
+        schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|field| mapped_field(field.as_ref()))
+            .collect(),
+    )
+}
+
+async fn ensure_campaign_name_mapping(
+    catalog: &dyn Catalog,
+    table: Table,
+    source: &TraceSchema,
+) -> Result<Table> {
+    let target = table.metadata().current_schema();
+    if let Some(value) = table
+        .metadata()
+        .properties()
+        .get(DEFAULT_SCHEMA_NAME_MAPPING)
+    {
+        let mapping: NameMapping =
+            serde_json::from_str(value).context("parse existing campaigns Iceberg name mapping")?;
+        for field in &source.fields {
+            let target_id = target
+                .field_by_name(&field.name)
+                .context("campaign schema is missing Parquet field")?
+                .id;
+            ensure!(
+                mapping.fields().iter().any(|mapped| {
+                    mapped.names().iter().any(|name| name == &field.name)
+                        && mapped.field_id() == Some(target_id)
+                }),
+                "campaign name mapping does not map {} to Iceberg field ID {}",
+                field.name,
+                target_id
+            );
+        }
+        return Ok(table);
+    }
+
+    let mapping = mapping_from_existing_schema(target);
+    let value =
+        serde_json::to_string(&mapping).context("serialize campaigns Iceberg name mapping")?;
+    let tx = Transaction::new(&table);
+    tx.update_table_properties()
+        .set(DEFAULT_SCHEMA_NAME_MAPPING.to_string(), value)
+        .apply(tx)?
+        .commit(catalog)
+        .await
+        .context("set campaigns Iceberg name mapping before appending Parquet")
 }
 
 async fn rest_catalog(config: &PublisherConfig) -> Result<iceberg_catalog_rest::RestCatalog> {
@@ -465,6 +603,151 @@ mod tests {
         assert_eq!(name_mapping_json(&trace_schema)[1]["field-id"], 2);
         assert_eq!(partition_column("ad_events"), Some("ts"));
         assert_eq!(partition_field_name("sessions"), Some("started_at_day"));
+        assert_eq!(partition_column("campaigns"), Some("network"));
+        assert_eq!(partition_field_name("campaigns"), Some("network"));
+        assert_eq!(partition_transform("campaigns"), Some(Transform::Identity));
+    }
+
+    #[test]
+    fn campaign_manifest_partition_is_network_identity() {
+        let field = iceberg_rust::spec::PartitionField {
+            source_id: 2,
+            field_id: 1000,
+            name: "network".to_string(),
+            transform: Transform::Identity,
+        };
+        let object = ParquetObject {
+            location: "s3://bucket/iceberg/campaigns/data/network=taboola/part.parquet".to_string(),
+            size_bytes: 100,
+            record_count: 1,
+            partition_day: None,
+            partition_network: Some("taboola".to_string()),
+        };
+        assert_eq!(
+            object_partition("campaigns", &[field.clone()], &object).unwrap(),
+            Struct::from_iter([Some(Literal::string("taboola"))])
+        );
+
+        let mut missing = object.clone();
+        missing.partition_network = None;
+        assert!(object_partition("campaigns", &[field.clone()], &missing).is_err());
+        assert!(object_partition("campaigns", &[], &object).is_err());
+        let mut wrong_transform = field;
+        wrong_transform.transform = Transform::Day;
+        assert!(object_partition("campaigns", &[wrong_transform], &object).is_err());
+    }
+
+    #[test]
+    fn day_manifest_partition_still_uses_days_since_epoch() {
+        let field = iceberg_rust::spec::PartitionField {
+            source_id: 1,
+            field_id: 1000,
+            name: "started_at_day".to_string(),
+            transform: Transform::Day,
+        };
+        let day = NaiveDate::from_ymd_opt(2026, 9, 14).unwrap();
+        let object = ParquetObject {
+            location: "s3://bucket/iceberg/sessions/data/started_at_day=2026-09-14/part.parquet"
+                .to_string(),
+            size_bytes: 100,
+            record_count: 1,
+            partition_day: Some(day),
+            partition_network: None,
+        };
+        let days = day
+            .signed_duration_since(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+            .num_days() as i32;
+        assert_eq!(
+            object_partition("sessions", &[field], &object).unwrap(),
+            Struct::from_iter([Some(Literal::date(days))])
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_campaign_table_gets_name_mapping_from_its_own_field_ids() {
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "test",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    "memory://warehouse".to_string(),
+                )]),
+            )
+            .await
+            .unwrap();
+        let namespace = NamespaceIdent::new("trace".to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .unwrap();
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(41, "campaign_id", Type::Primitive(PrimitiveType::String))
+                    .into(),
+                NestedField::required(73, "network", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .build()
+            .unwrap();
+        let table = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("campaigns".to_string())
+                    .location("memory://warehouse/trace/campaigns".to_string())
+                    .schema(schema)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        // MemoryCatalog renumbers fields on create. Use different producer
+        // IDs to verify the mapping follows the stored table's IDs.
+        let campaign_id = table
+            .metadata()
+            .current_schema()
+            .field_by_name("campaign_id")
+            .unwrap()
+            .id;
+        let network_id = table
+            .metadata()
+            .current_schema()
+            .field_by_name("network")
+            .unwrap()
+            .id;
+        let source = TraceIcebergSchema::new(
+            vec![
+                Field {
+                    id: 101,
+                    name: "campaign_id".to_string(),
+                    required: true,
+                    field_type: IcebergType::String,
+                    doc: None,
+                },
+                Field {
+                    id: 102,
+                    name: "network".to_string(),
+                    required: true,
+                    field_type: IcebergType::String,
+                    doc: None,
+                },
+            ],
+            None,
+        );
+        let updated = ensure_campaign_name_mapping(&catalog, table, &source)
+            .await
+            .unwrap();
+        let value = updated
+            .metadata()
+            .properties()
+            .get(DEFAULT_SCHEMA_NAME_MAPPING)
+            .unwrap();
+        let mapping: NameMapping = serde_json::from_str(value).unwrap();
+        assert_ne!(campaign_id, 101);
+        assert_ne!(network_id, 102);
+        assert_eq!(mapping.fields()[0].field_id(), Some(campaign_id));
+        assert_eq!(mapping.fields()[1].field_id(), Some(network_id));
+        ensure_campaign_name_mapping(&catalog, updated, &source)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -565,5 +848,11 @@ mod tests {
                 .count(),
             2
         );
+        let paths = data_file_locations(&catalog.load_table(&ident).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains("memory://warehouse/trace/ad_events/data/first.parquet"));
+        assert!(paths.contains("memory://warehouse/trace/ad_events/data/second.parquet"));
     }
 }

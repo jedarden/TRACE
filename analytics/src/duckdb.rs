@@ -4,8 +4,8 @@ use duckdb::{params, types::ValueRef, Connection};
 
 /// SQL for a view over a Hive-partitioned Parquet glob. The
 /// `hive_partitioning = true` flag is what exposes the directory-named
-/// partition columns (`dt`, `ts_day`, `started_at_day`, …) — without it those
-/// columns don't exist and no partition predicate can prune files.
+/// partition columns (`dt`, `ts_day`, `started_at_day`, `network`, …) — without
+/// it partition predicates cannot prune files by their directory values.
 pub fn hive_parquet_view_sql(view_name: &str, glob: &str) -> String {
     format!(
         "CREATE OR REPLACE VIEW {} AS \
@@ -174,27 +174,25 @@ impl DuckDBClient {
             .execute(&ad_events_sql, params![])
             .context("Failed to create view for Iceberg ad_events table")?;
 
-        // Create view for campaigns dimension table
+        // The syncer publishes immutable campaign revisions. Select the
+        // newest revision per network/campaign key for dimension queries.
         let campaigns_path = format!("{}/trace/campaigns", warehouse);
         let campaigns_sql = format!(
-            "CREATE OR REPLACE VIEW iceberg_campaigns AS \
-             SELECT * FROM iceberg_scan('{}', {});",
+            "CREATE OR REPLACE VIEW trace.campaigns AS \
+             SELECT * FROM iceberg_scan('{}', {}) \
+             QUALIFY ROW_NUMBER() OVER (PARTITION BY network, campaign_id \
+             ORDER BY synced_at DESC) = 1;",
             campaigns_path, catalog_option
         );
         self.conn
             .execute(&campaigns_sql, params![])
             .context("Failed to create view for Iceberg campaigns table")?;
-
-        // Create view for creatives dimension table
-        let creatives_path = format!("{}/trace/creatives", warehouse);
-        let creatives_sql = format!(
-            "CREATE OR REPLACE VIEW iceberg_creatives AS \
-             SELECT * FROM iceberg_scan('{}', {});",
-            creatives_path, catalog_option
-        );
         self.conn
-            .execute(&creatives_sql, params![])
-            .context("Failed to create view for Iceberg creatives table")?;
+            .execute(
+                "CREATE OR REPLACE VIEW iceberg_campaigns AS SELECT * FROM trace.campaigns;",
+                params![],
+            )
+            .context("Failed to create compatibility view for Iceberg campaigns")?;
 
         // Create view for assets dimension table (headlines, images, and
         // landing pages exploded from synced creatives — schema in
@@ -238,14 +236,16 @@ impl DuckDBClient {
     /// Every view sets `hive_partitioning = true`: the pipeline writes
     /// Hive-style partition directories (`events/dt=YYYY-MM-DD/hour=HH/`,
     /// `events-compacted/dt=YYYY-MM-DD/`, `iceberg/ad_events/data/ts_day=…/`,
-    /// `iceberg/sessions/data/started_at_day=…/` — none of which carry the
-    /// partition value as an in-file column), so the partition columns only
+    /// `iceberg/sessions/data/started_at_day=…/` — those day partition
+    /// values do not exist as in-file columns), so the partition columns only
     /// exist if hive extraction is on. Without it a `dt`/`ts_day`/
     /// `started_at_day` predicate is an unknown-column error, and with it the
     /// predicate is what lets DuckDB skip whole directories — filtering the
     /// in-file `ts` timestamp alone reads every file (verified, see
     /// docs/analytics/iceberg_partition_pruning.md and
     /// `test_partition_predicate_prunes_files_scanned` below).
+    /// Campaign snapshots use `iceberg/campaigns/data/network=…/` and retain
+    /// `network` in each row; filtering the view by network prunes those files.
     ///
     /// The two raw event views have one opt-in exception: with
     /// `compat_event_views` they come from `crate::events_compat` instead,
@@ -299,6 +299,47 @@ impl DuckDBClient {
             "parquet_sessions",
             &sessions_glob,
             "Failed to create view for partitioned sessions",
+        )?;
+
+        // The syncer owns one current campaigns.parquet per network. Exclude
+        // immutable revision and compaction outputs from this source view to
+        // avoid reading an old campaign generation alongside the current one.
+        let campaigns_glob = format!(
+            "{}/iceberg/campaigns/data/network=*/campaigns.parquet",
+            s3_path
+        );
+        ensure_trace_schema(&self.conn)?;
+        match self.conn.execute(
+            &hive_parquet_view_sql("trace.campaigns", &campaigns_glob),
+            params![],
+        ) {
+            Ok(_) => {}
+            Err(error)
+                if format!("{error:#}").contains("No files found that match the pattern") =>
+            {
+                // Reports can start before the first --hierarchy sync. Keep
+                // the dimension relation available with the producer schema.
+                self.conn.execute_batch(
+                    "CREATE OR REPLACE VIEW trace.campaigns AS
+                     SELECT CAST(NULL AS VARCHAR) AS campaign_id,
+                            CAST(NULL AS VARCHAR) AS network,
+                            CAST(NULL AS VARCHAR) AS campaign_name,
+                            CAST(NULL AS VARCHAR) AS status,
+                            CAST(NULL AS VARCHAR) AS account_id,
+                            CAST(NULL AS VARCHAR) AS account_name,
+                            CAST(NULL AS TIMESTAMP) AS synced_at
+                     WHERE FALSE;",
+                )?;
+            }
+            Err(error) => {
+                return Err(error).context("Failed to create view for partitioned campaigns")
+            }
+        }
+        create_optional_parquet_view(
+            &self.conn,
+            "parquet_campaigns",
+            &campaigns_glob,
+            "Failed to create compatibility view for partitioned campaigns",
         )?;
 
         let assets_glob = format!("{}/assets/**/*.parquet", s3_path);
@@ -364,32 +405,9 @@ impl DuckDBClient {
         }
     }
 
-    /// Get the SQL fragment for querying campaigns dimension table
-    pub fn campaigns_table_sql(&self, config: &Config) -> String {
-        if config.is_iceberg_enabled() {
-            "iceberg_campaigns".to_string()
-        } else {
-            // For Parquet mode, campaigns data is embedded in events
-            // Return a subquery that extracts unique campaigns from events
-            format!(
-                "(SELECT DISTINCT campaign_id, campaign_name, network FROM {})",
-                self.events_table_sql(config)
-            )
-        }
-    }
-
-    /// Get the SQL fragment for querying creatives dimension table
-    pub fn creatives_table_sql(&self, config: &Config) -> String {
-        if config.is_iceberg_enabled() {
-            "iceberg_creatives".to_string()
-        } else {
-            // For Parquet mode, creatives data is embedded in events
-            // Return a subquery that extracts unique creatives from events
-            format!(
-                "(SELECT DISTINCT creative_id, headline, image_id, network FROM {})",
-                self.events_table_sql(config)
-            )
-        }
+    /// Get the synced campaigns dimension in either backend.
+    pub fn campaigns_table_sql(&self, _config: &Config) -> String {
+        "trace.campaigns".to_string()
     }
 
     /// Get the SQL fragment for querying the assets dimension table
@@ -963,14 +981,238 @@ mod partition_pruning_tests {
     }
 
     #[test]
-    fn test_iceberg_setup_registers_trace_assets_from_configured_table() {
+    fn test_campaign_partition_prunes_files_and_preserves_network_key() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let db = DuckDBClient {
+            conn: Connection::open_in_memory().expect("open connection"),
+        };
+        db.setup_parquet_views(&root.display().to_string(), &parquet_config())
+            .expect("register campaign fixture");
+
+        let selected = files_scanned(
+            db.connection(),
+            "SELECT COUNT(*) FROM trace.campaigns WHERE network = 'taboola'",
+        );
+        let all = files_scanned(db.connection(), "SELECT COUNT(*) FROM trace.campaigns");
+        assert_eq!(selected, 1, "network filter must read one partition");
+        assert_eq!(all, 3, "unfiltered query must read every network partition");
+
+        let mut stmt = db
+            .connection()
+            .prepare(
+                "SELECT network, campaign_id, campaign_name, status, account_id \
+                 FROM trace.campaigns WHERE campaign_id = 'shared-1' ORDER BY network",
+            )
+            .expect("prepare campaign join fixture");
+        let rows: Vec<(String, String, String, String, String)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .expect("query campaigns")
+            .map(|row| row.expect("read campaign row"))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "mgid".into(),
+                    "shared-1".into(),
+                    "MGID Spring".into(),
+                    "active".into(),
+                    "acct-m".into()
+                ),
+                (
+                    "taboola".into(),
+                    "shared-1".into(),
+                    "Taboola Spring".into(),
+                    "active".into(),
+                    "acct-t".into()
+                ),
+            ],
+            "a campaign ID shared by networks must retain separate metadata"
+        );
+        db.connection()
+            .execute_batch(
+                "CREATE TABLE campaign_events (network VARCHAR, campaign_id VARCHAR);
+                 INSERT INTO campaign_events VALUES
+                   ('taboola', 'shared-1'), ('mgid', 'shared-1');",
+            )
+            .expect("seed events with overlapping campaign IDs");
+        let joined: Vec<(String, String)> = {
+            let mut stmt = db
+                .connection()
+                .prepare(
+                    "SELECT e.network, c.campaign_name
+                     FROM campaign_events e JOIN trace.campaigns c
+                       ON e.network = c.network AND e.campaign_id = c.campaign_id
+                     ORDER BY e.network",
+                )
+                .expect("prepare network-safe campaign join");
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("run campaign join")
+                .map(|row| row.expect("read joined campaign"))
+                .collect()
+        };
+        assert_eq!(
+            joined,
+            vec![
+                ("mgid".into(), "MGID Spring".into()),
+                ("taboola".into(), "Taboola Spring".into()),
+            ]
+        );
+        assert_eq!(db.campaigns_table_sql(&parquet_config()), "trace.campaigns");
+        let compatibility_rows: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM parquet_campaigns", [], |row| {
+                row.get(0)
+            })
+            .expect("read migration source");
+        assert_eq!(compatibility_rows, 4);
+        db.connection()
+            .execute_batch(
+                "CREATE TABLE parquet_ad_events (
+                     network VARCHAR, campaign_id VARCHAR, type VARCHAR,
+                     ts TIMESTAMP, ts_day DATE
+                 );
+                 INSERT INTO parquet_ad_events VALUES
+                     ('taboola', 'shared-1', 'pageview', TIMESTAMP '2026-10-01 10:00:00', DATE '2026-10-01'),
+                     ('taboola', 'shared-1', 'click', TIMESTAMP '2026-10-01 10:01:00', DATE '2026-10-01'),
+                     ('mgid', 'shared-1', 'pageview', TIMESTAMP '2026-10-01 11:00:00', DATE '2026-10-01'),
+                     ('outbrain', 'unsynced-1', 'pageview', TIMESTAMP '2026-10-01 12:00:00', DATE '2026-10-01');",
+            )
+            .expect("seed campaign report events");
+        let sql = render_template_with_client(
+            include_str!("../queries/ctr_by_campaign.sql"),
+            &ReportParams {
+                s3_path: None,
+                start_date: Some("2026-10-01".into()),
+                end_date: Some("2026-10-02".into()),
+            },
+            &db,
+            &parquet_config(),
+        );
+        let report = db
+            .execute_query(&sql)
+            .expect("run campaign dimension report");
+        assert_eq!(report.rows.len(), 5, "keep quiet and unsynced campaigns");
+        let taboola = report
+            .rows
+            .iter()
+            .find(|row| row[0] == "shared-1" && row[1] == "taboola")
+            .expect("Taboola campaign");
+        assert_eq!(
+            &taboola[2..7],
+            &["Taboola Spring", "active", "acct-t", "1", "1"]
+        );
+        let mgid = report
+            .rows
+            .iter()
+            .find(|row| row[0] == "shared-1" && row[1] == "mgid")
+            .expect("MGID campaign");
+        assert_eq!(&mgid[2..7], &["MGID Spring", "active", "acct-m", "1", "0"]);
+        let quiet = report
+            .rows
+            .iter()
+            .find(|row| row[0] == "quiet-2")
+            .expect("zero-traffic campaign");
+        assert_eq!(&quiet[5..7], &["0", "0"]);
+        let unsynced = report
+            .rows
+            .iter()
+            .find(|row| row[0] == "unsynced-1")
+            .expect("unsynced event campaign");
+        assert_eq!(&unsynced[1..3], &["outbrain", "NULL"]);
+        assert_eq!(&unsynced[5..7], &["1", "0"]);
+    }
+
+    #[test]
+    fn test_campaign_relation_is_empty_before_first_hierarchy_sync() {
+        let missing = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/absent-hierarchy");
+        let db = DuckDBClient {
+            conn: Connection::open_in_memory().expect("open connection"),
+        };
+        db.setup_parquet_views(&missing.display().to_string(), &parquet_config())
+            .expect("register empty campaign relation");
+        let count: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM trace.campaigns", [], |row| row.get(0))
+            .expect("query empty campaign relation");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_iceberg_setup_registers_trace_campaigns_from_configured_table() {
         let conn = Connection::open_in_memory().expect("open connection");
         conn.execute_batch(
+            "CREATE TABLE iceberg_campaign_fixture (
+                 campaign_id VARCHAR, network VARCHAR, campaign_name VARCHAR,
+                 status VARCHAR, synced_at TIMESTAMP
+             );
+             INSERT INTO iceberg_campaign_fixture VALUES
+                 ('camp-1', 'taboola', 'Old name', 'active', TIMESTAMP '2026-09-01 12:00:00'),
+                 ('camp-1', 'taboola', 'Spring', 'active', TIMESTAMP '2026-10-01 12:00:00');
+             CREATE MACRO iceberg_scan(table_path, catalog_uri) AS TABLE
+                 SELECT * FROM iceberg_campaign_fixture
+                 WHERE table_path = 's3://trace-bucket/warehouse/trace/campaigns'
+                   AND catalog_uri = 'http://catalog.test';",
+        )
+        .expect("install local campaign scan fixture");
+
+        let db = DuckDBClient { conn };
+        let config = Config {
+            iceberg_catalog_uri: Some("http://catalog.test".to_string()),
+            iceberg_warehouse: Some("s3://trace-bucket/warehouse".to_string()),
+            ..parquet_config()
+        };
+        db.setup_iceberg_views(&config)
+            .expect("register Iceberg campaign view");
+        assert_eq!(db.campaigns_table_sql(&config), "trace.campaigns");
+        let rows: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM trace.campaigns WHERE network = 'taboola' AND status = 'active'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read configured campaign table");
+        assert_eq!(rows, 1);
+        let latest: String = db
+            .connection()
+            .query_row(
+                "SELECT campaign_name FROM trace.campaigns WHERE campaign_id = 'camp-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read latest campaign revision");
+        assert_eq!(latest, "Spring");
+        let alias_rows: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM iceberg_campaigns", [], |row| {
+                row.get(0)
+            })
+            .expect("read compatibility campaign view");
+        assert_eq!(alias_rows, 1);
+    }
+
+    #[test]
+    fn test_iceberg_setup_registers_trace_assets_from_configured_table() {
+        let conn = Connection::open_in_memory().expect("open connection");
+        // The scan macro stands in for every Iceberg table registered during
+        // setup, so it also needs the campaign columns used by that view.
+        conn.execute_batch(
             "CREATE TABLE iceberg_fixture (
-                 asset_id VARCHAR, network VARCHAR, type VARCHAR, content VARCHAR
+                 asset_id VARCHAR, network VARCHAR, type VARCHAR, content VARCHAR,
+                 campaign_id VARCHAR, synced_at TIMESTAMP
              );
              INSERT INTO iceberg_fixture VALUES
-                 ('taboola:headline:fixture', 'taboola', 'headline', 'fixture content');
+                 ('taboola:headline:fixture', 'taboola', 'headline', 'fixture content',
+                  'camp-1', TIMESTAMP '2026-10-01 12:00:00');
              CREATE MACRO iceberg_scan(table_path, catalog_uri) AS TABLE
                  SELECT * FROM iceberg_fixture
                  WHERE table_path = 's3://trace-bucket/warehouse/trace/assets'
@@ -1169,6 +1411,10 @@ mod partition_pruning_tests {
              CREATE TABLE trace.assets (
                  asset_id VARCHAR, network VARCHAR, type VARCHAR, content VARCHAR,
                  creative_id VARCHAR, campaign_id VARCHAR, campaign_name VARCHAR
+             );
+             CREATE TABLE trace.campaigns (
+                 campaign_id VARCHAR, network VARCHAR, campaign_name VARCHAR,
+                 status VARCHAR, account_id VARCHAR
              );",
         )
         .expect("create report fixture relations");

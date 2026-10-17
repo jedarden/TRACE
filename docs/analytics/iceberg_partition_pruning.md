@@ -193,6 +193,17 @@ WHERE network = 'taboola' OR network = 'outbrain';
 -- May scan multiple partitions
 ```
 
+### Campaign Dimension
+
+The campaign dimension uses identity partitioning on `network`. The checked-in
+fixture under `analytics/tests/fixtures/iceberg/campaigns/data/` has one
+`campaigns.parquet` file in each of three network partitions. The
+`test_campaign_partition_prunes_files_and_preserves_network_key` regression
+checks that a Taboola filter reads 1 of 3 files while an unfiltered query
+reads all 3. It also verifies that the same campaign ID in Taboola and MGID
+retains the correct network-specific name when joined to events. These are
+local Parquet fixture measurements; the Iceberg catalog is not involved.
+
 ### Combining Multiple Predicates
 
 ```sql

@@ -26,6 +26,11 @@ range with the matching `ts_day` range; `ts` alone filters rows but does not
 skip Parquet files. The registered `parquet_sessions` view similarly retains
 `started_at_day` from
 `s3://<TRACE_S3_BUCKET>/<TRACE_S3_PREFIX>/iceberg/sessions/data/**/*.parquet`.
+In Parquet mode, `trace.campaigns` reads the syncer's current
+network-partitioned campaign files. In Iceberg mode it selects the latest
+immutable revision of each campaign. Join it to events on
+`(network, campaign_id)`; campaign IDs can be reused by different networks.
+The CTR report also keeps events for campaigns that have not synced yet.
 With the REST catalog, the service registers `iceberg_ad_events` and
 `iceberg_sessions`; timestamp ranges prune the Iceberg day transforms. The
 mixed-generation `parquet_events` and `parquet_events_compacted` compatibility
@@ -56,20 +61,31 @@ LIMIT 100;
 ### Click-Through Rate (CTR)
 
 ```sql
--- CTR by campaign
+-- CTR by campaign, retaining unsynced events and zero-traffic campaigns
+WITH filtered_events AS (
+    SELECT network, campaign_id, type
+    FROM parquet_ad_events
+    WHERE ts >= CURRENT_DATE - INTERVAL '30 days'
+        AND ts_day >= CAST(CURRENT_DATE - INTERVAL '30 days' AS DATE)
+)
 SELECT
-    params->>'utm_campaign' AS campaign,
-    params->>'utm_source' AS source,
-    COUNT(*) FILTER (WHERE type = 'pageview') AS views,
-    COUNT(*) FILTER (WHERE type = 'click') AS clicks,
+    COALESCE(c.network, e.network) AS network,
+    COALESCE(c.campaign_id, e.campaign_id) AS campaign_id,
+    c.campaign_name,
+    c.status,
+    c.account_id,
+    COUNT(*) FILTER (WHERE e.type = 'pageview') AS views,
+    COUNT(*) FILTER (WHERE e.type = 'click') AS clicks,
     ROUND(
-        100.0 * clicks / NULLIF(views, 0),
+        100.0 * COUNT(*) FILTER (WHERE e.type = 'click') /
+        NULLIF(COUNT(*) FILTER (WHERE e.type = 'pageview'), 0),
         2
     ) AS ctr_pct
-FROM parquet_ad_events
-WHERE ts >= CURRENT_DATE - INTERVAL '30 days'
-    AND ts_day >= CAST(CURRENT_DATE - INTERVAL '30 days' AS DATE)
-GROUP BY 1, 2
+FROM trace.campaigns c
+FULL OUTER JOIN filtered_events e
+    ON e.network = c.network AND e.campaign_id = c.campaign_id
+GROUP BY COALESCE(c.network, e.network), COALESCE(c.campaign_id, e.campaign_id),
+    c.campaign_name, c.status, c.account_id
 ORDER BY clicks DESC
 LIMIT 50;
 ```
