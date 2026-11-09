@@ -745,6 +745,39 @@ mod partition_pruning_tests {
         }
     }
 
+    /// One expected `trace.assets` fixture row: the checked-in Hive fixture
+    /// stores `asset_id = "<network>:<type>"` and the fixed content value.
+    fn fixture_asset_row(network: &str, asset_type: &str) -> (String, String, String, String) {
+        (
+            format!("{network}:{asset_type}"),
+            network.to_string(),
+            asset_type.to_string(),
+            "fixture content".to_string(),
+        )
+    }
+
+    /// Deterministic `trace.assets` result rows for `predicate` ("" for the
+    /// unfiltered baseline), ordered by `asset_id`.
+    fn asset_rows(conn: &Connection, predicate: &str) -> Vec<(String, String, String, String)> {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT asset_id, network, type, content \
+                 FROM trace.assets {predicate} ORDER BY asset_id"
+            ))
+            .expect("prepare assets query");
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .expect("query assets")
+        .map(|row| row.expect("read asset row"))
+        .collect()
+    }
+
     /// `TABLE_SCAN -> Total Files Read` from EXPLAIN ANALYZE of `sql`.
     fn files_scanned(conn: &Connection, sql: &str) -> usize {
         let mut stmt = conn
@@ -937,40 +970,48 @@ mod partition_pruning_tests {
             "network predicate must read fewer files than the unfiltered baseline"
         );
 
-        let selected_rows = {
-            let mut stmt = db
-                .connection()
-                .prepare(
-                    "SELECT asset_id, network, type FROM trace.assets \
-                     WHERE network = 'taboola' ORDER BY asset_id",
-                )
-                .expect("prepare filtered assets query");
-            stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .expect("query filtered assets")
-            .map(|row| row.expect("read filtered asset row"))
-            .collect::<Vec<_>>()
-        };
+        // Expected result rows, not just file counts: a network predicate
+        // must return exactly that network's fixture rows, and the unfiltered
+        // baseline must return the rows of every fixture network. `content`
+        // pins each row's payload so the assertions cannot pass on a
+        // mis-registered glob that merely carries the right partition
+        // columns. `asset_rows` orders by asset_id, so every comparison is
+        // deterministic.
+        let taboola_rows = asset_rows(db.connection(), "WHERE network = 'taboola'");
         assert_eq!(
-            selected_rows,
+            taboola_rows,
             vec![
-                (
-                    "taboola:headline".to_string(),
-                    "taboola".to_string(),
-                    "headline".to_string(),
-                ),
-                (
-                    "taboola:image".to_string(),
-                    "taboola".to_string(),
-                    "image".to_string(),
-                ),
+                fixture_asset_row("taboola", "headline"),
+                fixture_asset_row("taboola", "image"),
             ],
             "network predicate must return every selected network row and no others"
+        );
+
+        let mgid_rows = asset_rows(db.connection(), "WHERE network = 'mgid'");
+        assert_eq!(
+            mgid_rows,
+            vec![
+                fixture_asset_row("mgid", "headline"),
+                fixture_asset_row("mgid", "image"),
+            ],
+            "the second fixture network must return exactly its own rows"
+        );
+
+        let baseline_rows = asset_rows(db.connection(), "");
+        assert_eq!(
+            baseline_rows,
+            vec![
+                fixture_asset_row("mgid", "headline"),
+                fixture_asset_row("mgid", "image"),
+                fixture_asset_row("taboola", "headline"),
+                fixture_asset_row("taboola", "image"),
+            ],
+            "unfiltered baseline must return the rows of every fixture network"
+        );
+        assert_eq!(
+            baseline_rows.len(),
+            taboola_rows.len() + mgid_rows.len(),
+            "the two network-filtered results must partition the unfiltered baseline"
         );
 
         let compatibility_rows: i64 = db

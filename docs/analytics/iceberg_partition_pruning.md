@@ -171,8 +171,10 @@ The regression test `test_asset_partition_predicates_prune_files_scanned` in
 `analytics/tests/fixtures/assets/`, with one Parquet file for each of four
 `network`/`type` pairs across Taboola and MGID. `EXPLAIN ANALYZE` reads 2 of 4
 files for `network = 'taboola'`, compared with all 4 files for the unfiltered
-baseline, and the filtered query returns the two Taboola rows. The test uses
-the Parquet view directly and does not connect to the Iceberg catalog. This
+baseline; each network filter returns exactly that network's two fixture rows,
+and the unfiltered baseline returns all four rows from both fixture networks.
+The test uses the Parquet view directly and does not connect to the Iceberg
+catalog. This
 validates the network-pruning guidance below on the DuckDB Parquet read path;
 it is a local fixture result, not a measurement of the live Iceberg catalog.
 
