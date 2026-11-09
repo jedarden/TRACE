@@ -182,9 +182,13 @@ assets/network=mgid/type=image/part-00000.parquet
 The local `trace.assets` view enables `hive_partitioning = true`, so
 `network = 'taboola'` reads 2 of 4 files and returns the two Taboola fixture
 rows (`taboola:headline` and `taboola:image`); the corresponding MGID filter
-reads 2 of 4 and returns `mgid:headline` and `mgid:image`. The unfiltered
-baseline reads all 4 files and returns all four rows. A filter for the absent
-fixture network `outbrain` reads 0 files and returns 0 rows.
+reads 2 of 4 and returns `mgid:headline` and `mgid:image`. Combining both
+partition columns — `network = 'taboola' AND type = 'headline'` — descends
+into the nested partition and reads 1 of 4 files, returning exactly the
+`taboola:headline` fixture row (fewer files than the network-only filter's 2
+and the unfiltered baseline's 4). The unfiltered baseline reads all 4 files
+and returns all four rows. A filter for the absent fixture network
+`outbrain` reads 0 files and returns 0 rows.
 The row assertions and the plan assertions run the same result/baseline SQL,
 so the file list and the rows describe one execution. Beyond the
 `Total Files Read` counter, the test also checks the plan's `Filename(s):`
@@ -196,6 +200,11 @@ card — the part of `EXPLAIN ANALYZE` that identifies *which* files were read
   `network=taboola/type=…/part-00000.parquet` paths — two occurrences of
   `/network=taboola/` and none of `/network=mgid/` — and the two networks'
   plans together cover exactly the four files the baseline counter reads.
+- The combined network/type filter names its nested partition: the
+  `network = 'taboola' AND type = 'headline'` plan's card contains only
+  `network=taboola/type=headline/part-00000.parquet` — one occurrence each
+  of `/network=taboola/` and `/type=headline/`, and no `/network=mgid/` or
+  `/type=image/` — matching the combined-predicate SQL guidance below.
 - A plan that prunes no files shows the unexpanded source glob
   (`assets/**/*.parquet`) in the card instead of resolved paths, so the
   unfiltered baseline's file identity rests on its `Total Files Read: 4`
