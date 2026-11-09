@@ -166,13 +166,25 @@ WHERE started_at >= TIMESTAMP '2026-09-03 00:00:00'
 
 ### Network-Based Queries on Assets Table
 
-The regression test `test_asset_partition_predicates_prune_files_scanned` in
-`analytics/src/duckdb.rs` reads the checked-in local fixture at
-`analytics/tests/fixtures/assets/`, with one Parquet file for each of four
-`network`/`type` pairs across Taboola and MGID. `EXPLAIN ANALYZE` reads 2 of 4
-files for `network = 'taboola'`, compared with all 4 files for the unfiltered
-baseline; each network filter returns exactly that network's two fixture rows,
-and the unfiltered baseline returns all four rows from both fixture networks.
+The regression test
+`test_asset_partition_predicates_prune_files_scanned` in
+`analytics/src/duckdb.rs` reads the checked-in local DuckDB fixture at
+`analytics/tests/fixtures/assets/`. The fixture is Hive-partitioned by
+`network` and `type`, with one file in each of these paths:
+
+```
+assets/network=taboola/type=headline/part-00000.parquet
+assets/network=taboola/type=image/part-00000.parquet
+assets/network=mgid/type=headline/part-00000.parquet
+assets/network=mgid/type=image/part-00000.parquet
+```
+
+The local `trace.assets` view enables `hive_partitioning = true`, so
+`network = 'taboola'` reads 2 of 4 files and returns the two Taboola fixture
+rows (`taboola:headline` and `taboola:image`); the corresponding MGID filter
+reads 2 of 4 and returns `mgid:headline` and `mgid:image`. The unfiltered
+baseline reads all 4 files and returns all four rows. A filter for the absent
+fixture network `outbrain` reads 0 files and returns 0 rows.
 The row assertions and the plan assertions run the same result/baseline SQL,
 so the file list and the rows describe one execution. Beyond the
 `Total Files Read` counter, the test also checks the plan's `Filename(s):`
