@@ -745,6 +745,25 @@ mod partition_pruning_tests {
         }
     }
 
+    /// Resolve the checked-in fixture root from the invocation directory
+    /// instead of trusting `env!("CARGO_MANIFEST_DIR")`: the macro bakes the
+    /// compile-time absolute path into the binary, and this repo shares one
+    /// Cargo target dir across checkouts, so a test binary reused from a
+    /// moved extraction carries a path that no longer exists (the fixtures
+    /// then match no files and Hive-backed views silently fall back). `cargo
+    /// test` runs test binaries with the package root as the working
+    /// directory; mirrors `manifest_dir()` in tests/normalization_views.rs.
+    fn checked_in_fixtures_root() -> PathBuf {
+        let current = std::env::current_dir().expect("read test working directory");
+        if current.join("tests/fixtures").is_dir() {
+            current.join("tests/fixtures")
+        } else if current.join("analytics/tests/fixtures").is_dir() {
+            current.join("analytics/tests/fixtures")
+        } else {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+        }
+    }
+
     /// One expected `trace.assets` fixture row: the checked-in Hive fixture
     /// stores `asset_id = "<network>:<type>"` and the fixed content value.
     fn fixture_asset_row(network: &str, asset_type: &str) -> (String, String, String, String) {
@@ -1013,7 +1032,7 @@ mod partition_pruning_tests {
 
     #[test]
     fn test_asset_partition_predicates_prune_files_scanned() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let root = checked_in_fixtures_root();
 
         let conn = Connection::open_in_memory().expect("open connection");
         let db = DuckDBClient { conn };
@@ -1259,7 +1278,7 @@ mod partition_pruning_tests {
 
     #[test]
     fn test_campaign_partition_prunes_files_and_preserves_network_key() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let root = checked_in_fixtures_root();
         let db = DuckDBClient {
             conn: Connection::open_in_memory().expect("open connection"),
         };
@@ -1410,7 +1429,7 @@ mod partition_pruning_tests {
 
     #[test]
     fn test_campaign_relation_is_empty_before_first_hierarchy_sync() {
-        let missing = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/absent-hierarchy");
+        let missing = checked_in_fixtures_root().join("absent-hierarchy");
         let db = DuckDBClient {
             conn: Connection::open_in_memory().expect("open connection"),
         };
