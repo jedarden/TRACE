@@ -6,9 +6,10 @@ must be bootstrapped before publication is enabled.
 
 ## Catalog and storage
 
-Deploy `k8s/iceberg-rest.yaml` through the cluster's GitOps repository. The
-catalog uses a persistent SQLite JDBC catalog and the existing
-`trace-s3-credentials` secret. Configure `trace-config` with:
+Deploy `declarative-config/k8s/ardenone-manager/trace/iceberg-rest.yaml`
+through the cluster's GitOps repository. The catalog uses a persistent SQLite
+JDBC catalog and the existing `trace-s3-credentials` secret. Configure
+`trace-config` with:
 
 ```yaml
 iceberg-catalog-uri: http://iceberg-rest.trace.svc.cluster.local:8181
