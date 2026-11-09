@@ -757,10 +757,10 @@ mod partition_pruning_tests {
     }
 
     /// The `trace.assets` result and baseline queries established by
-    /// trace-14ae2518: `predicate` filters the network ("" is the unfiltered
-    /// baseline), ordered by `asset_id`. The row assertions and the
-    /// EXPLAIN ANALYZE file-identity check below both run this exact SQL,
-    /// so the rows and the file list describe the same execution.
+    /// trace-14ae2518: `predicate` filters the network and/or asset type (""
+    /// is the unfiltered baseline), ordered by `asset_id`. The row assertions
+    /// and the EXPLAIN ANALYZE file-identity checks below both run this exact
+    /// SQL, so the rows and the file list describe the same execution.
     fn assets_query(predicate: &str) -> String {
         format!(
             "SELECT asset_id, network, type, content \
@@ -1037,6 +1037,10 @@ mod partition_pruning_tests {
             network_and_type, 1,
             "network/type predicates must read only one asset partition"
         );
+        assert!(
+            network_and_type < network_only,
+            "combined network/type predicate must read fewer files than network-only"
+        );
 
         let all_files = files_scanned(db.connection(), "SELECT COUNT(*) FROM trace.assets");
         assert_eq!(
@@ -1056,6 +1060,12 @@ mod partition_pruning_tests {
             files_scanned(db.connection(), &assets_query("WHERE network = 'taboola'")),
             network_only,
             "the taboola result query's plan must read only the taboola files"
+        );
+        let combined_query = assets_query("WHERE network = 'taboola' AND type = 'headline'");
+        assert_eq!(
+            files_scanned(db.connection(), &combined_query),
+            network_and_type,
+            "the combined result query's plan must read only the matching nested partition"
         );
         assert_eq!(
             files_scanned(db.connection(), &assets_query("")),
@@ -1087,6 +1097,32 @@ mod partition_pruning_tests {
             network_only,
             "plan must identify no file outside the taboola partitions: {}",
             taboola_files
+        );
+
+        let combined_cards = filename_cards(db.connection(), &combined_query);
+        assert_eq!(
+            combined_cards.len(),
+            1,
+            "the combined result query must plan as one Parquet scan"
+        );
+        let combined_files = &combined_cards[0];
+        assert_eq!(
+            combined_files.matches("/network=taboola/").count(),
+            network_and_type,
+            "combined plan must identify only the selected network file: {}",
+            combined_files
+        );
+        assert_eq!(
+            combined_files.matches("/type=headline/").count(),
+            network_and_type,
+            "combined plan must identify only the selected type file: {}",
+            combined_files
+        );
+        assert_eq!(
+            combined_files.matches("/network=").count(),
+            network_and_type,
+            "combined plan must identify no file outside the selected nested partition: {}",
+            combined_files
         );
 
         let mgid_cards = filename_cards(db.connection(), &assets_query("WHERE network = 'mgid'"));
@@ -1175,6 +1211,16 @@ mod partition_pruning_tests {
                 fixture_asset_row("taboola", "image"),
             ],
             "network predicate must return every selected network row and no others"
+        );
+
+        let combined_rows = asset_rows(
+            db.connection(),
+            "WHERE network = 'taboola' AND type = 'headline'",
+        );
+        assert_eq!(
+            combined_rows,
+            vec![fixture_asset_row("taboola", "headline")],
+            "combined network/type predicate must return exactly the matching nested row"
         );
 
         let mgid_rows = asset_rows(db.connection(), "WHERE network = 'mgid'");
