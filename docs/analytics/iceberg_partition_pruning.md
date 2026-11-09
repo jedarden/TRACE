@@ -173,10 +173,28 @@ The regression test `test_asset_partition_predicates_prune_files_scanned` in
 files for `network = 'taboola'`, compared with all 4 files for the unfiltered
 baseline; each network filter returns exactly that network's two fixture rows,
 and the unfiltered baseline returns all four rows from both fixture networks.
+The row assertions and the plan assertions run the same result/baseline SQL,
+so the file list and the rows describe one execution. Beyond the
+`Total Files Read` counter, the test also checks the plan's `Filename(s):`
+card — the part of `EXPLAIN ANALYZE` that identifies *which* files were read
+(measured on DuckDB 1.10502):
+
+- A network filter that prunes to a strict subset names its concrete files:
+  the `network = 'taboola'` plan's card contains only
+  `network=taboola/type=…/part-00000.parquet` paths — two occurrences of
+  `/network=taboola/` and none of `/network=mgid/` — and the two networks'
+  plans together cover exactly the four files the baseline counter reads.
+- A plan that prunes no files shows the unexpanded source glob
+  (`assets/**/*.parquet`) in the card instead of resolved paths, so the
+  unfiltered baseline's file identity rests on its `Total Files Read: 4`
+  counter plus the fixture tree, not on a file list.
+- A filter for a network absent from the fixture (`network = 'outbrain'`)
+  prunes to zero files and emits no `Filename(s):` card at all.
+
 The test uses the Parquet view directly and does not connect to the Iceberg
-catalog. This
-validates the network-pruning guidance below on the DuckDB Parquet read path;
-it is a local fixture result, not a measurement of the live Iceberg catalog.
+catalog. This validates the network-pruning guidance below on the DuckDB
+Parquet read path; it is a local fixture result, not a measurement of the
+live Iceberg catalog.
 
 ```sql
 -- ✅ GOOD: Uses partition pruning on network

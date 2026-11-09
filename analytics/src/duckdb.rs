@@ -756,14 +756,23 @@ mod partition_pruning_tests {
         )
     }
 
+    /// The `trace.assets` result and baseline queries established by
+    /// trace-14ae2518: `predicate` filters the network ("" is the unfiltered
+    /// baseline), ordered by `asset_id`. The row assertions and the
+    /// EXPLAIN ANALYZE file-identity check below both run this exact SQL,
+    /// so the rows and the file list describe the same execution.
+    fn assets_query(predicate: &str) -> String {
+        format!(
+            "SELECT asset_id, network, type, content \
+             FROM trace.assets {predicate} ORDER BY asset_id"
+        )
+    }
+
     /// Deterministic `trace.assets` result rows for `predicate` ("" for the
     /// unfiltered baseline), ordered by `asset_id`.
     fn asset_rows(conn: &Connection, predicate: &str) -> Vec<(String, String, String, String)> {
         let mut stmt = conn
-            .prepare(&format!(
-                "SELECT asset_id, network, type, content \
-                 FROM trace.assets {predicate} ORDER BY asset_id"
-            ))
+            .prepare(&assets_query(predicate))
             .expect("prepare assets query");
         stmt.query_map([], |row| {
             Ok((
@@ -798,6 +807,75 @@ mod partition_pruning_tests {
                     .ok()
             })
             .unwrap_or_else(|| panic!("no 'Total Files Read' in plan:\n{}", plan))
+    }
+
+    /// Reconstructed `Filename(s):` card contents from the EXPLAIN ANALYZE
+    /// plan of `sql`, one String per scan operator. This is the card that
+    /// identifies *which* files the scan read, as opposed to the
+    /// `Total Files Read` counter above. Measured card shapes (DuckDB
+    /// 1.10502): a `File Filters` predicate that prunes to a strict subset
+    /// of the fixture files lists those concrete files; a plan that keeps
+    /// every file shows the unexpanded source glob instead; a plan that
+    /// prunes to zero files emits no card at all, so an empty Vec is a
+    /// possible result and callers assert the shape they expect.
+    ///
+    /// The ASCII plan hard-wraps long paths at arbitrary characters (the
+    /// wrap points depend on the checkout path length, so they differ per
+    /// environment) and centers each wrapped row inside the card. Joining
+    /// the trimmed rows therefore reconstructs the wrapped text except at a
+    /// wrap point that lands inside the `", "` separator between two files,
+    /// where the centered padding and the separator space are
+    /// indistinguishable. Callers must consequently assert on substrings
+    /// and occurrence counts (partition directory names contain no spaces
+    /// and are never split into unreadable pieces), not on an exact file
+    /// list split.
+    fn filename_cards(conn: &Connection, sql: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN ANALYZE {}", sql))
+            .expect("prepare EXPLAIN ANALYZE");
+        let plan: String = stmt
+            .query_map([], |row| row.get::<usize, String>(1))
+            .expect("query plan")
+            .map(|r| r.expect("plan row"))
+            .collect();
+
+        // One accumulation per scan card: "Filename(s):" starts it, a blank
+        // padding row, a card border (┌/└ connector rows), or the end of the
+        // plan ends it.
+        let mut cards: Vec<String> = Vec::new();
+        let mut current: Option<String> = None;
+        for line in plan.lines() {
+            let line = line.trim();
+            let inside_border = line.starts_with('│');
+            let content = line
+                .strip_prefix('│')
+                .and_then(|l| l.strip_suffix('│'))
+                .map(str::trim);
+            let border = !inside_border;
+            if border || content.is_none() || content.is_some_and(str::is_empty) {
+                if let Some(text) = current.take() {
+                    cards.push(text);
+                }
+                if border {
+                    continue;
+                }
+                if content.unwrap_or_default().is_empty() {
+                    continue;
+                }
+            }
+            let content = content.expect("card row content");
+            if content.ends_with("Filename(s):") {
+                current = Some(String::new());
+                continue;
+            }
+            if let Some(text) = current.as_mut() {
+                text.push_str(content);
+            }
+        }
+        if let Some(text) = current.take() {
+            cards.push(text);
+        }
+        cards
     }
 
     /// Parquet-mode config pointing at nothing: the tests build their own
@@ -968,6 +1046,118 @@ mod partition_pruning_tests {
         assert!(
             network_only < all_files,
             "network predicate must read fewer files than the unfiltered baseline"
+        );
+
+        // The counters above are measured on COUNT(*) probes; the plan of
+        // the established result/baseline queries themselves must read the
+        // same files, so the file identity below and the row assertions
+        // describe one execution.
+        assert_eq!(
+            files_scanned(db.connection(), &assets_query("WHERE network = 'taboola'")),
+            network_only,
+            "the taboola result query's plan must read only the taboola files"
+        );
+        assert_eq!(
+            files_scanned(db.connection(), &assets_query("")),
+            all_files,
+            "the unfiltered baseline query's plan must read every fixture file"
+        );
+
+        // EXPLAIN ANALYZE must go further than the counter and identify
+        // which files were read: the `Filename(s):` card of a network
+        // query's plan names only files under that network's partition
+        // directories, and the two networks' plans together cover exactly
+        // the partitions of the unfiltered baseline plan.
+        let taboola_cards =
+            filename_cards(db.connection(), &assets_query("WHERE network = 'taboola'"));
+        assert_eq!(
+            taboola_cards.len(),
+            1,
+            "the taboola result query must plan as one Parquet scan"
+        );
+        let taboola_files = &taboola_cards[0];
+        assert_eq!(
+            taboola_files.matches("/network=taboola/").count(),
+            network_only,
+            "plan must identify exactly the taboola partition files: {}",
+            taboola_files
+        );
+        assert_eq!(
+            taboola_files.matches("/network=").count(),
+            network_only,
+            "plan must identify no file outside the taboola partitions: {}",
+            taboola_files
+        );
+
+        let mgid_cards = filename_cards(db.connection(), &assets_query("WHERE network = 'mgid'"));
+        assert_eq!(
+            mgid_cards.len(),
+            1,
+            "the mgid result query must plan as one Parquet scan"
+        );
+        let mgid_files = &mgid_cards[0];
+        assert_eq!(
+            mgid_files.matches("/network=mgid/").count(),
+            all_files - network_only,
+            "plan must identify exactly the mgid partition files: {}",
+            mgid_files
+        );
+        assert_eq!(
+            mgid_files.matches("/network=").count(),
+            all_files - network_only,
+            "plan must identify no file outside the mgid partitions: {}",
+            mgid_files
+        );
+
+        assert_eq!(
+            taboola_files.matches("/network=taboola/").count()
+                + mgid_files.matches("/network=mgid/").count(),
+            all_files,
+            "the two networks' concrete file lists must cover exactly the files the baseline counter reads"
+        );
+
+        // Measured shape: with no partition predicate the baseline's card
+        // shows the unexpanded source glob rather than four resolved paths,
+        // so the baseline's file identity rests on its `Total Files Read`
+        // counter plus the fixture tree itself; the filtered plans above
+        // name their concrete files. `all_files` (4) equals the number of
+        // Parquet files the fixture tree actually contains, and the two
+        // networks' concrete lists above cover exactly those files, which
+        // pins the baseline counter to the four partition files.
+        let baseline_cards = filename_cards(db.connection(), &assets_query(""));
+        assert_eq!(
+            baseline_cards.len(),
+            1,
+            "the unfiltered baseline query must plan as one Parquet scan"
+        );
+        assert!(
+            baseline_cards[0].ends_with("/assets/**/*.parquet"),
+            "a plan that prunes no files must identify the unexpanded glob, got: {}",
+            baseline_cards[0]
+        );
+
+        // A network absent from the fixture prunes to zero files: no
+        // Filename(s) card at all, and a zero counter.
+        let absent = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM trace.assets WHERE network = 'outbrain'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count rows of a network absent from the fixture");
+        assert_eq!(absent, 0);
+        assert_eq!(
+            files_scanned(
+                db.connection(),
+                "SELECT COUNT(*) FROM trace.assets WHERE network = 'outbrain'"
+            ),
+            0,
+            "a network absent from the fixture must scan no files"
+        );
+        assert!(
+            filename_cards(db.connection(), &assets_query("WHERE network = 'outbrain'")).is_empty(),
+            "a plan that prunes every file must emit no Filename(s) card"
         );
 
         // Expected result rows, not just file counts: a network predicate
