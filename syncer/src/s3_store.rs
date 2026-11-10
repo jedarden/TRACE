@@ -48,6 +48,15 @@ pub trait AssetStore: Send + Sync {
 
     /// Load all asset dimension rows across every partition
     async fn load_assets(&self) -> anyhow::Result<Vec<AssetRecord>>;
+
+    /// Publish an immutable asset snapshot to the Iceberg catalog.
+    async fn publish_asset_revisions(
+        &self,
+        _assets: Vec<AssetRecord>,
+        _config: &trace_iceberg::publisher::PublisherConfig,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Storage for the current campaign dimension, partitioned by network.
@@ -114,6 +123,66 @@ pub(crate) fn assets_partition_files(
     }
 
     Ok(files)
+}
+
+/// Build immutable revision objects for the catalog-backed assets table.
+/// Legacy Parquet consumers continue to use the mutable Hive snapshot above;
+/// Iceberg manifests reference these UUID-named objects so a later sync can
+/// never rewrite a file already committed to a snapshot.
+pub(crate) fn asset_revision_files(
+    key_prefix: &str,
+    assets: Vec<AssetRecord>,
+) -> anyhow::Result<Vec<(String, Vec<u8>, String, String)>> {
+    let mut by_partition: std::collections::HashMap<(String, String), Vec<AssetRecord>> =
+        std::collections::HashMap::new();
+    for asset in assets {
+        by_partition
+            .entry((asset.network.clone(), asset.asset_type.clone()))
+            .or_default()
+            .push(asset);
+    }
+
+    by_partition
+        .into_iter()
+        .map(|((network, asset_type), rows)| {
+            let key = format!(
+                "{}/iceberg/assets/data/network={}/type={}/revision-{}.parquet",
+                key_prefix,
+                network,
+                asset_type,
+                uuid::Uuid::new_v4()
+            );
+            Ok((key, assets_to_parquet(rows)?, network, asset_type))
+        })
+        .collect()
+}
+
+fn asset_revision_object(
+    config: &trace_iceberg::publisher::PublisherConfig,
+    key_prefix: &str,
+    key: &str,
+    bytes: &[u8],
+    network: &str,
+    asset_type: &str,
+) -> anyhow::Result<trace_iceberg::publisher::ParquetObject> {
+    let (_, record_count) = trace_iceberg::types::schema_from_parquet(bytes)?;
+    let relative_key = key
+        .strip_prefix(&format!("{}/", key_prefix))
+        .ok_or_else(|| anyhow::anyhow!("Asset revision key is outside S3 prefix"))?;
+    anyhow::ensure!(
+        relative_key.starts_with(&format!(
+            "iceberg/assets/data/network={network}/type={asset_type}/revision-"
+        )) && relative_key.ends_with(".parquet"),
+        "Iceberg asset object must reference an immutable network/type revision"
+    );
+    Ok(trace_iceberg::publisher::ParquetObject {
+        location: config.object_uri(relative_key),
+        size_bytes: bytes.len() as u64,
+        record_count: record_count as u64,
+        partition_day: None,
+        partition_network: Some(network.to_owned()),
+        partition_type: Some(asset_type.to_owned()),
+    })
 }
 
 pub(crate) fn campaigns_partition_key(key_prefix: &str, network: &str) -> String {
@@ -197,6 +266,7 @@ fn campaign_revision_object(
         record_count: record_count as u64,
         partition_day: None,
         partition_network: Some(network.to_owned()),
+        partition_type: None,
     })
 }
 
@@ -1107,6 +1177,45 @@ impl AssetStore for S3CreativeStore {
         );
         Ok(assets)
     }
+
+    async fn publish_asset_revisions(
+        &self,
+        assets: Vec<AssetRecord>,
+        config: &trace_iceberg::publisher::PublisherConfig,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            config.bucket == self.bucket
+                && config.prefix.trim_matches('/') == self.key_prefix.trim_matches('/'),
+            "Iceberg publisher bucket/prefix must match asset S3 store"
+        );
+        let files = asset_revision_files(&self.key_prefix, assets)?;
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        let mut objects = Vec::with_capacity(files.len());
+        for (key, bytes, network, asset_type) in &files {
+            let object =
+                asset_revision_object(config, &self.key_prefix, key, bytes, network, asset_type)?;
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .body(ByteStream::from(bytes.clone()))
+                .send()
+                .await?;
+            objects.push(object);
+        }
+
+        let published =
+            trace_iceberg::publisher::append_parquet_files(config, "assets", &files[0].1, objects)
+                .await?;
+        tracing::info!(
+            "Published {} immutable asset Parquet objects to trace.assets",
+            published
+        );
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1565,6 +1674,55 @@ mod tests {
         assert!(taboola_headlines
             .iter()
             .all(|a| a.network == "taboola" && a.asset_type == "headline"));
+    }
+
+    #[test]
+    fn asset_revision_files_are_immutable_and_carry_both_partition_keys() {
+        let now = Utc::now().trunc_subsecs(3);
+        let asset = AssetRecord {
+            asset_id: "taboola:headline:Headline".to_string(),
+            network: "taboola".to_string(),
+            asset_type: "headline".to_string(),
+            content: "Headline".to_string(),
+            creative_id: Some("creative-1".to_string()),
+            campaign_id: Some("campaign-1".to_string()),
+            campaign_name: None,
+            item_id: Some("item-1".to_string()),
+            first_seen: now,
+            last_seen: now,
+            synced_at: now,
+        };
+        let files = asset_revision_files("trace-events", vec![asset]).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].0.starts_with(
+            "trace-events/iceberg/assets/data/network=taboola/type=headline/revision-"
+        ));
+        assert!(files[0].0.ends_with(".parquet"));
+        assert_eq!(files[0].2, "taboola");
+        assert_eq!(files[0].3, "headline");
+
+        let config = trace_iceberg::publisher::PublisherConfig {
+            catalog_uri: "http://catalog.invalid".into(),
+            warehouse: "s3://test-bucket/trace-events/iceberg".into(),
+            bucket: "test-bucket".into(),
+            prefix: "trace-events".into(),
+            region: "us-east-1".into(),
+            endpoint: None,
+            access_key_id: None,
+            secret_access_key: None,
+        };
+        let object = asset_revision_object(
+            &config,
+            "trace-events",
+            &files[0].0,
+            &files[0].1,
+            &files[0].2,
+            &files[0].3,
+        )
+        .unwrap();
+        assert_eq!(object.partition_network.as_deref(), Some("taboola"));
+        assert_eq!(object.partition_type.as_deref(), Some("headline"));
+        assert!(object.partition_day.is_none());
     }
 
     #[test]

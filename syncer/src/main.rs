@@ -98,11 +98,10 @@ async fn main() -> Result<()> {
     let sync_creatives = args.mode == "creatives" || args.mode == "both";
     let sync_metrics = args.mode == "metrics" || args.mode == "both";
     let sync_hierarchy = args.hierarchy;
-    let campaign_publisher = if sync_hierarchy {
-        trace_iceberg::publisher::PublisherConfig::from_env()?
-    } else {
-        None
-    };
+    // Asset publication is independent of the optional hierarchy mode: a
+    // creative-only sync must still make new assets visible to catalog-backed
+    // analytics after the one-time Parquet migration.
+    let iceberg_publisher = trace_iceberg::publisher::PublisherConfig::from_env()?;
     if sync_hierarchy {
         let count = campaign_registry.load().await?;
         info!("Loaded {} existing campaigns from previous syncs", count);
@@ -180,7 +179,13 @@ async fn main() -> Result<()> {
     if args.once {
         // Run once and exit
         if sync_creatives {
-            run_sync(&mut registry, &mut asset_registry, &mut clients).await?;
+            run_sync(
+                &mut registry,
+                &mut asset_registry,
+                &mut clients,
+                iceberg_publisher.as_ref(),
+            )
+            .await?;
         }
         if sync_metrics {
             run_metrics_sync(&mut metrics_registry, &mut clients, start_date, end_date).await?;
@@ -190,7 +195,7 @@ async fn main() -> Result<()> {
                 &mut hierarchy_registry,
                 &mut campaign_registry,
                 &mut clients,
-                campaign_publisher.as_ref(),
+                iceberg_publisher.as_ref(),
             )
             .await?;
         }
@@ -201,7 +206,13 @@ async fn main() -> Result<()> {
 
         loop {
             if sync_creatives {
-                run_sync(&mut registry, &mut asset_registry, &mut clients).await?;
+                run_sync(
+                    &mut registry,
+                    &mut asset_registry,
+                    &mut clients,
+                    iceberg_publisher.as_ref(),
+                )
+                .await?;
             }
             if sync_metrics {
                 run_metrics_sync(&mut metrics_registry, &mut clients, start_date, end_date).await?;
@@ -211,7 +222,7 @@ async fn main() -> Result<()> {
                     &mut hierarchy_registry,
                     &mut campaign_registry,
                     &mut clients,
-                    campaign_publisher.as_ref(),
+                    iceberg_publisher.as_ref(),
                 )
                 .await?;
             }
@@ -226,6 +237,7 @@ async fn run_sync(
     registry: &mut CreativeRegistry,
     asset_registry: &mut AssetRegistry,
     clients: &mut [Box<dyn ApiClient>],
+    publisher: Option<&trace_iceberg::publisher::PublisherConfig>,
 ) -> Result<()> {
     info!("Starting creative sync...");
 
@@ -275,6 +287,10 @@ async fn run_sync(
     // when empty: store_assets writes one file per non-empty partition.
     info!("Persisting asset dimension to S3...");
     asset_registry.persist().await?;
+    if let Some(config) = publisher {
+        info!("Publishing asset dimension revisions to Iceberg...");
+        asset_registry.publish_revisions(config).await?;
+    }
 
     info!(
         "Sync complete: {} creatives fetched, {} assets in dimension, {} errors",
@@ -811,9 +827,14 @@ mod tests {
         let mut asset_registry = AssetRegistry::new(asset_store.clone());
         let mut clients: Vec<Box<dyn ApiClient>> = vec![Box::new(api_client::DemoClient::new())];
 
-        run_sync(&mut creative_registry, &mut asset_registry, &mut clients)
-            .await
-            .unwrap();
+        run_sync(
+            &mut creative_registry,
+            &mut asset_registry,
+            &mut clients,
+            None,
+        )
+        .await
+        .unwrap();
 
         // Demo creatives carry headline + image + landing page, so the
         // dimension must have been fed — this is the wiring that turns a
@@ -879,9 +900,14 @@ mod tests {
             )),
         ];
 
-        run_sync(&mut creative_registry, &mut asset_registry, &mut clients)
-            .await
-            .unwrap();
+        run_sync(
+            &mut creative_registry,
+            &mut asset_registry,
+            &mut clients,
+            None,
+        )
+        .await
+        .unwrap();
 
         // One Parquet object per (network, type) partition, Hive-style
         let objects = asset_store.objects().await;
@@ -967,9 +993,14 @@ mod tests {
             )),
         ];
 
-        run_sync(&mut creative_registry, &mut asset_registry, &mut clients)
-            .await
-            .expect("a per-network fetch failure must not abort the run");
+        run_sync(
+            &mut creative_registry,
+            &mut asset_registry,
+            &mut clients,
+            None,
+        )
+        .await
+        .expect("a per-network fetch failure must not abort the run");
 
         // The healthy network's creatives and assets made it through
         assert_eq!(

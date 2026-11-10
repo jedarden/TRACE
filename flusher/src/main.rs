@@ -219,6 +219,7 @@ impl S3Upload for S3Client {
                 record_count: record_count as u64,
                 partition_day,
                 partition_network: None,
+                partition_type: None,
             });
         }
         let count = trace_iceberg::publisher::append_parquet_files(

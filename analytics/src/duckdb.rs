@@ -200,7 +200,8 @@ impl DuckDBClient {
         let assets_path = format!("{}/trace/assets", warehouse);
         let assets_sql = format!(
             "CREATE OR REPLACE VIEW trace.assets AS \
-             SELECT * FROM iceberg_scan('{}', {});",
+             SELECT * FROM iceberg_scan('{}', {}) \
+             QUALIFY ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY synced_at DESC) = 1;",
             assets_path, catalog_option
         );
         self.conn

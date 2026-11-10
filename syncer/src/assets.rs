@@ -221,6 +221,16 @@ impl AssetRegistry {
             .store_assets(self.assets.values().cloned().collect())
             .await
     }
+
+    /// Publish the current dimension snapshot as immutable Iceberg revisions.
+    pub async fn publish_revisions(
+        &self,
+        config: &trace_iceberg::publisher::PublisherConfig,
+    ) -> anyhow::Result<()> {
+        self.store
+            .publish_asset_revisions(self.assets.values().cloned().collect(), config)
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -378,6 +388,14 @@ mod tests {
 
         async fn load_assets(&self) -> anyhow::Result<Vec<AssetRecord>> {
             Ok(self.assets.read().await.clone())
+        }
+
+        async fn publish_asset_revisions(
+            &self,
+            _assets: Vec<AssetRecord>,
+            _config: &trace_iceberg::publisher::PublisherConfig,
+        ) -> anyhow::Result<()> {
+            Ok(())
         }
     }
 

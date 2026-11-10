@@ -100,6 +100,8 @@ pub struct ParquetObject {
     pub partition_day: Option<NaiveDate>,
     /// Network represented by the campaigns table's identity transform.
     pub partition_network: Option<String>,
+    /// Asset type represented by the assets table's identity transform.
+    pub partition_type: Option<String>,
 }
 
 /// Return the data-file URIs currently referenced by an existing table.
@@ -154,16 +156,7 @@ pub async fn append_parquet_files(
     let (trace_schema, _) = crate::types::schema_from_parquet(parquet_schema_bytes)
         .context("derive Iceberg schema from Parquet footer")?;
     let schema = to_apache_schema(&trace_schema)?;
-    let partition_column = partition_column(table_name);
-    let source_partition_id = partition_column
-        .and_then(|name| trace_schema.fields.iter().find(|field| field.name == name))
-        .map(|field| field.id);
-
-    if let Some(column) = partition_column {
-        if source_partition_id.is_none() {
-            bail!("table {table_name} requires partition source column {column}");
-        }
-    }
+    let partition_sources = partition_sources(table_name, &trace_schema)?;
 
     let catalog = rest_catalog(config).await?;
     let namespace = NamespaceIdent::new("trace".to_string());
@@ -183,18 +176,18 @@ pub async fn append_parquet_files(
         }
         existing
     } else {
-        let partition_spec = match (partition_column, source_partition_id) {
-            (Some(_), Some(source_id)) => Some(
-                UnboundPartitionSpec::builder()
-                    .add_partition_field(
-                        source_id,
-                        partition_field_name(table_name).unwrap(),
-                        partition_transform(table_name).unwrap(),
-                    )
-                    .context("build Iceberg partition spec")?
-                    .build(),
-            ),
-            _ => None,
+        let partition_spec = if partition_sources.is_empty() {
+            None
+        } else {
+            let mut builder = UnboundPartitionSpec::builder();
+            for (source_name, source_id) in &partition_sources {
+                builder = builder.add_partition_field(
+                    *source_id,
+                    partition_field_name(table_name, source_name),
+                    partition_transform(table_name, source_name),
+                )?;
+            }
+            Some(builder.build())
         };
         let table_location = format!(
             "{}/{}/{}",
@@ -270,29 +263,73 @@ pub async fn append_parquet_files(
     Ok(count)
 }
 
-fn partition_column(table_name: &str) -> Option<&'static str> {
+fn partition_sources(table_name: &str, schema: &TraceSchema) -> Result<Vec<(&str, i32)>> {
     match table_name {
-        "ad_events" => Some("ts"),
-        "sessions" => Some("started_at"),
-        "campaigns" => Some("network"),
-        _ => None,
+        "ad_events" => Ok(vec![(
+            "ts",
+            schema
+                .fields
+                .iter()
+                .find(|field| field.name == "ts")
+                .context("table ad_events requires partition source column ts")?
+                .id,
+        )]),
+        "sessions" => Ok(vec![(
+            "started_at",
+            schema
+                .fields
+                .iter()
+                .find(|field| field.name == "started_at")
+                .context("table sessions requires partition source column started_at")?
+                .id,
+        )]),
+        "campaigns" => Ok(vec![(
+            "network",
+            schema
+                .fields
+                .iter()
+                .find(|field| field.name == "network")
+                .context("table campaigns requires partition source column network")?
+                .id,
+        )]),
+        "assets" => Ok(vec![
+            (
+                "network",
+                schema
+                    .fields
+                    .iter()
+                    .find(|field| field.name == "network")
+                    .context("table assets requires partition source column network")?
+                    .id,
+            ),
+            (
+                "type",
+                schema
+                    .fields
+                    .iter()
+                    .find(|field| field.name == "type")
+                    .context("table assets requires partition source column type")?
+                    .id,
+            ),
+        ]),
+        _ => Ok(Vec::new()),
     }
 }
 
-fn partition_field_name(table_name: &str) -> Option<&'static str> {
+fn partition_field_name(table_name: &str, source_name: &str) -> &'static str {
     match table_name {
-        "ad_events" => Some("ts_day"),
-        "sessions" => Some("started_at_day"),
-        "campaigns" => Some("network"),
-        _ => None,
+        "ad_events" => "ts_day",
+        "sessions" => "started_at_day",
+        "campaigns" | "assets" => source_name,
+        _ => source_name,
     }
 }
 
-fn partition_transform(table_name: &str) -> Option<Transform> {
+fn partition_transform(table_name: &str, source_name: &str) -> Transform {
     match table_name {
-        "ad_events" | "sessions" => Some(Transform::Day),
-        "campaigns" => Some(Transform::Identity),
-        _ => None,
+        "ad_events" | "sessions" => Transform::Day,
+        "campaigns" | "assets" => Transform::Identity,
+        _ => Transform::Void,
     }
 }
 
@@ -314,6 +351,30 @@ fn object_partition(
             .context("network-partitioned Iceberg object is missing partition_network")?;
         ensure!(!network.is_empty(), "campaign network partition is empty");
         return Ok(Struct::from_iter([Some(Literal::string(network))]));
+    }
+    if table_name == "assets" {
+        ensure!(
+            fields.len() == 2
+                && fields[0].name == "network"
+                && fields[0].transform == Transform::Identity
+                && fields[1].name == "type"
+                && fields[1].transform == Transform::Identity,
+            "assets table must be identity-partitioned by network and type"
+        );
+        let network = object
+            .partition_network
+            .as_deref()
+            .context("asset network partition is missing partition_network")?;
+        let asset_type = object
+            .partition_type
+            .as_deref()
+            .context("asset type partition is missing partition_type")?;
+        ensure!(!network.is_empty(), "asset network partition is empty");
+        ensure!(!asset_type.is_empty(), "asset type partition is empty");
+        return Ok(Struct::from_iter([
+            Some(Literal::string(network)),
+            Some(Literal::string(asset_type)),
+        ]));
     }
     if fields.is_empty() {
         return Ok(Struct::empty());
@@ -601,11 +662,26 @@ mod tests {
             Type::Map(_)
         ));
         assert_eq!(name_mapping_json(&trace_schema)[1]["field-id"], 2);
-        assert_eq!(partition_column("ad_events"), Some("ts"));
-        assert_eq!(partition_field_name("sessions"), Some("started_at_day"));
-        assert_eq!(partition_column("campaigns"), Some("network"));
-        assert_eq!(partition_field_name("campaigns"), Some("network"));
-        assert_eq!(partition_transform("campaigns"), Some(Transform::Identity));
+        let schema = TraceIcebergSchema::new(
+            vec![Field {
+                id: 1,
+                name: "network".to_string(),
+                required: true,
+                field_type: IcebergType::String,
+                doc: None,
+            }],
+            None,
+        );
+        assert!(partition_sources("ad_events", &schema).is_err());
+        assert_eq!(
+            partition_field_name("sessions", "started_at"),
+            "started_at_day"
+        );
+        assert_eq!(partition_field_name("campaigns", "network"), "network");
+        assert_eq!(
+            partition_transform("campaigns", "network"),
+            Transform::Identity
+        );
     }
 
     #[test]
@@ -622,6 +698,7 @@ mod tests {
             record_count: 1,
             partition_day: None,
             partition_network: Some("taboola".to_string()),
+            partition_type: None,
         };
         assert_eq!(
             object_partition("campaigns", &[field.clone()], &object).unwrap(),
@@ -635,6 +712,45 @@ mod tests {
         let mut wrong_transform = field;
         wrong_transform.transform = Transform::Day;
         assert!(object_partition("campaigns", &[wrong_transform], &object).is_err());
+    }
+
+    #[test]
+    fn asset_manifest_partition_is_network_and_type_identity() {
+        let fields = [
+            iceberg_rust::spec::PartitionField {
+                source_id: 2,
+                field_id: 1000,
+                name: "network".to_string(),
+                transform: Transform::Identity,
+            },
+            iceberg_rust::spec::PartitionField {
+                source_id: 3,
+                field_id: 1001,
+                name: "type".to_string(),
+                transform: Transform::Identity,
+            },
+        ];
+        let object = ParquetObject {
+            location:
+                "s3://bucket/iceberg/assets/data/network=taboola/type=headline/revision.parquet"
+                    .to_string(),
+            size_bytes: 100,
+            record_count: 1,
+            partition_day: None,
+            partition_network: Some("taboola".to_string()),
+            partition_type: Some("headline".to_string()),
+        };
+        assert_eq!(
+            object_partition("assets", &fields, &object).unwrap(),
+            Struct::from_iter([
+                Some(Literal::string("taboola")),
+                Some(Literal::string("headline")),
+            ])
+        );
+
+        let mut missing_type = object.clone();
+        missing_type.partition_type = None;
+        assert!(object_partition("assets", &fields, &missing_type).is_err());
     }
 
     #[test]
@@ -653,6 +769,7 @@ mod tests {
             record_count: 1,
             partition_day: Some(day),
             partition_network: None,
+            partition_type: None,
         };
         let days = day
             .signed_duration_since(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())

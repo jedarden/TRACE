@@ -457,6 +457,7 @@ pub async fn compact_iceberg_partition(
             record_count: file.record_count as u64,
             partition_day,
             partition_network: partition_network.clone(),
+            partition_type: None,
         })
         .collect();
     let published = trace_iceberg::publisher::append_parquet_files(
