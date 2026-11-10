@@ -15,7 +15,7 @@ use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
-#[command(name = "trace-analytics")]
+#[command(name = "trace-analytics", version)]
 #[command(about = "DuckDB analytics and report runner for TRACE", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -72,7 +72,7 @@ enum Commands {
         #[arg(short, long, default_value = "8080")]
         port: u16,
         /// Host to bind to
-        #[arg(short, long, default_value = "0.0.0.0")]
+        #[arg(long, default_value = "0.0.0.0")]
         host: String,
     },
     /// Materialize stitched sessions into the trace.sessions Iceberg table
