@@ -11,6 +11,11 @@
 -- The join is a LEFT JOIN with the event date filter inside the ON clause,
 -- so assets with no traffic in the window still appear (with zeros) rather
 -- than silently dropping out of the dimension report.
+WITH latest_assets AS (
+    SELECT *
+    FROM {{assets_table}}
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY synced_at DESC) = 1
+)
 SELECT
     a.asset_id,
     a.network,
@@ -32,7 +37,7 @@ SELECT
     ) AS conversion_rate,
     MIN(e.ts) AS first_event,
     MAX(e.ts) AS last_event
-FROM {{assets_table}} a
+FROM latest_assets a
 LEFT JOIN {{events_table}} e
     ON e.creative_id = a.creative_id
     AND e.network = a.network

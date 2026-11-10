@@ -515,7 +515,10 @@ mod tests {
     fn test_asset_performance_report_is_registered() {
         let report = get_report("asset_performance").expect("asset performance report");
         assert!(matches!(report.category, ReportCategory::Asset));
-        assert!(report.sql_template.contains("FROM {{assets_table}} a"));
+        assert!(report.sql_template.contains("FROM {{assets_table}}"));
+        assert!(report
+            .sql_template
+            .contains("ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY synced_at DESC)"));
         assert!(report.sql_template.contains("LEFT JOIN {{events_table}} e"));
         assert!(report
             .sql_template
