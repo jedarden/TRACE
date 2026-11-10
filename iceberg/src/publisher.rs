@@ -263,7 +263,7 @@ pub async fn append_parquet_files(
     Ok(count)
 }
 
-fn partition_sources(table_name: &str, schema: &TraceSchema) -> Result<Vec<(&str, i32)>> {
+fn partition_sources(table_name: &str, schema: &TraceSchema) -> Result<Vec<(&'static str, i32)>> {
     match table_name {
         "ad_events" => Ok(vec![(
             "ts",
@@ -316,7 +316,7 @@ fn partition_sources(table_name: &str, schema: &TraceSchema) -> Result<Vec<(&str
     }
 }
 
-fn partition_field_name(table_name: &str, source_name: &str) -> &'static str {
+fn partition_field_name<'a>(table_name: &str, source_name: &'a str) -> &'a str {
     match table_name {
         "ad_events" => "ts_day",
         "sessions" => "started_at_day",
@@ -325,7 +325,7 @@ fn partition_field_name(table_name: &str, source_name: &str) -> &'static str {
     }
 }
 
-fn partition_transform(table_name: &str, source_name: &str) -> Transform {
+fn partition_transform(table_name: &str, _source_name: &str) -> Transform {
     match table_name {
         "ad_events" | "sessions" => Transform::Day,
         "campaigns" | "assets" => Transform::Identity,

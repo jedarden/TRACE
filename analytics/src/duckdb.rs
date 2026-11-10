@@ -1551,7 +1551,8 @@ mod partition_pruning_tests {
                  type VARCHAR,
                  content VARCHAR,
                  creative_id VARCHAR,
-                 campaign_name VARCHAR
+                 campaign_name VARCHAR,
+                 synced_at TIMESTAMP
              );
              CREATE TABLE iceberg_ad_events (
                  creative_id VARCHAR,
@@ -1560,9 +1561,9 @@ mod partition_pruning_tests {
                  ts TIMESTAMP
              );
              INSERT INTO trace.assets VALUES
-                 ('taboola:headline:shared', 'taboola', 'headline', 'Shared', 'creative-1', 'Taboola campaign'),
-                 ('outbrain:headline:shared', 'outbrain', 'headline', 'Shared', 'creative-1', 'Outbrain campaign'),
-                 ('taboola:image:quiet', 'taboola', 'image', 'Quiet image', 'creative-quiet', 'Quiet campaign');
+                 ('taboola:headline:shared', 'taboola', 'headline', 'Shared', 'creative-1', 'Taboola campaign', TIMESTAMP '2026-09-01 00:00:00'),
+                 ('outbrain:headline:shared', 'outbrain', 'headline', 'Shared', 'creative-1', 'Outbrain campaign', TIMESTAMP '2026-09-01 00:00:00'),
+                 ('taboola:image:quiet', 'taboola', 'image', 'Quiet image', 'creative-quiet', 'Quiet campaign', TIMESTAMP '2026-09-01 00:00:00');
              INSERT INTO iceberg_ad_events VALUES
                  ('creative-1', 'taboola', 'pageview', TIMESTAMP '2026-09-02 10:00:00'),
                  ('creative-1', 'taboola', 'click', TIMESTAMP '2026-09-02 10:01:00'),
@@ -1706,7 +1707,8 @@ mod partition_pruning_tests {
              CREATE SCHEMA trace;
              CREATE TABLE trace.assets (
                  asset_id VARCHAR, network VARCHAR, type VARCHAR, content VARCHAR,
-                 creative_id VARCHAR, campaign_id VARCHAR, campaign_name VARCHAR
+                 creative_id VARCHAR, campaign_id VARCHAR, campaign_name VARCHAR,
+                 synced_at TIMESTAMP
              );
              CREATE TABLE trace.campaigns (
                  campaign_id VARCHAR, network VARCHAR, campaign_name VARCHAR,
